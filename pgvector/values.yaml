@@ -348,7 +348,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.0.1-pg18
+    tag: 2.0.2-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -856,16 +856,24 @@ backup:
     endpoint: ""
     bucket: ""
     prefix: "backups"
+    # rclone's S3 provider name (#353). "Other" suits MinIO/Ceph/Wasabi-style endpoints.
+    # Amazon S3 needs "AWS" plus the bucket's region below: SigV4 signs with the region and
+    # rclone does not auto-detect it the way the old MinIO client did.
+    provider: Other
+    region: ""
   existingSecret:
     name: ""
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
-  mc:
+  # The backup and validation Jobs copy the rclone binary and its CA bundle out of this
+  # image into the postgres-image container that runs pg_dump/pg_restore (#353). rclone
+  # replaced the MinIO client: MinIO withdrew its images from Docker Hub and quay.io and
+  # took dl.min.io down, so `backup.mc.*` (any value) fails the render and names this key.
+  # Credentials reach rclone through its environment, never argv (#167, #221).
+  rclone:
     image:
-      # quay.io, not Docker Hub: the minio/* repositories were pulled from Docker Hub and
-      # the same tags remain published on quay.io/minio (#348).
-      repository: quay.io/minio/mc
-      tag: RELEASE.2024-11-21T17-21-54Z
+      repository: rclone/rclone
+      tag: "1.71.2"
       digest: ""
       pullPolicy: IfNotPresent
   podSecurityContext:
@@ -880,7 +888,7 @@ backup:
   # rejects root-defaulting images under runAsNonRoot without an explicit uid
   containerSecurityContext:
     # The backup/validation containers write only to mounted volumes (/tools, /work)
-    # and /tmp (a /tmp emptyDir is mounted, incl. MC_CONFIG_DIR=/tmp/.mc). #117
+    # and /tmp (a /tmp emptyDir is mounted, incl. RCLONE_CACHE_DIR=/tmp/.rclone). #117
     readOnlyRootFilesystem: true
     runAsUser: 999
     runAsGroup: 999
@@ -1240,4 +1248,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.0.1-pg18
+      tag: 2.0.2-pg18

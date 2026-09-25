@@ -17,8 +17,8 @@ begin_suite "Backup and Restore Integration"
 # signed SigV4 with the *encoded* secret, so any key with these chars failed every
 # upload with a signature mismatch in production. Running the whole backup ->
 # validation -> restore path against such a key makes a regression fail the backup
-# job here instead of silently in prod. mc alias set (raw argv) handles it fine, so
-# the test harness's own setup calls use the same key.
+# job here instead of silently in prod. The harness's own rclone pods take the same key
+# through their environment.
 S3_SECRET='9Ea4amnO1POkgnUvz8TC/O9hLv58Ka+n91UW5/ek'
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
@@ -49,8 +49,9 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z
-          args: ["server", "/data"]
+          # bitnamilegacy, not minio/minio: MinIO withdrew its images from every public
+          # registry (#348, #353). Plain http here; the TLS variant lives in deploy_minio.
+          image: bitnamilegacy/minio:2025.7.23-debian-12-r5
           env:
             - name: MINIO_ROOT_USER
               value: minioadmin
@@ -58,12 +59,18 @@ spec:
               value: "${S3_SECRET}"
           ports:
             - containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/minio/data
           readinessProbe:
             httpGet:
               path: /minio/health/ready
               port: 9000
             initialDelaySeconds: 5
             periodSeconds: 5
+      volumes:
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -79,14 +86,17 @@ MINIO_MANIFEST
 
 wait_for_deployment_ready "${NAMESPACE}" "minio" 120
 
+# The harness's rclone pods: the remote is defined from the environment, exactly as the
+# chart's Jobs define theirs (#353). Bucket creation keeps rclone's bucket check ON.
+RCLONE_IMAGE=rclone/rclone:1.71.2
+RCLONE_ENV=(--env=RCLONE_CONFIG=/dev/null --env=RCLONE_CONFIG_S3_TYPE=s3 --env=RCLONE_CONFIG_S3_PROVIDER=Other
+  --env=RCLONE_CONFIG_S3_ENDPOINT=http://minio:9000 --env=RCLONE_CONFIG_S3_ACCESS_KEY_ID=minioadmin
+  "--env=RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=${S3_SECRET}")
 echo "Creating S3 bucket..."
-kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
-  --command -- sh -c "
-    mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
-    mc mb s3/pg-backups || true
-  "
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${NAMESPACE}" --timeout=120s
-kubectl delete pod mc-setup -n "${NAMESPACE}" --wait=false
+kubectl run s3-setup -n "${NAMESPACE}" --restart=Never --image="${RCLONE_IMAGE}" "${RCLONE_ENV[@]}" \
+  --command -- rclone mkdir s3:pg-backups
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/s3-setup -n "${NAMESPACE}" --timeout=120s
+kubectl delete pod s3-setup -n "${NAMESPACE}" --wait=false
 
 echo "Installing pg chart with backup + restore-validation enabled..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
@@ -107,7 +117,7 @@ assert_eq "inserted 3 rows before backup" "3" "${row_count_before}"
 
 # #230 regression guard: pg_restore --list only reads the header + TOC at the front
 # of a -Fc dump, so on any dump LARGER than the OS pipe buffer (~64 KB) it exits 0
-# while `mc cat` is still streaming -- mc is then SIGPIPE-killed and (pre-fix) pipefail
+# while `rclone cat` is still streaming -- rclone is then SIGPIPE-killed and (pre-fix) pipefail
 # aborted the whole Job before publishing, so no backup was ever produced. Seed a table
 # whose dump far exceeds the pipe buffer (high-entropy md5 text resists -Fc compression)
 # so the backup job below exercises the SIGPIPE path; the fix must let it complete.
@@ -117,9 +127,9 @@ pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO backup_big SELECT g, md5(random()::
 big_count=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM backup_big" "testuser" "testdb")
 assert_eq "seeded 50000 rows for the >64 KB dump (#230)" "50000" "${big_count}"
 
-# NOTE (#143/#159 coverage): the retention DELETE (mc find --name 'backup_*.dump'
+# NOTE (#143/#159 coverage): the retention DELETE (rclone delete --include 'backup_*.dump'
 # --older-than ${RETENTION_DAYS}d) and the stale-stage sweep (--older-than 1d) are
-# day-granular and mc cannot back-date an S3 object, so they cannot be exercised in a
+# day-granular and rclone cannot back-date an S3 object, so they cannot be exercised in a
 # minute-scale CI run. Their scoping (per-release subpath + name filter) is asserted at
 # the template level in test-template.sh; only the publish/restore path is live here.
 echo "Triggering backup job..."
@@ -150,18 +160,15 @@ echo "Verifying backup exists in S3..."
 # Filter to the canonical backup_<ts>.dump JSON line (rejecting any *.tmp stage) so both
 # the existence and the #230 size assertion below measure the PUBLISHED dump, never a
 # leftover stage or an unrelated object that happened to sort first.
-kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
-  --command -- sh -c "
-    mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
-    mc ls s3/pg-backups/backups/${FULLNAME}/ --json
-  "
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-check -n "${NAMESPACE}" --timeout=120s
-# Filter host-side (the mc image ships no grep): the canonical backup_<ts>.dump JSON
+kubectl run s3-check -n "${NAMESPACE}" --restart=Never --image="${RCLONE_IMAGE}" "${RCLONE_ENV[@]}" \
+  --command -- rclone lsjson "s3:pg-backups/backups/${FULLNAME}/"
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/s3-check -n "${NAMESPACE}" --timeout=120s
+# Filter host-side: lsjson prints one object per line; keep the canonical backup_<ts>.dump
 # line, rejecting any *.tmp stage, so the size assertion below measures the published dump.
-backup_file=$(kubectl logs -n "${NAMESPACE}" mc-check | grep -E '"key":"backup_[^"]*\.dump"' | head -1)
-kubectl delete pod mc-check -n "${NAMESPACE}" --wait=false
+backup_file=$(kubectl logs -n "${NAMESPACE}" s3-check | grep -E '"Name":"backup_[^"]*\.dump"' | head -1)
+kubectl delete pod s3-check -n "${NAMESPACE}" --wait=false
 
-if echo "${backup_file}" | grep -q '"size"'; then
+if echo "${backup_file}" | grep -q '"Size"'; then
   pass "backup file exists in S3"
 else
   fail "backup file exists in S3" "no file found"
@@ -170,7 +177,7 @@ fi
 # #230: prove the published dump actually exceeds the 64 KB pipe buffer, so the backup
 # job above genuinely traversed the SIGPIPE integrity-check path (not a sub-buffer dump
 # that would pass even with the bug present).
-backup_size=$(echo "${backup_file}" | grep -o '"size":[0-9]*' | grep -o '[0-9]*' | head -1)
+backup_size=$(echo "${backup_file}" | grep -o '"Size":[0-9]*' | grep -o '[0-9]*' | head -1)
 if [ -n "${backup_size}" ] && [ "${backup_size}" -gt 65536 ]; then
   pass "#230: published dump exceeds the 64 KB pipe buffer (${backup_size} bytes)"
 else
@@ -183,28 +190,27 @@ table_exists=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM information
 assert_eq "table dropped successfully" "0" "${table_exists}"
 
 echo "Restoring from backup..."
-kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
+kubectl run s3-fetch -n "${NAMESPACE}" --restart=Never --image="${RCLONE_IMAGE}" "${RCLONE_ENV[@]}" \
   --command -- sh -c "sleep 300"
-kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
-kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin "${S3_SECRET}"
+kubectl wait --for=condition=Ready pod/s3-fetch -n "${NAMESPACE}" --timeout=120s
 # #159 adversarial decoy: plant a staging object with a FAR-FUTURE timestamp so it is
 # lexically newer than the real dump. A correct selection must still reject it (it is a
 # .tmp stage), so this proves the .tmp-rejection rather than restating the filter.
-kubectl exec -n "${NAMESPACE}" mc-fetch -- sh -c "echo decoy | mc pipe 's3/pg-backups/backups/${FULLNAME}/backup_99999999_999999.dump.tmp'"
+kubectl exec -n "${NAMESPACE}" s3-fetch -- sh -c "echo decoy | rclone rcat 's3:pg-backups/backups/${FULLNAME}/backup_99999999_999999.dump.tmp'"
 # Select the NEWEST published dump, and only a published one: filter to
 # backup_<ts>.dump (rejecting any backup_<ts>.dump.tmp staging object, #159) and sort
 # descending so the lexically-greatest timestamp (the latest) wins -- the exact
 # "restore the latest" path #159 protects.
-DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json \
-  | grep -o '"key":"[^"]*"' | cut -d'"' -f4 | grep -E '^backup_.*\.dump$' | sort -r | head -1)
+DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" s3-fetch -- rclone lsf "s3:pg-backups/backups/${FULLNAME}/" --files-only \
+  | grep -E '^backup_.*\.dump$' | sort -r | head -1)
 assert_not_contains "#159: a .tmp stage is never selected for restore (even if lexically newest)" "${DUMP_FILE}" ".tmp"
 # the decoy carries the far-future timestamp 99999999; assert it was NOT selected, so
 # this independently proves the published dump (not just any 'backup_' string) was chosen.
 assert_not_contains "#159: the far-future .tmp decoy is not selected" "${DUMP_FILE}" "99999999"
 assert_contains "#159: restore target is a published backup_<ts>.dump" "${DUMP_FILE}" "backup_"
-kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
+kubectl exec -n "${NAMESPACE}" s3-fetch -- rclone cat "s3:pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
   | kubectl exec -i -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "cat > /tmp/restore.dump"
-kubectl delete pod mc-fetch -n "${NAMESPACE}" --wait=false
+kubectl delete pod s3-fetch -n "${NAMESPACE}" --wait=false
 kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "
   pg_restore -U testuser -d testdb --clean --if-exists /tmp/restore.dump 2>/dev/null || true
   rm -f /tmp/restore.dump

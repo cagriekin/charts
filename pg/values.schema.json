@@ -750,6 +750,45 @@
           }
         }
       }
+    },
+    "backup": {
+      "type": "object",
+      "properties": {
+        "s3": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "rclone S3 provider name: Other for MinIO/Ceph/Wasabi-style endpoints, AWS for Amazon S3 (then set region) (#353)"
+            },
+            "region": {
+              "type": "string"
+            }
+          }
+        },
+        "rclone": {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": "string"
+                },
+                "digest": {
+                  "type": "string"
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

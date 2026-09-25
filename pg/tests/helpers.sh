@@ -195,6 +195,10 @@ deploy_minio() {
     --dry-run=client -o yaml | kubectl apply -f -
   rm -rf "${certdir}"
 
+  # bitnamilegacy, not minio/minio: MinIO withdrew its images from Docker Hub and quay.io
+  # (#348, #353). The Bitnami image reads the same public.crt/private.key pair from /certs
+  # and serves TLS when MINIO_SCHEME=https; it runs as uid 1001 with its data under
+  # /bitnami/minio/data, so that path gets a writable emptyDir.
   echo "Deploying MinIO (TLS on :9000, Service exposes :443 -> 9000)..."
   kubectl apply -n "${namespace}" -f - <<'MINIO'
 apiVersion: apps/v1
@@ -209,14 +213,15 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z
-          args: ["server", "/data", "--certs-dir", "/certs"]
+          image: bitnamilegacy/minio:2025.7.23-debian-12-r5
           env:
             - { name: MINIO_ROOT_USER, value: minioadmin }
             - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
+            - { name: MINIO_SCHEME, value: https }
           ports: [{ containerPort: 9000 }]
           volumeMounts:
             - { name: certs, mountPath: /certs, readOnly: true }
+            - { name: data, mountPath: /bitnami/minio/data }
           readinessProbe:
             httpGet: { path: /minio/health/ready, port: 9000, scheme: HTTPS }
             initialDelaySeconds: 5
@@ -224,6 +229,8 @@ spec:
       volumes:
         - name: certs
           secret: { secretName: minio-tls, defaultMode: 0444 }
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -234,12 +241,18 @@ spec:
 MINIO
   wait_for_deployment_ready "${namespace}" "minio" 180
 
+  # rclone, not mc (#353): the remote is defined from its environment, and bucket
+  # creation needs the bucket check ON (the chart's Jobs turn it off; they never create).
   echo "Creating bucket ${bucket}..."
-  kubectl delete pod mc-setup -n "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-  kubectl run mc-setup -n "${namespace}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
-    --command -- sh -c "mc --insecure alias set s3 https://minio:443 minioadmin minioadmin && mc --insecure mb s3/${bucket} || true"
-  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${namespace}" --timeout=120s
-  kubectl delete pod mc-setup -n "${namespace}" --wait=false
+  kubectl delete pod s3-setup -n "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kubectl run s3-setup -n "${namespace}" --restart=Never --image=rclone/rclone:1.71.2 \
+    --env=RCLONE_CONFIG=/dev/null --env=RCLONE_NO_CHECK_CERTIFICATE=true \
+    --env=RCLONE_CONFIG_S3_TYPE=s3 --env=RCLONE_CONFIG_S3_PROVIDER=Other \
+    --env=RCLONE_CONFIG_S3_ENDPOINT=https://minio:443 \
+    --env=RCLONE_CONFIG_S3_ACCESS_KEY_ID=minioadmin --env=RCLONE_CONFIG_S3_SECRET_ACCESS_KEY=minioadmin \
+    --command -- rclone mkdir "s3:${bucket}"
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/s3-setup -n "${namespace}" --timeout=120s
+  kubectl delete pod s3-setup -n "${namespace}" --wait=false
 }
 
 resolve_fullname() {

@@ -106,7 +106,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 
 > **Pinning images by digest (#26).** Every image block — `postgresql.image`,
 > `ha.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
-> `busyboxImage`, `backup.mc.image`, and `pgbackrest.cronjob.image` — accepts an
+> `busyboxImage`, `backup.rclone.image`, and `pgbackrest.cronjob.image` — accepts an
 > optional `digest` (e.g. `sha256:…`). When set, the image is rendered as
 > `repository:tag@digest` so a mutable-tag repush cannot silently change what runs.
 > Empty (default) pulls by tag.
@@ -841,9 +841,11 @@ kubectl create job --from=cronjob/my-pgvector-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
-| `backup.mc.image.repository` | MinIO client image for the mc-installer init container (quay.io — the Docker Hub `minio/*` repositories are gone, #348) | `quay.io/minio/mc` |
-| `backup.mc.image.tag` | MinIO client image tag | `RELEASE.2024-11-21T17-21-54Z` |
-| `backup.mc.image.pullPolicy` | MinIO client image pull policy | `IfNotPresent` |
+| `backup.s3.provider` | rclone S3 provider name (#353): `Other` for MinIO/Ceph/Wasabi-style endpoints, `AWS` for Amazon S3 (then set `region`, which rclone does not auto-detect) | `Other` |
+| `backup.s3.region` | S3 region, required with `provider: AWS` | `""` |
+| `backup.rclone.image.repository` | rclone image; the Jobs copy the `rclone` binary and its CA bundle out of it (#353). `backup.mc.*` was removed and fails the render | `rclone/rclone` |
+| `backup.rclone.image.tag` | rclone image tag | `1.71.2` |
+| `backup.rclone.image.pullPolicy` | rclone image pull policy | `IfNotPresent` |
 | `backup.podSecurityContext` | Backup pod security context | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` |
 | `backup.containerSecurityContext` | Backup container security context | `runAsUser: 999`, `runAsGroup: 999`, no privilege escalation, all capabilities dropped |
 | `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |

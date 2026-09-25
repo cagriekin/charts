@@ -1,6 +1,22 @@
 # pgvector chart changelog
 
-## 2.1.2 - unreleased
+## 2.2.0 - 2026-09-25
+
+### Changed
+
+- **The pg_dump backup path uses rclone instead of the MinIO client (#353).** MinIO withdrew
+  its images from Docker Hub and then quay.io and took dl.min.io down, so no `backup.mc.image`
+  could pull (2.1.1's quay move lasted a week). The backup and validation Jobs now copy the
+  `rclone` binary and its CA bundle out of `backup.rclone.image` (default `rclone/rclone`)
+  and drive S3 through rclone's environment-defined remote: credentials never in argv (#167),
+  never percent-encoded (#221). `backup.mc.*` is removed and any value under it fails the
+  render naming the new key. Behaviour is unchanged -- staged upload, streamed integrity
+  check, atomic publish, release-scoped retention -- except that retention and the stale-stage
+  sweep now stop at the release directory (`--max-depth 1`) instead of recursing into it, and
+  the installer init container no longer runs as root. New `backup.s3.provider` (default
+  `Other`) and `backup.s3.region`: Amazon S3 needs `provider: AWS` plus the bucket's region,
+  which rclone does not auto-detect the way mc did. The KinD suites' S3 server moved to
+  `bitnamilegacy/minio`.
 
 ### Fixed
 

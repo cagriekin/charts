@@ -29,6 +29,7 @@
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
+{{- include "pg.validateRemovedBackupMc" . }}
 {{- include "pg.validateLeaseTimings" . }}
 {{- include "pg.validateHaImageGeneration" . }}
 {{- include "pg.validateEtcdBootstrapImage" . }}
