@@ -1,6 +1,6 @@
 # pg chart changelog
 
-## 2.1.2 - unreleased
+## 2.1.2 - 2026-09-25
 
 ### Fixed
 
