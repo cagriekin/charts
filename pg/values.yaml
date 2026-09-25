@@ -81,7 +81,9 @@ postgresql:
     failureThreshold: 6
 
   # Suspends the liveness and readiness probes until PostgreSQL first accepts
-  # connections, so a slow start is not killed mid-startup by the liveness
+  # connections over loopback TCP -- which the bootstrap's socket-only transient postmaster
+  # never opens, so a cluster still being created cannot retire this grace (#350) -- so a
+  # slow start is not killed mid-startup by the liveness
   # probe: the agent has to acquire the lease and decide bootstrap-vs-clone before
   # postgres opens at all, and crash-recovery WAL replay can take longer still, both
   # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is

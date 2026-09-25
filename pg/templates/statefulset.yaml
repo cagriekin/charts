@@ -30,6 +30,7 @@
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
 {{- include "pg.validateRemovedBackupMc" . }}
+{{- include "pg.validateListenAddresses" . }}
 {{- include "pg.validateLeaseTimings" . }}
 {{- include "pg.validateHaImageGeneration" . }}
 {{- include "pg.validateEtcdBootstrapImage" . }}
@@ -1270,6 +1271,12 @@ spec:
 {{- if .Values.postgresql.startupProbe.enabled }}
           # Holds off liveness/readiness until postgres first accepts connections, so a
           # slow first start cannot be killed mid-flight by the liveness probe (#172).
+          # Over LOOPBACK TCP, not the unix socket (#350): the bootstrap's transient
+          # postmaster (entrypoint.sh, listen_addresses='') and the stock image's init-time
+          # server answer the socket, so a bare pg_isready retired this grace -- and armed
+          # liveness -- while the cluster was still being created. 127.0.0.1 is the one
+          # address only the real postmaster opens (listen_addresses='*', which the
+          # agent's own self-connection already relies on).
           # THIS BUDGET (periodSeconds x failureThreshold) BOUNDS A STANDBY'S FIRST CLONE:
           # since #288 the agent runs pg_basebackup from THIS container, not from a
           # probe-free init container, so lowering the threshold caps how long a clone of
@@ -1282,7 +1289,7 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+                - pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
             periodSeconds: {{ .Values.postgresql.startupProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.postgresql.startupProbe.timeoutSeconds }}
             failureThreshold: {{ .Values.postgresql.startupProbe.failureThreshold }}
@@ -1324,12 +1331,18 @@ spec:
             # cloning standby (no postgres yet, or walreceiver not yet streaming) is
             # NotReady by design -- it is not killed (agent-mode liveness is the agent
             # /healthz heartbeat, and readiness is independent of the startup probe).
+            # pg_isready probes LOOPBACK TCP (#350): the bootstrap's socket-only transient
+            # postmaster used to answer the socket and report the pod Ready mid-bootstrap,
+            # with the bootstrap pg_hba still on disk, then NotReady when it was stopped.
+            # The psql checks stay on the socket on purpose: they run as $POSTGRES_USER under
+            # the local trust rule, and once loopback answers, the socket is the real
+            # postmaster's too (the two never coexist).
             exec:
               command:
                 - /bin/bash
                 - -c
                 - |
-                  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
                   {{- if .Values.postgresql.tls.enabled }}
                   {{- /* Fail closed when requested server TLS is not actually on (#335).
                          `SHOW ssl` is the only signal that reports what the postmaster
@@ -1364,7 +1377,7 @@ spec:
                 - /bin/bash
                 - -c
                 - |
-                  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
                   {{- if .Values.postgresql.tls.enabled }}
                   {{- /* Fail closed when requested server TLS is not actually on (#335).
                          `SHOW ssl` is the only signal that reports what the postmaster

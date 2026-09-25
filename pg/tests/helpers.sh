@@ -298,3 +298,73 @@ discover_primary() {
   done
   echo ""
 }
+
+# --- #350 probe lab ---
+probe_lab_350() {
+  local ns="$1" pod="$2"
+  local lab_image lab_startup lab_readiness lab_overrides lab_out
+  # --- #350 probe lab: the mechanism, not the rendered text ---------------------------------
+  # Run the pod's ACTUAL startup and readiness commands (read back from the live pod spec) inside
+  # a throwaway pod of the same image, first against a socket-only postmaster started exactly the
+  # way the bootstrap starts its transient one (listen_addresses=''), then against one that
+  # listens on loopback. The socket-only server must FAIL both probes -- while a bare pg_isready,
+  # the pre-#350 shape, passes it, which is the regression this proves closed -- and the loopback
+  # server must PASS both, the readiness one as a primary (pg_is_in_recovery = f). PGHOST points
+  # the bare pg_isready at the lab's socket directory; `-h 127.0.0.1` overrides it, as in the pod.
+  echo "Running the #350 probe lab..."
+  lab_image=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].image}')
+  lab_startup=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].startupProbe.exec.command[2]}')
+  lab_readiness=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]}')
+  assert_contains "#350 lab: the live startup command asks loopback" "${lab_startup}" "pg_isready -h 127.0.0.1"
+  assert_contains "#350 lab: the live readiness command asks loopback first" "${lab_readiness}" "pg_isready -h 127.0.0.1"
+  # The container starts as root and the script runs as the image's own `postgres` user via
+  # runuser: initdb refuses root, and it also refuses a uid the image has no passwd entry for
+  # (the chart's default 101 has none in the stock image, whose postgres is 999).
+  lab_overrides=$(jq -cn --arg img "${lab_image}" --arg st "${lab_startup}" --arg rd "${lab_readiness}" '{
+    spec: {
+      restartPolicy: "Never",
+      containers: [{
+        name: "lab", image: $img, command: ["sleep", "900"],
+        env: [{name: "POSTGRES_USER", value: "postgres"}, {name: "POSTGRES_DB", value: "postgres"},
+              {name: "PGHOST", value: "/tmp/lab/run"}, {name: "STARTUP_CMD", value: $st}, {name: "READINESS_CMD", value: $rd}],
+        resources: {requests: {cpu: "100m", memory: "128Mi"}, limits: {cpu: "500m", memory: "256Mi"}}
+      }]
+    }}')
+  kubectl delete pod probe-lab-350 -n "${ns}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kubectl run probe-lab-350 -n "${ns}" --image="${lab_image}" --restart=Never --overrides="${lab_overrides}" >/dev/null
+  if ! kubectl wait --for=condition=Ready pod/probe-lab-350 -n "${ns}" --timeout=180s >/dev/null 2>&1; then
+    echo "  probe lab pod did not become Ready (image=${lab_image}):"
+    kubectl get pod -n "${ns}" probe-lab-350 -o wide 2>&1 | tail -1
+    kubectl describe pod -n "${ns}" probe-lab-350 2>&1 | sed -n '/^Events:/,$p' | tail -8
+  fi
+  # The lab script is a plain heredoc (no nested quoting) so a developer can dry-run the
+  # same text against an image with `docker run --entrypoint bash <img> -s`.
+  local lab_script
+  read -r -d '' lab_script <<'LAB' || true
+set -u
+PGBIN=$(ls -d /usr/lib/postgresql/*/bin | head -1); export PATH="$PGBIN:$PATH"
+export PGDATA=/tmp/lab/pgdata; mkdir -p /tmp/lab/run
+initdb -D "$PGDATA" -U postgres --auth-local=trust --auth-host=trust >/dev/null 2>&1 || { echo "initdb=fail"; exit 0; }
+probe() { bash -c "$2" >/dev/null 2>&1 && echo "$1=pass" || echo "$1=fail"; }
+# exactly the bootstrap's transient shape: listen_addresses='' (no TCP), socket only
+pg_ctl -D "$PGDATA" -w -o "-c listen_addresses='' -c unix_socket_directories=/tmp/lab/run" start >/dev/null 2>&1 || { echo "transient=fail"; exit 0; }
+probe bare-pg_isready-vs-transient 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+probe startup-vs-transient "$STARTUP_CMD"
+probe readiness-vs-transient "$READINESS_CMD"
+pg_ctl -D "$PGDATA" -w -m fast stop >/dev/null 2>&1
+pg_ctl -D "$PGDATA" -w -o "-c listen_addresses='127.0.0.1' -c unix_socket_directories=/tmp/lab/run" start >/dev/null 2>&1 || { echo "loopback=fail"; exit 0; }
+probe startup-vs-loopback "$STARTUP_CMD"
+probe readiness-vs-loopback "$READINESS_CMD"
+pg_ctl -D "$PGDATA" -w -m fast stop >/dev/null 2>&1
+LAB
+  lab_out=$(kubectl exec -i -n "${ns}" probe-lab-350 -- runuser -u postgres -- bash -s <<< "${lab_script}" 2>&1)
+  kubectl delete pod probe-lab-350 -n "${ns}" --wait=false >/dev/null 2>&1 || true
+  local r
+  r() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
+  assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(r bare-pg_isready-vs-transient)"
+  assert_eq "#350 lab: the startup probe is NOT satisfied by a socket-only postmaster" "fail" "$(r startup-vs-transient)"
+  assert_eq "#350 lab: the readiness probe is NOT satisfied by a socket-only postmaster" "fail" "$(r readiness-vs-transient)"
+  assert_eq "#350 lab: the startup probe passes once loopback listens" "pass" "$(r startup-vs-loopback)"
+  assert_eq "#350 lab: the readiness probe passes on a loopback-listening primary" "pass" "$(r readiness-vs-loopback)"
+  unset -f r
+}

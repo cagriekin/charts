@@ -38,6 +38,20 @@ POD1="${FULLNAME}-1"
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
 
+# --- #350: Ready means the REAL postmaster, never the bootstrap's transient one ---
+# The bootstrap writes its completion sentinel only after stopping the socket-only transient
+# postmaster; a standby clones the sentinel along with PGDATA. With the probes on loopback,
+# Ready therefore implies the sentinel on every pod and a postmaster answering on 127.0.0.1.
+# Checked at the first moment Ready is observed.
+for pod in "${POD0}" "${POD1}"; do
+  sentinel=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- sh -c 'test -f "$PGDATA/.pg-ha-bootstrap-complete" && echo yes || echo no' 2>/dev/null)
+  assert_eq "#350: ${pod} Ready implies the bootstrap sentinel is present" "yes" "${sentinel}"
+  loopback_rc=0
+  kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
+  assert_eq "#350: ${pod} Ready implies a postmaster on loopback" "0" "${loopback_rc}"
+done
+probe_lab_350 "${NAMESPACE}" "${POD0}"
+
 # --- agent mode shape: no repmgrd / service-updater sidecars ---
 for pod in "${POD0}" "${POD1}"; do
   containers=$(kubectl get pod -n "${NAMESPACE}" "${pod}" -o jsonpath='{.spec.containers[*].name}')

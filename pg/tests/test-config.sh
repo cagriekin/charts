@@ -26,6 +26,16 @@ POD="${FULLNAME}-0"
 pod_phase=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.status.phase}')
 assert_eq "pod ${POD} is Running" "Running" "${pod_phase}"
 
+# #350: Ready must mean the REAL postmaster. The stock image's init-time server is socket-only
+# and used to satisfy the probes, so `helm --wait` could return while the database was still
+# being created -- the pg_hba assertion below then read the init-time file. With the probes on
+# loopback, Ready implies loopback answers. Checked at the first moment Ready is seen.
+loopback_rc=0
+kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
+assert_eq "#350: Ready implies the real postmaster answers on loopback" "0" "${loopback_rc}"
+
+probe_lab_350 "${NAMESPACE}" "${POD}"
+
 # Test: configuration parameters are applied
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem is 64MB" "64MB" "${work_mem}"
@@ -44,6 +54,16 @@ assert_eq "custom.conf mounted at /etc/postgresql/conf.d" "0" "${mount_rc}"
 hba_content=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
   bash -c 'cat $(psql -U testuser -d testdb -t -A -c "SHOW hba_file")' 2>/dev/null)
 assert_contains "pg_hba contains custom entry" "${hba_content}" "host all all 10.244.0.0/16 md5"
+# Diagnostics for the historical flake on this assertion (#350): the entries are written by
+# the standalone postStart hook, so show what the file holds and whether the hook ran late.
+if ! grep -q "host all all 10.244.0.0/16 md5" <<< "${hba_content}"; then
+  echo "  --- pg_hba.conf as read ---"; printf '%s\n' "${hba_content}" | grep -vE '^\s*(#|$)' | head -20
+  echo "  --- container timing ---"
+  kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{range .status.containerStatuses[?(@.name=="postgresql")]}started={.state.running.startedAt} ready={.ready} restarts={.restartCount}{"\n"}{end}'
+  kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}readyAt={.lastTransitionTime}{"\n"}{end}'
+  kubectl get events -n "${NAMESPACE}" --field-selector involvedObject.name="${POD}" -o custom-columns='T:.lastTimestamp,R:.reason,M:.message' 2>/dev/null | tail -12
+  kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql --timestamps 2>/dev/null | grep -iE "postStart|hba|ready to accept|shutting down|init" | head -12
+fi
 
 # Test: upgrade with changed configuration (reload-only param)
 helm upgrade "${RELEASE}" "${CHART_DIR}" \

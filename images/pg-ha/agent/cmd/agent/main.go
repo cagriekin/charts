@@ -2347,9 +2347,10 @@ func (a *agent) discardFreshDataDir() error {
 	// between that start and its matching stop, WaitDelay kills entrypoint.sh but NOT the
 	// detached postmaster -- and then WipeDataDir refuses on the live postmaster.pid, returning
 	// "delete the PVC to recover" while every later sup.Start fails on "postmaster.pid already
-	// exists". The pod wedges Running/NotReady for good: the startupProbe's `pg_isready` over
-	// the unix socket is SATISFIED by the orphan, so the startup grace stops protecting, while
-	// selfConn() dials 127.0.0.1 and can never reach a socket-only postmaster.
+	// exists". The pod wedges Running/NotReady for good: the orphan answers only the unix
+	// socket, so the chart's loopback startupProbe (#350) never passes and the kubelet restarts
+	// the container after the startup budget, while selfConn() dials 127.0.0.1 and can never
+	// reach a socket-only postmaster either.
 	//
 	// Best-effort and on its OWN context: the usual trigger for this path is the parent budget
 	// having already expired, so reusing it would make the stop a guaranteed no-op.
@@ -2409,11 +2410,12 @@ func (a *agent) endClone() {
 // Why the budget is not enough on its own. bootstrapInitdbNative bounds the exec with
 // initdbBudget, and every error return calls discardFreshDataDir, so a slow or failing
 // bootstrap already cleans up after itself. What neither covers is the agent not returning at
-// all: `pg_ctl -w start` inside bootstrap_initdb satisfies the chart's startupProbe (plain
-// `pg_isready`, answered over the unix socket), which retires the startup grace and arms the
-// liveness probe -- and /healthz goes stale after ~3x the reconcile interval because act() holds
-// opMu for the whole exec without beating. On a contended node the kubelet can therefore SIGKILL
-// the container mid-bootstrap, with the same effect as an OOM kill or a node reboot: PGDATA is
+// all. Until chart 2.2.1 the transient `pg_ctl -w start` inside bootstrap_initdb satisfied the
+// chart's startupProbe (a bare `pg_isready`, answered over the unix socket), so the startup
+// grace was retired and liveness armed mid-bootstrap; the probe now asks loopback TCP, which
+// that postmaster never opens (#350), and the exec runs under beatDuring, so /healthz stays
+// fresh. The kill is still reachable -- OOM, eviction, a node reboot, an orphaned transient
+// after a cut-short exec (discardFreshDataDir) -- with the same effect: PGDATA is
 // initialized but carries no repmgr role or database, bootstrap_initdb no-ops on it forever
 // (PG_VERSION exists), and the pod comes up as a primary the agent can never authenticate
 // against. No error is returned to clean up after, so only a next-boot check can recover it.
