@@ -30,9 +30,7 @@ assert_eq "pod ${POD} is Running" "Running" "${pod_phase}"
 # and used to satisfy the probes, so `helm --wait` could return while the database was still
 # being created -- the pg_hba assertion below then read the init-time file. With the probes on
 # loopback, Ready implies loopback answers. Checked at the first moment Ready is seen.
-loopback_rc=0
-kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
-assert_eq "#350: Ready implies the real postmaster answers on loopback" "0" "${loopback_rc}"
+assert_loopback_answers "${NAMESPACE}" "${POD}"
 
 probe_lab_350 "${NAMESPACE}" "${POD}"
 

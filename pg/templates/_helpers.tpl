@@ -1764,11 +1764,6 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
-{{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
-       been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
-       that only ever configured repmgrd are gone, and a values file still carrying them
-       would otherwise deploy an agent cluster while its author believes repmgrd is running
-       -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
 {{- define "pg.validateListenAddresses" -}}
 {{- /* postgresql.configuration renders into conf.d/custom.conf, which sorts after the
        postgresql.conf the bootstrap wrote, so it can override listen_addresses='*'. Loopback
@@ -1786,7 +1781,7 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- if has (lower (trim $addr)) (list "*" "0.0.0.0" "localhost" "127.0.0.1") -}}{{- $ok = true -}}{{- end -}}
 {{- end -}}
 {{- if not $ok -}}
-{{- fail (printf "postgresql.configuration.listen_addresses=%q does not include IPv4 loopback: the startup and readiness probes check pg_isready over 127.0.0.1 (#350) and the HA agent connects to its own postmaster there, so this pod would never become Ready (an IPv6-only '::' or '::1' does not answer 127.0.0.1). Add '*' or '127.0.0.1' to the list (e.g. \"127.0.0.1, %s\"), or drop the key -- the chart already sets listen_addresses = '*'." ($v | toString) ($v | toString)) -}}
+{{- fail (printf "postgresql.configuration.listen_addresses=%q does not include IPv4 loopback: the startup and readiness probes check pg_isready over 127.0.0.1 (#350), and under ha.enabled the HA agent connects to its own postmaster there, so this pod would never become Ready (an IPv6-only '::' or '::1' does not answer 127.0.0.1). Add '*' or '127.0.0.1' to the list (e.g. \"127.0.0.1, %s\"), or drop the key -- the chart already sets listen_addresses = '*'." ($v | toString) ($v | toString)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -1803,6 +1798,11 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
+{{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
+       been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
+       that only ever configured repmgrd are gone, and a values file still carrying them
+       would otherwise deploy an agent cluster while its author believes repmgrd is running
+       -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
 {{- define "pg.validateRemovedRepmgrdValues" -}}
 {{- /* Checked in BOTH namespaces, and that is the whole point (#291 review). Reading only
        .Values.repmgr made every guard below silently skippable by taking the rename NOTES.txt

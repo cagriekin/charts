@@ -158,6 +158,12 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288) | `180` |
 
+The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350), the one address the
+bootstrap's transient postmaster and the stock image's init-time server never open, so Ready
+means the real postmaster. `listen_addresses` must therefore keep IPv4 loopback: a
+`postgresql.configuration.listen_addresses` without `*`, `0.0.0.0`, `localhost` or `127.0.0.1`
+fails the render. An IPv6-only `::`/`::1` does not count (PostgreSQL binds it `IPV6_V6ONLY`).
+
 ### Pod Disruption Budgets
 
 | Parameter | Description | Default |

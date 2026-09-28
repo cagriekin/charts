@@ -46,9 +46,7 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 60
 for pod in "${POD0}" "${POD1}"; do
   sentinel=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- sh -c 'test -f "$PGDATA/.pg-ha-bootstrap-complete" && echo yes || echo no' 2>/dev/null)
   assert_eq "#350: ${pod} Ready implies the bootstrap sentinel is present" "yes" "${sentinel}"
-  loopback_rc=0
-  kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
-  assert_eq "#350: ${pod} Ready implies a postmaster on loopback" "0" "${loopback_rc}"
+  assert_loopback_answers "${NAMESPACE}" "${pod}"
 done
 probe_lab_350 "${NAMESPACE}" "${POD0}"
 

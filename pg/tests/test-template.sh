@@ -1983,7 +1983,8 @@ for mode_name in agent standalone; do
     "$(probe_pg_isready "${cont}" startup | grep -c .)" "$(probe_pg_isready "${cont}" startup | grep -c -- '-h 127.0.0.1')"
   assert_eq "#350 ${mode_name}: every readinessProbe pg_isready asks 127.0.0.1" \
     "$(probe_pg_isready "${cont}" readiness | grep -c .)" "$(probe_pg_isready "${cont}" readiness | grep -c -- '-h 127.0.0.1')"
-  assert_not_eq "#350 ${mode_name}: ... and there is at least one" "0" "$(probe_pg_isready "${cont}" readiness | grep -c .)"
+  assert_not_eq "#350 ${mode_name}: ... and there is at least one startup pg_isready" "0" "$(probe_pg_isready "${cont}" startup | grep -c .)"
+  assert_not_eq "#350 ${mode_name}: ... and at least one readiness pg_isready" "0" "$(probe_pg_isready "${cont}" readiness | grep -c .)"
 done
 readiness_block=$(printf '%s\n' "${agent_pg_cont}" | awk '/readinessProbe:/{f=1; next} f && /^          [a-z]+:$/{exit} f')
 assert_not_contains "#350: the readiness psql checks stay on the unix socket (local trust)" "${readiness_block}" 'psql -h'

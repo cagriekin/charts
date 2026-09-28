@@ -299,11 +299,20 @@ discover_primary() {
   echo ""
 }
 
-# --- #350 probe lab ---
+# --- #350: Ready means the REAL postmaster ---
+# The bootstrap's transient postmaster and the stock image's init-time server are socket-only;
+# the probes ask loopback TCP, so a pod observed Ready must have a postmaster on 127.0.0.1.
+# Call it at the first moment Ready is seen, before anything else has had time to settle.
+assert_loopback_answers() {
+  local ns="$1" pod="$2" rc=0
+  kubectl exec -n "${ns}" "${pod}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || rc=$?
+  assert_eq "#350: ${pod} Ready implies the real postmaster answers on loopback" "0" "${rc}"
+}
+
+# --- #350 probe lab: the mechanism, not the rendered text ---
 probe_lab_350() {
   local ns="$1" pod="$2"
   local lab_image lab_startup lab_readiness lab_overrides lab_out
-  # --- #350 probe lab: the mechanism, not the rendered text ---------------------------------
   # Run the pod's ACTUAL startup and readiness commands (read back from the live pod spec) inside
   # a throwaway pod of the same image, first against a socket-only postmaster started exactly the
   # way the bootstrap starts its transient one (listen_addresses=''), then against one that
@@ -359,7 +368,6 @@ pg_ctl -D "$PGDATA" -w -m fast stop >/dev/null 2>&1
 LAB
   lab_out=$(kubectl exec -i -n "${ns}" probe-lab-350 -- runuser -u postgres -- bash -s <<< "${lab_script}" 2>&1)
   kubectl delete pod probe-lab-350 -n "${ns}" --wait=false >/dev/null 2>&1 || true
-  local r
   r() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
   assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(r bare-pg_isready-vs-transient)"
   assert_eq "#350 lab: the startup probe is NOT satisfied by a socket-only postmaster" "fail" "$(r startup-vs-transient)"
