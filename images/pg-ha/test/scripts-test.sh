@@ -258,9 +258,9 @@ fi
 
 # --- #288: bootstrap_initdb's completion sentinel is written LAST ---
 # The agent pairs an in-progress marker beside PGDATA with this sentinel inside it: marker
-# present and sentinel absent means the bootstrap was killed partway (the kubelet can do this --
-# the transient `pg_ctl start` satisfies the chart's startupProbe while the agent is inside the
-# exec and not beating /healthz) and the directory must be discarded. That inference only holds
+# present and sentinel absent means the bootstrap was killed partway (an OOM kill, an eviction,
+# a node reboot; the chart's probes no longer count the transient postmaster, #350) and the
+# directory must be discarded. That inference only holds
 # if the sentinel is written after the LAST thing the bootstrap does, so a half-bootstrapped
 # directory can never carry it.
 # Anchored to the WRITE, not to the literal anywhere (#298 review). The sentinel name appears

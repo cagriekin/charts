@@ -1,5 +1,22 @@
 # pg chart changelog
 
+## 2.2.1 - 2026-09-26
+
+### Fixed
+
+- **The startup and readiness probes no longer count the bootstrap's transient postmaster
+  (#350).** `pg_isready` now asks loopback TCP (`-h 127.0.0.1`), which the socket-only
+  postmaster `entrypoint.sh` runs while creating the cluster -- and the stock image's init-time
+  server in standalone mode -- never open. Before, a fresh install reported Ready mid-bootstrap
+  with the bootstrap-only `pg_hba.conf` still on disk (the `config` suite's
+  `pg_hba contains custom entry` flake), blipped NotReady when that postmaster was stopped, and
+  had its startup grace retired -- liveness armed -- while the agent was still inside the
+  bootstrap exec. The readiness probe's `psql` role and TLS checks stay on the unix socket. A
+  `postgresql.configuration.listen_addresses` without IPv4 loopback (`*`, `0.0.0.0`,
+  `localhost` or `127.0.0.1`; an IPv6-only `::`/`::1` does not count, PostgreSQL binds it
+  `IPV6_V6ONLY`) now fails the render: the probes and the HA agent's self-connection both
+  need it. Pods roll once for the probe change.
+
 ## 2.2.0 - 2026-09-25
 
 ### Changed
