@@ -883,6 +883,14 @@ spec:
             - name: CASCADE_REPLICATION
               value: "true"
 {{- end }}
+{{- if gt (int64 .Values.ha.agent.maximumLagOnFailover) 0 }}
+            {{- /* RPO gate on automatic failover (#273). A lease-holding standby more than this
+                   many bytes behind the primary's last recorded position refuses to promote and
+                   releases the lease, so an asymmetric outage cannot accept unbounded data loss.
+                   Emitted only when set: 0 keeps the agent's environment byte-identical. */}}
+            - name: MAX_LAG_ON_FAILOVER_BYTES
+              value: {{ int64 .Values.ha.agent.maximumLagOnFailover | quote }}
+{{- end }}
 {{- if .Values.ha.agent.syncReplicationSlots }}
             {{- /* Logical failover slot sync (#308): the primary reconciles
                    synchronized_standby_slots to its current standby's physical slot(s)

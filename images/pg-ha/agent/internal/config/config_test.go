@@ -723,3 +723,27 @@ func TestStringRedactsTheRepmgrPassword(t *testing.T) {
 		t.Errorf("%%v bypassed String(): %s", v)
 	}
 }
+
+// #273: MAX_LAG_ON_FAILOVER_BYTES is optional; unset is 0 (gate off), and a value that is
+// not a non-negative integer is refused rather than silently read as "off".
+func TestLoadMaxLagOnFailover(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil || c.MaxLagOnFailoverBytes != 0 {
+		t.Fatalf("unset: got %d err=%v, want 0 and no error", c.MaxLagOnFailoverBytes, err)
+	}
+	env := fullEnv()
+	env["MAX_LAG_ON_FAILOVER_BYTES"] = "1048576"
+	c, err = Load(getter(env))
+	if err != nil || c.MaxLagOnFailoverBytes != 1048576 {
+		t.Fatalf("1048576: got %d err=%v", c.MaxLagOnFailoverBytes, err)
+	}
+	if !strings.Contains(c.String(), "MaxLagOnFailoverBytes:1048576") {
+		t.Errorf("String() omits the gate: %s", c.String())
+	}
+	for _, bad := range []string{"-1", "1MB", "abc", "1.5"} {
+		env["MAX_LAG_ON_FAILOVER_BYTES"] = bad
+		if _, err := Load(getter(env)); err == nil || !strings.Contains(err.Error(), "MAX_LAG_ON_FAILOVER_BYTES") {
+			t.Errorf("%q: want a MAX_LAG_ON_FAILOVER_BYTES error, got %v", bad, err)
+		}
+	}
+}

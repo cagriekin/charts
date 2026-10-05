@@ -81,6 +81,7 @@ func TestEveryMetricIsWiredToItsOwnSetter(t *testing.T) {
 		{"pg_ha_agent_tls_inactive", "1", func(m *Metrics) { m.SetTLSInactive(true) }},
 		{"pg_ha_agent_renew_failures_total", "1", func(m *Metrics) { m.IncRenewFailure() }},
 		{"pg_ha_agent_promotions_total", "1", func(m *Metrics) { m.IncPromotion() }},
+		{"pg_ha_agent_promotions_refused_lag_total", "1", func(m *Metrics) { m.IncPromotionRefusedLag() }},
 		{"pg_ha_agent_demotes_total", "1", func(m *Metrics) { m.IncDemote() }},
 		{"pg_ha_agent_fences_total", "1", func(m *Metrics) { m.IncFence() }},
 		{"pg_ha_agent_reconcile_errors_total", "1", func(m *Metrics) { m.IncReconcileError() }},

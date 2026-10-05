@@ -106,6 +106,10 @@ type Config struct {
 	// slot(s) on every tick it serves, so a logical failover slot can be synced across
 	// promote without a full resync. Physical replication is unaffected either way.
 	SyncReplicationSlots bool // SYNC_REPLICATION_SLOTS
+	// MaxLagOnFailoverBytes is the #273 RPO gate: a lease-holding standby more than this many
+	// bytes behind the primary's last recorded position refuses automatic promotion. 0 (the
+	// default, and the value when MAX_LAG_ON_FAILOVER_BYTES is unset) disables the gate.
+	MaxLagOnFailoverBytes uint64 // MAX_LAG_ON_FAILOVER_BYTES
 
 	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
 	// (all-or-none, enforced by the dcs layer).
@@ -305,6 +309,17 @@ func Load(get func(string) string) (*Config, error) {
 
 	// Logical failover slot sync (#308). Optional -- absent/empty means off.
 	c.SyncReplicationSlots = boolEnv(get("SYNC_REPLICATION_SLOTS"))
+	// #273: optional; the chart emits it only when ha.agent.maximumLagOnFailover > 0. A
+	// value that does not parse as a non-negative integer is a misconfiguration, not 0 --
+	// silently disabling an RPO guard the operator asked for is the failure this agent's
+	// other optional knobs are careful to avoid.
+	if v := strings.TrimSpace(get("MAX_LAG_ON_FAILOVER_BYTES")); v != "" {
+		n, perr := strconv.ParseUint(v, 10, 64)
+		if perr != nil {
+			l.invalid = append(l.invalid, fmt.Sprintf("MAX_LAG_ON_FAILOVER_BYTES=%q must be a non-negative integer number of bytes (%v)", v, perr))
+		}
+		c.MaxLagOnFailoverBytes = n
+	}
 
 	// PostgreSQL major (#269). Optional -- the image ENV supplies it; default 18 for an
 	// older image that predates the build arg. Digits only: the value is joined into the
@@ -524,12 +539,12 @@ func (c Config) String() string {
 		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s Mechanism:%s DCSBackend:%s "+
 		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d "+
 		"Control:%t ControlAddr:%s ControlMTLS:%t ControlAllowedCNs:%d "+
-		"ControlRestore:%t ControlRestoreAllowedCNs:%d ControlRestoreReadPodLogs:%t}",
+		"ControlRestore:%t ControlRestoreAllowedCNs:%d ControlRestoreReadPodLogs:%t MaxLagOnFailoverBytes:%d}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
 		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.Mechanism, c.DCSBackend,
 		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules),
 		c.ControlEnabled, c.ControlAddr, c.ControlCertFile != "", len(c.ControlAllowedCNs),
-		c.ControlRestoreEnabled, len(c.ControlRestoreAllowedCNs), c.ControlRestoreReadPodLogs)
+		c.ControlRestoreEnabled, len(c.ControlRestoreAllowedCNs), c.ControlRestoreReadPodLogs, c.MaxLagOnFailoverBytes)
 }

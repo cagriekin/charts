@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
@@ -585,5 +586,56 @@ func TestEveryActionRendersItsOwnName(t *testing.T) {
 		if c.a.String() != c.name {
 			t.Errorf("%s renders as %q", c.name, c.a.String())
 		}
+	}
+}
+
+// #273: the RPO gate on automatic promotion. The lease-holding standby is the most-advanced
+// reachable node (every earlier branch has passed); the gate asks whether even that is close
+// enough to where the primary was, as recorded on the marker.
+func TestLagGateRefusesAFarBehindHolder(t *testing.T) {
+	local := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true}
+	marker := MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0", LSN: ls(0, 0x1000+2<<20), LSNOK: true} // 2 MiB ahead
+	cases := []struct {
+		name       string
+		obs        Observation
+		wantAction Action
+		wantInWhy  string
+	}{
+		{"gate off (0) promotes", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 0}, Promote, ""},
+		{"lag above the limit releases, naming the gate", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, LagGateReason},
+		{"lag exactly at the limit promotes", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 2 << 20}, Promote, ""},
+		{"caught-up standby promotes under a tight limit", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000+2<<20), LSNOK: true}, Marker: marker, MaxLagBytes: 1}, Promote, ""},
+		{"standby ahead of the recorded position promotes", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000+3<<20), LSNOK: true}, Marker: marker, MaxLagBytes: 1}, Promote, ""},
+		{"no recorded position: the gate steps aside", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}, MaxLagBytes: 1}, Promote, ""},
+		{"unknown local LSN: the gate steps aside", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true}, Marker: marker, MaxLagBytes: 1}, Promote, ""},
+		{"recorded position from another timeline is not compared", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(6), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true}, Marker: MarkerState{Present: true, Timeline: tl(5), LSN: ls(0, 0x1000+2<<20), LSNOK: true}, MaxLagBytes: 1}, Promote, ""},
+		{"operator override: switchover-target naming this node promotes despite the lag", Observation{HoldLease: true, LocalNode: "pg-1", SwitchoverTarget: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, Promote, ""},
+		{"a switchover-target naming ANOTHER node is no override", Observation{HoldLease: true, LocalNode: "pg-1", SwitchoverTarget: "pg-2", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, LagGateReason},
+	}
+	for _, c := range cases {
+		got := Decide(c.obs)
+		if got.Action != c.wantAction {
+			t.Errorf("%s: action = %s (%s), want %s", c.name, got.Action, got.Reason, c.wantAction)
+		}
+		if c.wantInWhy != "" && !strings.Contains(got.Reason, c.wantInWhy) {
+			t.Errorf("%s: reason %q lacks %q", c.name, got.Reason, c.wantInWhy)
+		}
+	}
+}
+
+// The gate ranks AFTER the handoff to a more-advanced reachable peer and after the highwater
+// guard: a holder that must release for either of those reasons never reaches it, so the lag
+// reason only ever describes a node that would otherwise have promoted.
+func TestLagGateDoesNotPreemptEarlierGuards(t *testing.T) {
+	local := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true}
+	marker := MarkerState{Present: true, Timeline: tl(5), LSN: ls(0, 0x1000+2<<20), LSNOK: true}
+	ahead := Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1,
+		Peers: []PeerState{standby("pg-2", 5, 0, 0x1000+1<<20)}}
+	if got := Decide(ahead); got.Action != ReleaseLease || got.Target != "pg-2" || strings.Contains(got.Reason, LagGateReason) {
+		t.Errorf("more-advanced peer should win the handoff before the gate speaks: %+v", got)
+	}
+	below := Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(7), LSN: ls(0, 0x1000+2<<20), LSNOK: true}, MaxLagBytes: 1}
+	if got := Decide(below); got.Action != ReleaseLease || strings.Contains(got.Reason, LagGateReason) || !strings.Contains(got.Reason, "highwater") {
+		t.Errorf("highwater guard should speak before the gate: %+v", got)
 	}
 }

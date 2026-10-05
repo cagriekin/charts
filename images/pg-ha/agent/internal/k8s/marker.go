@@ -64,6 +64,14 @@ type Marker struct {
 	PausedBy string
 	// SwitchoverTarget is the pod named by SwitchoverTargetAnnotation ("" if none).
 	SwitchoverTarget string
+	// LSN is the serving primary's last recorded write position (PostgreSQL text form
+	// "X/Y"), "" when none was ever recorded (#273). It is the reference the lag gate
+	// compares a failover candidate against: the marker outlives the primary's pod, which
+	// its gossip annotation does not, so it is the one place that still says where the
+	// primary was once the primary is gone. Refreshed every primary tick only while the
+	// gate is enabled; at most one reconcile interval behind the true position, so the
+	// lag it yields is a floor, not a ceiling. Parsed by the agent (pg.ParseLSN), not here.
+	LSN string
 	// SchemaVersion is the on-DCS data version (absent/0 == legacy v1). A reader
 	// seeing a value above its own SchemaVersion is talking to a newer agent
 	// mid-upgrade (Part H4).
@@ -86,6 +94,7 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 		Paused:           strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true"),
 		PausedBy:         strings.TrimSpace(cm.Annotations[PausedByAnnotation]),
 		SwitchoverTarget: strings.TrimSpace(cm.Annotations[SwitchoverTargetAnnotation]),
+		LSN:              strings.TrimSpace(cm.Data["lsn"]),
 	}
 	if v, perr := strconv.Atoi(cm.Data["schemaVersion"]); perr == nil {
 		m.SchemaVersion = v
@@ -154,6 +163,35 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	}
 	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
 		return fmt.Errorf("update marker %s: %w", name, uerr)
+	}
+	return nil
+}
+
+// WriteMarkerLSN records the serving primary's write position in the marker's Data
+// (key "lsn", PostgreSQL "X/Y" text) for the #273 lag gate. A MISSING marker is a no-op
+// rather than a create: the marker's identity is the highwater timeline WriteMarker
+// records, and the primary's first StayPrimary tick writes that before this is ever
+// called -- creating a timeline-less marker here would make it Present-but-Malformed,
+// which every reader fails closed on (#174). Read-modify-write of the one key, so the
+// highwater, the primary name and every annotation (pause, switchover) are untouched.
+func (c *Client) WriteMarkerLSN(ctx context.Context, name, lsn string) error {
+	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
+	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get marker %s: %w", name, err)
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	if cm.Data["lsn"] == lsn {
+		return nil
+	}
+	cm.Data["lsn"] = lsn
+	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
+		return fmt.Errorf("update marker %s lsn: %w", name, uerr)
 	}
 	return nil
 }

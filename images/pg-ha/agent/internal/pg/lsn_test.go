@@ -69,3 +69,15 @@ func TestRoleStringsAreTheContract(t *testing.T) {
 		t.Errorf("an out-of-range Role = %q, want unknown", got)
 	}
 }
+
+func TestLSNStringRoundTrips(t *testing.T) {
+	for _, s := range []string{"0/3000120", "1A/FF000000", "FFFFFFFF/FFFFFFFF"} {
+		l, ok := ParseLSN(s)
+		if !ok {
+			t.Fatalf("ParseLSN(%q) failed", s)
+		}
+		if got := l.String(); got != s {
+			t.Errorf("String() = %q, want %q", got, s)
+		}
+	}
+}

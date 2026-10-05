@@ -202,6 +202,22 @@ casc_bool_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.cascadingReplication=true >/dev/null 2>&1 || casc_bool_rc=$?
 assert_eq "#298: a real boolean cascadingReplication renders" "0" "${casc_bool_rc}"
 
+# #273: the RPO gate. Off by default (no env, so the agent's environment is byte-identical);
+# an integer renders quoted (k8s env values are strings); a string or a negative is refused by
+# the schema -- a quoted value would read as 0 through int64 and silently disable the guard.
+lag_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#273: no MAX_LAG_ON_FAILOVER_BYTES at the default (gate off)" "${lag_default}" "MAX_LAG_ON_FAILOVER_BYTES"
+lag_on=$(helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#273: the knob renders the agent env" "${lag_on}" "name: MAX_LAG_ON_FAILOVER_BYTES"
+assert_contains "#273: ... quoted, as an integer" "${lag_on}" 'value: "1048576"'
+lag_str_rc=0; helm template test-pg "${CHART_DIR}" --set-string ha.agent.maximumLagOnFailover=1MB >/dev/null 2>&1 || lag_str_rc=$?
+assert_gt "#273: a string value is refused by the schema" "${lag_str_rc}" 0
+lag_neg_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=-1 >/dev/null 2>&1 || lag_neg_rc=$?
+assert_gt "#273: a negative value is refused by the schema" "${lag_neg_rc}" 0
+lag_rule=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#273: the refused-promotion alert is shipped" "${lag_rule}" "alert: PGHAAgentPromotionRefusedLag"
+assert_contains "#273: ... on the refusal counter" "${lag_rule}" "pg_ha_agent_promotions_refused_lag_total"
+
 # #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
 # value renders as a YAML scalar the API server rejects with an unmarshal error).
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)

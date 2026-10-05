@@ -10,6 +10,7 @@
 package reconcile
 
 import (
+	"fmt"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 
 	"github.com/cagriekin/pg-ha-agent/internal/podname"
@@ -99,6 +100,14 @@ type MarkerState struct {
 	// the lease so the data-bearing primary can acquire and serve (#186); "" when
 	// the marker is absent or carries no primary.
 	Primary string
+	// LSN is the last write position the serving primary recorded on the marker (#273),
+	// LSNOK false when none was recorded or it did not parse. The lag gate's reference:
+	// it survives the primary's pod, unlike gossip, so it still says where the primary
+	// was after the primary is gone. Written once per primary tick while the gate is
+	// enabled, so it trails the true position by at most one reconcile interval -- the
+	// lag computed from it is a floor on the real loss, never an overestimate.
+	LSN   pg.LSN
+	LSNOK bool
 }
 
 // Observation is the full input to a decision.
@@ -172,7 +181,18 @@ type Observation struct {
 	// oscillates the chosen upstream and re-runs `repmgr standby follow` every tick
 	// (the #182 no-thrash invariant). "" before the first follow.
 	CurrentUpstream string
+	// MaxLagBytes is the RPO gate on AUTOMATIC promotion (#273; Patroni's
+	// maximum_lag_on_failover): a lease-holding standby whose write position trails the
+	// marker's recorded primary position by more than this many bytes refuses to promote
+	// and releases the lease instead. 0 disables the gate. Without it the election
+	// promotes the most-advanced REACHABLE standby whatever its distance from the lost
+	// primary, so an asymmetric outage can accept unbounded data loss.
+	MaxLagBytes uint64
 }
+
+// LagGateReason is the fixed prefix of the Decision.Reason a lag-refused promotion
+// carries, so the agent can count and alert on it without parsing prose.
+const LagGateReason = "lag gate (#273)"
 
 // Decide maps an Observation to the single action to take.
 func Decide(o Observation) Decision {
@@ -250,6 +270,16 @@ func Decide(o Observation) Decision {
 			}
 			if o.PeersPending {
 				return d(Wait, "", "cold boot: waiting for peers to report their position before promoting (recovery-mode makes stopped primary-state peers observable)")
+			}
+			// RPO gate (#273), last before the promote: everything above has established that
+			// this node is the most-advanced one that can serve; this asks whether even that is
+			// close enough to where the primary was. Release rather than Wait, for the same
+			// reason the empty-data branch releases (#186): holding the lease while refusing
+			// would DemoteFence the former primary the moment it comes back read-write -- the
+			// one node whose data this gate exists to keep -- whereas a free lease lets it
+			// reacquire and resume through StartLocal/StayPrimary with nothing discarded.
+			if blocked, why := lagExceedsFailoverLimit(o); blocked {
+				return d(ReleaseLease, "", "refuse to promote: "+why)
 			}
 			// #297's "unregistered holder must not promote" gate stood here until #298's
 			// review. It read repmgr.nodes to refuse promoting a node no survivor could
@@ -389,6 +419,36 @@ func Decide(o Observation) Decision {
 		}
 		return d(StartLocal, "", "standby-state data, stopped: start as a standby")
 	}
+}
+
+// lagExceedsFailoverLimit reports whether the local standby trails the marker's recorded
+// primary position by more than o.MaxLagBytes (#273), with the reason to log. It is
+// deliberately narrow: it never blocks when the gate is off, when either position is
+// unknown, or when the marker's timeline is not the local one (a standby below the
+// highwater is already refused by unsafeToServe; a standby above it cannot exist). An
+// explicit operator request -- the switchover-target annotation naming THIS node -- is
+// the override the issue asks for: the operator has looked at the lag and accepted it,
+// and automatic promotion is what the gate bounds, not a manual one.
+func lagExceedsFailoverLimit(o Observation) (bool, string) {
+	if o.MaxLagBytes == 0 || !o.Marker.Present || o.Marker.Malformed || !o.Marker.LSNOK || !o.Local.LSNOK {
+		return false, ""
+	}
+	if !o.Local.TimelineOK || o.Marker.Timeline != o.Local.Timeline {
+		return false, ""
+	}
+	ref, loc := o.Marker.LSN.Uint64(), o.Local.LSN.Uint64()
+	if ref <= loc {
+		return false, ""
+	}
+	lag := ref - loc
+	if lag <= o.MaxLagBytes {
+		return false, ""
+	}
+	if o.SwitchoverTarget != "" && o.SwitchoverTarget == o.LocalNode {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s: this standby is %d bytes behind the primary's last recorded position %s (limit %d; set ha.agent.maximumLagOnFailover=0 to disable, or request this node explicitly with the pg-ha/switchover-target annotation to accept the loss)",
+		LagGateReason, lag, o.Marker.LSN, o.MaxLagBytes)
 }
 
 // sameTimelinePrimary returns a reachable live primary on exactly the local

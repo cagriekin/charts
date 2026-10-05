@@ -483,3 +483,44 @@ func TestWriteMarkerTreatsAnUnparseableTimelineAsNoConstraint(t *testing.T) {
 		t.Errorf("timeline = %d, want 3", m.Timeline)
 	}
 }
+
+// #273: the primary's position rides on the marker beside the highwater, survives a highwater
+// advance, is a no-op on an absent marker, and skips the write when unchanged.
+func TestMarkerLSNRecord(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+		t.Fatalf("absent marker must be a no-op: %v", err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Present {
+		t.Fatalf("WriteMarkerLSN must not create the marker: %+v", m)
+	}
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := c.ReadMarker(ctx, "pg-primary")
+	if err != nil || m.LSN != "0/3000120" || m.Timeline != 7 || m.Primary != "pg-1" {
+		t.Fatalf("read back: %+v err=%v", m, err)
+	}
+	// A highwater advance keeps the position (WriteMarker merges its keys).
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 8); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000120" || m.Timeline != 8 {
+		t.Errorf("position lost on advance: %+v", m)
+	}
+	// Unchanged position: no Update action issued.
+	before := len(cs.Actions())
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range cs.Actions()[before:] {
+		if a.GetVerb() == "update" {
+			t.Errorf("unchanged position must not write: %v", a)
+		}
+	}
+}

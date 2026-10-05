@@ -637,6 +637,7 @@ render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Override per incident with `pg-ha/switchover-target=<pod>`. See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
 | `ha.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
 | `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself. The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**, so a stale pin fails loudly instead of being ignored. See [Replication Mechanics](#replication-mechanics-experimental-287) below. | `native` |
 
@@ -758,6 +759,38 @@ If you were already on the default (agent) — which has been the default since 
 from your values if you set it explicitly, since 2.0.0 rejects the key either way.
 
 GitOps/ArgoCD: the Lease, the primary-marker ConfigMap, and the write-Service `.spec.selector` are runtime-owned by the agent — `ignoreDifferences` on the Service selector and do not prune the Lease/marker, or auto-sync will fight the agent. Set `postgresql.existingSecret.enabled=true` (the `lookup`-based password generation returns nil under ArgoCD).
+
+### RPO gate on automatic failover (#273)
+
+The election promotes the most-advanced **reachable** standby. Without a bound, that standby
+can still be far behind the primary it replaces — an asymmetric outage (the primary and its
+best standby lost together, a standby stalled for an hour) then costs whatever WAL the survivor
+never received. `ha.agent.maximumLagOnFailover` is that bound, in bytes (Patroni's
+`maximum_lag_on_failover`; its default is 1 MiB, this chart's is `0`, off).
+
+How it works. While the gate is enabled the serving primary records its write position on the
+`<fullname>-primary` marker ConfigMap every tick (`data.lsn`, one bounded write; the marker
+outlives the pod, unlike the gossip annotation). A standby that acquires the lease compares its
+own position with that record **last**, after every other guard (highwater, a more-advanced
+reachable peer, cold-boot settling): if it is more than the limit behind, it refuses to promote
+and **releases the lease** rather than holding it — holding would fence the former primary the
+moment it came back, which is the one node whose data the gate exists to keep. Releasing lets
+the returning primary reacquire and resume with nothing discarded. Until then the cluster has
+no primary: `pg_ha_agent_promotions_refused_lag_total` climbs once per refusing tick and
+`PGHAAgentPromotionRefusedLag` pages, and `GET /v1/cluster` carries the reason.
+
+What it does not do. The recorded position trails the true one by at most one
+`reconcileInterval`, so the measured lag is a floor on the real loss, not a ceiling. It bounds
+*automatic* promotion only: a controlled switchover is unaffected (its target must be caught up
+anyway), and an operator accepts the loss explicitly by naming the node:
+
+```bash
+kubectl annotate configmap <fullname>-primary pg-ha/switchover-target=<standby-pod>
+```
+
+The named standby promotes on its next tick and clears the annotation (one-shot, like every
+switchover request). `kubectl annotate ... pg-ha/switchover-target-` withdraws it. Lowering the
+value to `0` with `helm upgrade` is the other way out; it rolls the pods.
 
 ### Maintenance mode (pause)
 

@@ -276,6 +276,7 @@ jobs:
           - cascading-replication
           - sync-replication-slots
           - agent-rolling
+          - agent-lag-gate
           - backup-restore
           - backup-concurrent
           - pgbackrest-restore
