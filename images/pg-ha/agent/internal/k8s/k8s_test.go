@@ -506,15 +506,21 @@ func TestMarkerLSNRecord(t *testing.T) {
 	if err != nil || m.LSN != "0/3000120" || m.Timeline != 7 || m.Primary != "pg-1" {
 		t.Fatalf("read back: %+v err=%v", m, err)
 	}
-	// Unchanged position: no Update action issued.
+	// One merge patch, no read-modify-write: it cannot conflict with the control API's
+	// annotation writes or the Promote branch's WriteMarker.
 	before := len(cs.Actions())
-	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000200"); err != nil {
 		t.Fatal(err)
 	}
+	verbs := ""
 	for _, a := range cs.Actions()[before:] {
-		if a.GetVerb() == "update" {
-			t.Errorf("unchanged position must not write: %v", a)
-		}
+		verbs += a.GetVerb() + " "
+	}
+	if verbs != "patch " {
+		t.Errorf("WriteMarkerLSN must be exactly one patch, got %q", verbs)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000200" || m.Primary != "pg-1" || m.Timeline != 7 {
+		t.Errorf("patch must touch only lsn: %+v", m)
 	}
 	// A same-timeline rewrite keeps the position; a timeline ADVANCE retires it, because the
 	// gate only ever compares same-timeline positions and a stale one would be compared
@@ -522,7 +528,7 @@ func TestMarkerLSNRecord(t *testing.T) {
 	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
 		t.Fatal(err)
 	}
-	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000120" {
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000200" {
 		t.Errorf("same-timeline rewrite dropped the position: %+v", m)
 	}
 	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 8); err != nil {

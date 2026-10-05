@@ -637,7 +637,7 @@ render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
-| `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Override per incident with `pg-ha/switchover-target=<pod>`. See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
+| `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Accept the loss per incident with `pg-ha/accept-failover-lag=<pod>` on the marker. Needs the pg-ha image at 2.1.0 or later (render-enforced). See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
 | `ha.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
 | `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself. The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**, so a stale pin fails loudly instead of being ignored. See [Replication Mechanics](#replication-mechanics-experimental-287) below. | `native` |
 
@@ -798,9 +798,11 @@ kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<standby
 
 Name the node the refusal names: the most-advanced reachable standby, which is the one
 refusing (its `ERROR` line and `GET /v1/cluster` print the exact command). It promotes on its
-next tick however far behind it is, and the annotation is cleared (one-shot). Naming a
-further-behind node is ignored, and the refusal says which node to name instead: letting it jump
-the most-advanced ranking would discard even more WAL than the gate refused.
+next tick however far behind it is, and the annotation is cleared (one-shot: whichever node
+next serves read-write clears it, so an acceptance left over from an episode the returning
+primary ended cannot waive a later failover's bound). Naming a further-behind node is ignored,
+and the refusal says which node to name instead: letting it jump the most-advanced ranking
+would discard even more WAL than the gate refused.
 `kubectl annotate ... pg-ha/accept-failover-lag-` withdraws it. Lowering the value to `0` with
 `helm upgrade` is the other way out; it rolls the pods.
 

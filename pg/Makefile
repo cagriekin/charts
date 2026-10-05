@@ -61,7 +61,7 @@ test-agent: cluster-exists
 	@bash $(TESTS_DIR)/test-agent-failover.sh
 
 # RPO gate on automatic failover (#273): a caught-up standby still fails over, a lagging one
-# refuses and releases, the switchover-target annotation overrides, the ex-primary rejoins.
+# refuses and releases, pg-ha/accept-failover-lag promotes it, the ex-primary rejoins.
 test-agent-lag-gate: cluster-exists
 	@bash $(TESTS_DIR)/test-agent-lag-gate.sh
 

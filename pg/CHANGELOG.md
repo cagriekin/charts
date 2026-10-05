@@ -1,6 +1,6 @@
 # pg chart changelog
 
-## 2.3.0 - unreleased
+## 2.3.0 - 2026-10-05
 
 ### Added
 
@@ -15,7 +15,10 @@
   pages on them. The explicit acceptance of the loss is a new annotation,
   `pg-ha/accept-failover-lag=<pod>` on the marker (one-shot; names the refusing, most-advanced
   standby, which then promotes); a pending `pg-ha/switchover-target` is never read as one. Default `0`
-  (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0.
+  (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0,
+  which this release pins; setting the knob against an older `ha.image.tag` fails the render.
+  The agent's Role gains `patch` on the one marker ConfigMap (the position is recorded by JSON
+  merge patch, so it never races an operator's annotation edit); a BYO Role must grant it too.
 
 ## 2.2.1 - 2026-09-26
 

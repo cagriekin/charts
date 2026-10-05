@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // SchemaVersion is the version of the data the agent writes to the DCS (the marker
@@ -47,13 +49,18 @@ const (
 )
 
 // AcceptLagAnnotation, set to a pod name on the marker ConfigMap, is the operator's
-// explicit acceptance of the data loss the #273 lag gate would otherwise refuse: that
-// pod may promote on the next automatic failover however far behind the recorded
-// position it is, and the lease holder hands it the lease if it is not already the
-// holder. One-shot -- the promoting node clears it. Deliberately NOT the
-// switchover-target annotation: that one is a routine handoff request whose target must
-// be caught up, and a pending one must never double as a waiver of the RPO bound when
-// the primary happens to die before the target catches up. Set with
+// explicit acceptance of the data loss the #273 lag gate would otherwise refuse: that pod
+// may promote however far behind the recorded position it is. It waives the gate for the
+// named node only, and only once that node is the lease holder the election settled on
+// (the most-advanced reachable standby -- which is also the node whose refusal is being
+// logged, and the refusal prints the exact annotate command). Naming a further-behind node
+// is ignored: letting it jump the ranking would discard even more WAL than the gate
+// refused. One-shot: cleared by whichever node next serves read-write, so an acceptance
+// left over from an episode that ended another way (the primary came back) can never
+// waive the bound on a later failover. Deliberately NOT the switchover-target annotation:
+// that one is a routine handoff request whose target must be caught up, and a pending one
+// must never double as a waiver of the RPO bound when the primary happens to die before
+// the target catches up. Set with
 // `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<pod>`.
 const AcceptLagAnnotation = "pg-ha/accept-failover-lag"
 
@@ -165,7 +172,8 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	// write that refuses to lower it costs nothing and cannot be fooled that way. An
 	// unparseable recorded value is treated as no constraint, matching shouldAdvanceMarker.
 	if cur, ok := cm.Data["timeline"]; ok {
-		if v, perr := strconv.ParseUint(cur, 10, 32); perr == nil && timeline < uint32(v) {
+		v, perr := strconv.ParseUint(cur, 10, 32)
+		if perr == nil && timeline < uint32(v) {
 			return fmt.Errorf("refusing to lower the highwater marker %s from timeline %d to %d: it is monotonic (#125)", name, v, timeline)
 		}
 		// A timeline ADVANCE retires the recorded position (#273): it was measured on the
@@ -173,7 +181,7 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 		// Left in place it would be compared against the new timeline the moment that one
 		// is recorded as current -- blocking a planned restart against a stale high value,
 		// or waving through a real loss against a stale low one.
-		if v, perr := strconv.ParseUint(cur, 10, 32); perr != nil || timeline > uint32(v) {
+		if perr != nil || timeline > uint32(v) {
 			delete(cm.Data, "lsn")
 		}
 	}
@@ -192,33 +200,33 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	return nil
 }
 
-// WriteMarkerLSN records the serving primary's write position in the marker's Data
-// (key "lsn", PostgreSQL "X/Y" text) for the #273 lag gate. A MISSING marker is a no-op
-// rather than a create: the marker's identity is the highwater timeline WriteMarker
-// records, and the primary's first StayPrimary tick writes that before this is ever
-// called -- creating a timeline-less marker here would make it Present-but-Malformed,
-// which every reader fails closed on (#174). Read-modify-write of the one key, so the
-// highwater, the primary name and every annotation (pause, switchover) are untouched.
-func (c *Client) WriteMarkerLSN(ctx context.Context, name, lsn string) error {
-	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
-	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
+// patchMarker applies a JSON merge patch to the marker ConfigMap. A MISSING marker is a
+// no-op, not a create: the marker's identity is the highwater timeline WriteMarker records,
+// and creating one here would make it Present-but-Malformed, which every reader fails
+// closed on (#174). A merge patch is one API call with no read-modify-write, so it cannot
+// 409 against -- or make a 409 for -- the control API's annotateMarker or the Promote
+// branch's WriteMarker, which matters once the lag gate writes the marker every busy tick.
+func (c *Client) patchMarker(ctx context.Context, name string, patch []byte, what string) error {
+	_, err := c.cs.CoreV1().ConfigMaps(c.namespace).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("get marker %s: %w", name, err)
-	}
-	if cm.Data == nil {
-		cm.Data = map[string]string{}
-	}
-	if cm.Data["lsn"] == lsn {
-		return nil
-	}
-	cm.Data["lsn"] = lsn
-	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
-		return fmt.Errorf("update marker %s lsn: %w", name, uerr)
+		return fmt.Errorf("%s on marker %s: %w", what, name, err)
 	}
 	return nil
+}
+
+// WriteMarkerLSN records the serving primary's write position in the marker's Data (key
+// "lsn", PostgreSQL "X/Y" text) for the #273 lag gate. The caller skips the call when the
+// marker it just observed already carries the position, so this is one patch per change.
+// The highwater, the primary name and every annotation are untouched.
+func (c *Client) WriteMarkerLSN(ctx context.Context, name, lsn string) error {
+	patch, err := json.Marshal(map[string]any{"data": map[string]string{"lsn": lsn}})
+	if err != nil {
+		return err
+	}
+	return c.patchMarker(ctx, name, patch, "record position")
 }
 
 // annotateMarker applies set (values) and unset (keys) to the marker ConfigMap's
@@ -280,26 +288,17 @@ func (c *Client) SetSwitchoverTarget(ctx context.Context, name, target, requeste
 	return c.annotateMarker(ctx, name, set, []string{})
 }
 
-// ClearAcceptLagTarget removes the #273 lag-acceptance annotation after the node it named
-// has promoted, so the acceptance is one-shot and cannot waive the bound on a later,
-// unrelated failover. A missing marker or absent annotation is a no-op.
+// ClearAcceptLagTarget removes the #273 lag-acceptance annotation, making it one-shot:
+// called by whichever node serves read-write while it is set, so neither the node it named
+// (after promoting) nor a returning primary leaves it behind to waive a later failover's
+// bound. A merge patch with a null value deletes the key; a missing marker or an absent
+// annotation is a no-op.
 func (c *Client) ClearAcceptLagTarget(ctx context.Context, name string) error {
-	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
-	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]any{AcceptLagAnnotation: nil}}})
 	if err != nil {
-		return fmt.Errorf("get marker %s: %w", name, err)
+		return err
 	}
-	if _, has := cm.Annotations[AcceptLagAnnotation]; !has {
-		return nil
-	}
-	delete(cm.Annotations, AcceptLagAnnotation)
-	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
-		return fmt.Errorf("clear %s on %s: %w", AcceptLagAnnotation, name, uerr)
-	}
-	return nil
+	return c.patchMarker(ctx, name, patch, "clear "+AcceptLagAnnotation)
 }
 
 // ClearSwitchoverTarget removes the switchover-target annotation from the marker

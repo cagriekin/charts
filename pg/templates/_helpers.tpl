@@ -1787,6 +1787,27 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
+{{- define "pg.validateLagGateImage" -}}
+{{- /* ha.agent.maximumLagOnFailover (#273) is read by the pg-ha agent from 2.1.0 on. An older
+       image ignores MAX_LAG_ON_FAILOVER_BYTES, which would leave the operator believing an RPO
+       guard is armed when nothing is -- the one failure the gate's own config loader refuses to
+       let a bad value cause. The chart knows the image it ships, so refuse the pairing here.
+       Only a tag of the chart's own scheme (<semver>-pg<major>) is checked; a custom tag is
+       the operator's statement that they know what the image runs. Agent-mode only and
+       nil-safe on the ha.agent map: standalone runs no agent, and nulling the block must
+       render there rather than surface a raw nil-pointer (#298 review). */ -}}
+{{- $lag := int64 ((.Values.ha.agent).maximumLagOnFailover | default 0) -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (gt $lag 0) -}}
+{{- $tag := .Values.ha.image.tag | toString -}}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-pg[0-9]+$" $tag -}}
+{{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
+{{- if semverCompare "< 2.1.0" $ver -}}
+{{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart 2.3.0 ships it), or set maximumLagOnFailover to 0." $lag $tag) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.validateRemovedBackupMc" -}}
 {{- /* backup.mc.* was the MinIO client image for the pg_dump backup Jobs. MinIO withdrew
        its images from Docker Hub and quay.io and took dl.min.io down, so no value under this

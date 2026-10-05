@@ -786,6 +786,19 @@ func (a *agent) tick(ctx context.Context) {
 	// a private cache, so a marker that was deleted and recreated is re-populated.
 	if a.cfg.MaxLagOnFailoverBytes > 0 && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
 		a.recordPrimaryPosition(ctx, obs)
+		// The acceptance is one-shot and belongs to the episode it was set in: whichever
+		// node serves read-write clears it -- the node it named, one tick after promoting,
+		// or a returning primary that made it moot. Left behind, it would silently waive the
+		// bound on a later, unrelated failover.
+		if obs.AcceptLagTarget != "" {
+			cctx, ccancel := context.WithTimeout(ctx, a.fenceBudget())
+			if cerr := a.kube.ClearAcceptLagTarget(cctx, a.cfg.MarkerName); cerr != nil {
+				a.log.Warn("clear pg-ha/accept-failover-lag now that a primary is serving (#273)", "err", cerr)
+			} else {
+				a.log.Info("cleared pg-ha/accept-failover-lag: a primary is serving, so the acceptance is spent (#273)", "named", obs.AcceptLagTarget, "primary", a.cfg.PodName)
+			}
+			ccancel()
+		}
 	}
 	a.opMu.Lock()
 	err := a.act(ctx, dec, obs)
@@ -1521,15 +1534,6 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.metr.IncPromotion()
-		// #273: an operator who accepted the lag for THIS node has been obeyed; the
-		// acceptance is one-shot so it cannot waive the bound on a later, unrelated failover.
-		if obs.AcceptLagTarget == a.cfg.PodName {
-			cctx, ccancel := context.WithTimeout(ctx, a.fenceBudget())
-			if cerr := a.kube.ClearAcceptLagTarget(cctx, a.cfg.MarkerName); cerr != nil {
-				a.log.Warn("clear pg-ha/accept-failover-lag after the accepted promote (#273)", "err", cerr)
-			}
-			ccancel()
-		}
 		// Holdership re-check before publishing this node as the primary, exactly as
 		// finishInitdbNative does after its own unbounded exec (#298 review). `pg_ctl -w
 		// promote` is bounded only by PGCTLTIMEOUT (60s; nothing in this image lowers it) and

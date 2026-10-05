@@ -79,6 +79,12 @@ while [[ ${waited} -lt 60 ]]; do
   lsn=$(marker_lsn); [[ -n "${lsn}" ]] && break; sleep 5; waited=$((waited + 5))
 done
 assert_contains "#273: the primary records its write position on the marker (data.lsn)" "${lsn}" '^[0-9A-F][0-9A-F]*/[0-9A-F][0-9A-F]*$'
+# The position is written by merge patch, which needs its own verb on the scoped marker rule.
+sa="system:serviceaccount:${NAMESPACE}:$(kubectl get sts "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+can_patch=$(kubectl auth can-i patch "configmaps/${MARKER}" -n "${NAMESPACE}" --as="${sa}" 2>/dev/null || true)
+assert_eq "#273: the agent SA may patch the marker" "yes" "${can_patch}"
+can_patch_other=$(kubectl auth can-i patch configmaps/other -n "${NAMESPACE}" --as="${sa}" 2>/dev/null || true)
+assert_eq "#273: ... but no other ConfigMap" "no" "${can_patch_other}"
 lsn_later=""; waited=0
 pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE IF NOT EXISTS lag_gate (id serial PRIMARY KEY, v text)" "testuser" "testdb" >/dev/null
 pg_exec "${NAMESPACE}" "${PRIMARY}" "INSERT INTO lag_gate (v) SELECT repeat('x', 1000) FROM generate_series(1, 2000)" "testuser" "testdb" >/dev/null
@@ -148,18 +154,17 @@ assert_eq "#273: the planted position is on the marker" "FFFFFFFF/FFFFFFF0" "$(m
 kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/pause- >/dev/null 2>&1 || true
 
 echo "Observing ${POD0} for 60s: it must stay a standby and refuse to promote..."
-still_standby=true; saw_holder=false; elapsed=0
+still_standby=true; elapsed=0
 while [[ ${elapsed} -lt 60 ]]; do
   rec=$(in_recovery "${POD0}")
   [[ "${rec}" == "t" ]] || { still_standby=false; echo "  ${POD0} left recovery at ${elapsed}s (rec=${rec})"; break; }
-  holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
-  [[ "${holder}" == "${POD0}" ]] && saw_holder=true
   sleep 5; elapsed=$((elapsed + 5))
 done
 assert_eq "#273: the lagging standby refuses automatic promotion (still in recovery after 60s)" "true" "${still_standby}"
-assert_eq "#273: ... it did acquire the lease to decide, then released it" "true" "${saw_holder}"
+# The counter is the deterministic proof that it acquired the lease, decided, and released
+# (a refusing holder keeps the lease for one tick at most, so polling the Lease is a coin flip).
 refused=$(refused_count "${POD0}" || echo 0)
-assert_gt "#273: pg_ha_agent_promotions_refused_lag_total counts the refusals" "${refused:-0}" "0"
+assert_gt "#273: pg_ha_agent_promotions_refused_lag_total counts the refusals (acquire, refuse, release)" "${refused:-0}" "0"
 assert_contains "#273: the agent logs the refusal with the limit named" \
   "$(kubectl logs -n "${NAMESPACE}" "${POD0}" -c postgresql --since=3m 2>/dev/null | grep -m1 'refusing automatic promotion' || true)" \
   "maximumLagOnFailover"
