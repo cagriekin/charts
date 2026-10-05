@@ -787,8 +787,14 @@ and the agent is scraped), the agent logs one `ERROR` per episode, and
 What it does not do. Barring apiserver errors the recorded position trails the true one by at
 most one `reconcileInterval`, so the measured lag is a floor on the real loss, not a ceiling.
 The marker is a ConfigMap any namespace writer can edit, as #298 already notes for the
-highwater beside it: a forged position can only make the gate refuse (fail closed), never
-promote, and the refusal reason prints the value it compared against. It bounds *automatic*
+highwater beside it: a writer there can lower or clear the position and so waive the bound,
+exactly as they can set the acceptance annotation or delete the marker, so the gate bounds
+accidents, not an adversary who holds write on the marker. A recorded position that does not
+parse makes the gate refuse (fail closed), like every other malformed marker field, and the
+refusal reason prints what it compared against. It is also not applied to a standby already
+*above* the marker's timeline: a primary that promoted and died before its highwater advance
+landed leaves a position from the previous history, which the gate does not compare across.
+It bounds *automatic*
 promotion only: a controlled switchover is unaffected (its target must be caught up anyway),
 and a *pending* switchover request is never read as acceptance of the loss. An operator
 accepts the loss explicitly with a dedicated annotation naming the node that should promote:
@@ -801,7 +807,10 @@ Name the node the refusal names: the most-advanced reachable standby, which is t
 refusing (its `ERROR` line and `GET /v1/cluster` print the exact command). It promotes on its
 next tick however far behind it is, and the annotation is cleared (one-shot: whichever node
 next serves read-write clears it, so an acceptance left over from an episode the returning
-primary ended cannot waive a later failover's bound). Naming a further-behind node is ignored,
+primary ended cannot waive a later failover's bound). Set it in answer to a refusal, not ahead
+of one: a still-serving primary spends it on its next tick too, so an acceptance staged before
+a planned destructive step is gone by the time the failover happens -- pause the cluster for
+that instead. Naming a further-behind node is ignored,
 and the refusal says which node to name instead: letting it jump the most-advanced ranking
 would discard even more WAL than the gate refused.
 `kubectl annotate ... pg-ha/accept-failover-lag-` withdraws it. Lowering the value to `0` with

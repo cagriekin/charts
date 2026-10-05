@@ -575,7 +575,8 @@ ha:
     # the agent scraped; paging is your alert routing). An operator accepts the loss explicitly with
     # `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<pod>`, naming
     # the refusing node (the most-advanced standby; the refusal prints the command): it
-    # promotes and clears the annotation. A pending
+    # promotes and clears the annotation. Set it in answer to a refusal, not ahead of one:
+    # any node serving read-write clears it, a still-serving primary included. A pending
     # switchover request is never read as such an acceptance. Barring apiserver errors the
     # recorded position trails the true one by at most one reconcileInterval, so the
     # measured lag is a floor on the real loss. Controlled switchovers are unaffected (the

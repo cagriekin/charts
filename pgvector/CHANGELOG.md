@@ -17,8 +17,11 @@
   standby, which then promotes); a pending `pg-ha/switchover-target` is never read as one. Default `0`
   (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0,
   which this release pins; setting the knob against an older `ha.image.tag` fails the render.
-  The agent's Role gains `patch` on the one marker ConfigMap (the position is recorded by JSON
-  merge patch, so it never races an operator's annotation edit); a BYO Role must grant it too.
+  The agent's Role gains `patch` on the one marker ConfigMap (the position is recorded by an
+  RFC 6902 JSON patch fenced to the recorded primary and timeline, the acceptance cleared by a
+  merge patch; neither races an operator's annotation edit); a BYO Role must grant it too.
+  A recorded position that does not parse makes the gate refuse (fail closed), like every
+  other malformed marker field.
 
 ## 2.2.1 - 2026-09-26
 

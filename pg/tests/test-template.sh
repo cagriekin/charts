@@ -2063,7 +2063,7 @@ assert_contains "agent rbac: lease scoped to <fullname>-leader" "${agent_rbac}" 
 assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${agent_rbac}" "test-pg-primary"
 # marker.go does Get -> Create-if-absent -> Update, so the scoped rule must grant
 # update (not patch) or every marker advance would be Forbidden once wired
-assert_contains "agent rbac: marker configmaps grant get+update+patch (marker.go uses Update; #273 records the position by merge patch)" "${agent_rbac}" '"get", "update", "patch"'
+assert_contains "agent rbac: marker configmaps grant get+update+patch (marker.go uses Update; #273 records the position by JSON patch)" "${agent_rbac}" '"get", "update", "patch"'
 assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
 # agent mode records decisions in a structured audit log, not core/v1 Events, so
 # the events:create grant (service-updater only) must be dropped (least privilege)

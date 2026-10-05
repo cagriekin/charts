@@ -101,16 +101,21 @@ type MarkerState struct {
 	// the marker is absent or carries no primary.
 	Primary string
 	// LSN is the last write position the serving primary recorded on the marker (#273),
-	// LSNOK false when none was recorded or it did not parse. The lag gate's reference:
-	// it survives the primary's pod, unlike gossip, so it still says where the primary
-	// was after the primary is gone. Written on every tick the holder serves read-write
-	// while the gate is enabled (paused or not), so barring apiserver errors it trails the
-	// true position by at most one reconcile interval -- the lag computed from it is a
-	// floor on the real loss, never an overestimate. The marker is a ConfigMap any
-	// namespace writer can edit, like the highwater it sits beside (#298): a forged
-	// position can only make the gate refuse (fail closed), never promote.
-	LSN   pg.LSN
-	LSNOK bool
+	// LSNOK false when none was recorded. The lag gate's reference: it survives the
+	// primary's pod, unlike gossip, so it still says where the primary was after the
+	// primary is gone. Written on every tick the holder serves read-write while the gate
+	// is enabled (paused or not), so barring apiserver errors it trails the true position
+	// by at most one reconcile interval -- the lag computed from it is a floor on the real
+	// loss, never an overestimate. LSNMalformed is set when a value is present but does
+	// not parse: the gate then REFUSES (fail closed), the stance every reader of the
+	// marker takes on malformed data (#174), rather than measuring nothing. The marker is
+	// a ConfigMap any namespace writer can edit, like the highwater beside it (#298): a
+	// writer there can lower or clear the position and so waive the bound, exactly as they
+	// can set the acceptance annotation or delete the marker outright -- the gate bounds
+	// accidents, not an adversary who already holds write on the marker.
+	LSN          pg.LSN
+	LSNOK        bool
+	LSNMalformed bool
 }
 
 // Observation is the full input to a decision.
@@ -130,6 +135,9 @@ type Observation struct {
 	Local            LocalState
 	Peers            []PeerState
 	Marker           MarkerState
+	// MarkerName is the marker ConfigMap's name, so a refusal can print the exact kubectl
+	// command to accept the loss (#273); "" falls back to the documented placeholder.
+	MarkerName string
 	// LocalNode is this pod's name, compared against Marker.Primary so an empty-data
 	// lease holder can tell it is NOT the recorded primary and step aside (#186).
 	LocalNode string
@@ -434,14 +442,28 @@ func Decide(o Observation) Decision {
 
 // lagExceedsFailoverLimit reports whether the local standby trails the marker's recorded
 // primary position by more than o.MaxLagBytes (#273), with the reason to log. It is
-// deliberately narrow: it never blocks when the gate is off, when either position is
-// unknown, or when the marker's timeline is not the local one (a standby below the
-// highwater is already refused by unsafeToServe; a standby above it cannot exist). An
-// explicit operator acceptance -- the pg-ha/accept-failover-lag annotation naming THIS
-// node -- is the override the issue asks for: the operator has looked at the lag and
-// accepted it, and automatic promotion is what the gate bounds, not a manual one.
+// deliberately narrow: it never blocks when the gate is off, when no position was recorded
+// or the local one is unknown, or when the marker's timeline is not the local one. A
+// standby BELOW the highwater is already refused by unsafeToServe. A standby ABOVE it is
+// the one window the gate does not cover: a primary that promoted onto a new timeline and
+// died before its highwater advance landed (the Promote branch's write can miss its fence
+// budget; the next tick's catch-up needs the primary alive for one more interval) leaves a
+// position measured on the previous history, which is not comparable to a standby that
+// already followed onto the new one; the gate steps aside rather than compare across
+// histories. A position that is present but does not parse REFUSES, like every other
+// malformed marker field (#174). An explicit operator acceptance -- the
+// pg-ha/accept-failover-lag annotation naming THIS node -- is the override the issue asks
+// for: the operator has looked at the lag and accepted it, and automatic promotion is what
+// the gate bounds, not a manual one.
 func lagExceedsFailoverLimit(o Observation) (bool, string) {
-	if o.MaxLagBytes == 0 || !o.Marker.Present || o.Marker.Malformed || !o.Marker.LSNOK || !o.Local.LSNOK {
+	if o.MaxLagBytes == 0 || !o.Marker.Present || o.Marker.Malformed || !o.Local.LSNOK {
+		return false, ""
+	}
+	if o.Marker.LSNMalformed && o.AcceptLagTarget != o.LocalNode {
+		return true, fmt.Sprintf("%s: the primary's recorded position on the marker does not parse as a PostgreSQL LSN, so this standby's lag cannot be measured; refusing rather than promoting blind (fix or remove data.lsn on %s, or accept with `kubectl annotate configmap %s pg-ha/accept-failover-lag=%s`)",
+			LagGateReason, markerName(o), markerName(o), o.LocalNode)
+	}
+	if !o.Marker.LSNOK {
 		return false, ""
 	}
 	if !o.Local.TimelineOK || o.Marker.Timeline != o.Local.Timeline {
@@ -462,8 +484,17 @@ func lagExceedsFailoverLimit(o Observation) (bool, string) {
 	if o.AcceptLagTarget != "" {
 		ignored = fmt.Sprintf("; pg-ha/accept-failover-lag names %q, but %s is the most-advanced reachable standby and the one that would promote, so the acceptance is ignored -- annotate %s instead", o.AcceptLagTarget, o.LocalNode, o.LocalNode)
 	}
-	return true, fmt.Sprintf("%s: this standby is %d bytes behind the primary's last recorded position %s (limit %d; set ha.agent.maximumLagOnFailover=0 to disable, or accept the loss with `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=%s`%s)",
-		LagGateReason, lag, o.Marker.LSN, o.MaxLagBytes, o.LocalNode, ignored)
+	return true, fmt.Sprintf("%s: this standby is %d bytes behind the primary's last recorded position %s (limit %d; set ha.agent.maximumLagOnFailover=0 to disable, or accept the loss with `kubectl annotate configmap %s pg-ha/accept-failover-lag=%s`%s)",
+		LagGateReason, lag, o.Marker.LSN, o.MaxLagBytes, markerName(o), o.LocalNode, ignored)
+}
+
+// markerName is the marker ConfigMap's name for operator-facing text, or the documented
+// placeholder when the observation does not carry one (tests, older callers).
+func markerName(o Observation) string {
+	if o.MarkerName != "" {
+		return o.MarkerName
+	}
+	return "<fullname>-primary"
 }
 
 // sameTimelinePrimary returns a reachable live primary on exactly the local

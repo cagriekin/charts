@@ -132,17 +132,26 @@ assert_eq "#273: the former primary rejoined as a standby" "t" "$(in_recovery "$
 # Always through a controlled switchover (two of them when the primary already sits there),
 # so the pause below lands right after a promotion: the highwater advance has just retired
 # the previous position and the fenced record has to re-establish it against the new identity.
-switchover_to() {  # switchover_to <pod>: request the handoff and wait for the roles to settle on it
+switchover_to() {  # switchover_to <pod>: request the handoff, wait for the roles to settle on it AND for the
+  # demoted node to stream again -- a second switchover is only accepted once its target is a caught-up standby.
   echo "Primary is ${PRIMARY}; requesting a controlled switchover to $1..."
   kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/switchover-target="$1" --overwrite >/dev/null
-  local e=0
+  local e=0 streaming=""
   while [[ ${e} -lt ${FAILOVER_BUDGET} ]]; do
-    if settle_roles 5 && [[ "${PRIMARY}" == "$1" ]]; then return 0; fi
+    if settle_roles 5 && [[ "${PRIMARY}" == "$1" ]]; then break; fi
     e=$((e + 5))
   done
+  [[ "${PRIMARY}" == "$1" ]] || return 1
+  e=0
+  while [[ ${e} -lt 180 ]]; do
+    streaming=$(pg_exec "${NAMESPACE}" "$1" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "testuser" "testdb" 2>/dev/null | xargs || echo "")
+    [[ "${streaming}" == "1" ]] && return 0
+    sleep 5; e=$((e + 5))
+  done
+  echo "  (the demoted node did not resume streaming within 180s)"
   return 1
 }
-[[ "${PRIMARY}" == "${POD1}" ]] && switchover_to "${POD0}"
+if [[ "${PRIMARY}" == "${POD1}" ]]; then switchover_to "${POD0}" || true; fi
 switchover_to "${POD1}" || true
 assert_eq "#273: the primary is ${POD1} ahead of the blocked-failover scenario" "${POD1}" "${PRIMARY}"
 FV2="before-block-$(date +%s)"

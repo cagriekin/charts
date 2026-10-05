@@ -616,6 +616,15 @@ func TestLagGateRefusesAFarBehindHolder(t *testing.T) {
 		{"the refusal tells the operator which node to annotate", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, "pg-ha/accept-failover-lag=pg-1"},
 		{"acceptance is inert while the gate is off", Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-2", Local: local, Marker: marker, MaxLagBytes: 0,
 			Peers: []PeerState{standby("pg-2", 5, 0, 0x800)}}, Promote, ""},
+		// A recorded position that does not parse fails CLOSED, like every malformed marker
+		// field: the gate cannot measure, so it refuses rather than promoting blind.
+		{"a malformed recorded position refuses (fail closed)", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0", LSNMalformed: true}, MaxLagBytes: 1 << 20}, ReleaseLease, "does not parse"},
+		{"a malformed recorded position is inert while the gate is off", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0", LSNMalformed: true}, MaxLagBytes: 0}, Promote, ""},
+		{"operator acceptance waives a malformed recorded position too", Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0", LSNMalformed: true}, MaxLagBytes: 1 << 20}, Promote, ""},
+		// The refusal prints the real marker name when the observation carries it, so the
+		// command in the ERROR line and /v1/cluster can be pasted as is.
+		{"the refusal prints the exact marker name", Observation{HoldLease: true, LocalNode: "pg-1", MarkerName: "db-pg-primary", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, "kubectl annotate configmap db-pg-primary pg-ha/accept-failover-lag=pg-1"},
+		{"... and the documented placeholder without one", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, "configmap <fullname>-primary"},
 	}
 	for _, c := range cases {
 		got := Decide(c.obs)

@@ -207,8 +207,8 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 // closed on (#174). A merge patch is one API call with no read-modify-write, so it cannot
 // 409 against -- or make a 409 for -- the control API's annotateMarker or the Promote
 // branch's WriteMarker, which matters once the lag gate writes the marker every busy tick.
-func (c *Client) patchMarker(ctx context.Context, name string, patch []byte, what string) error {
-	_, err := c.cs.CoreV1().ConfigMaps(c.namespace).Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+func (c *Client) patchMarker(ctx context.Context, name string, pt types.PatchType, patch []byte, what string) error {
+	_, err := c.cs.CoreV1().ConfigMaps(c.namespace).Patch(ctx, name, pt, patch, metav1.PatchOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
@@ -223,8 +223,8 @@ func (c *Client) patchMarker(ctx context.Context, name string, patch []byte, wha
 // marker it just observed already carries the position, so this is one patch per change.
 // The highwater, the primary name and every annotation are untouched.
 //
-// The write is FENCED to the marker state the position was measured under: a JSON patch
-// whose test ops require data.primary == primary and data.timeline == timeline before the
+// The write is FENCED to the marker state the position was measured under: an RFC 6902 JSON
+// patch (application/json-patch+json, NOT a merge patch) whose test ops require data.primary == primary and data.timeline == timeline before the
 // add. Without it, a patch still in flight from a primary that has just lost the lease (the
 // record runs off the fence budget, not under the tick's operation lock) could land AFTER
 // the successor's WriteMarker advanced the timeline and retired the old position, putting a
@@ -242,17 +242,11 @@ func (c *Client) WriteMarkerLSN(ctx context.Context, name, primary string, timel
 	if err != nil {
 		return err
 	}
-	_, err = c.cs.CoreV1().ConfigMaps(c.namespace).Patch(ctx, name, types.JSONPatchType, patch, metav1.PatchOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
+	err = c.patchMarker(ctx, name, types.JSONPatchType, patch, "record position")
 	if apierrors.IsInvalid(err) {
 		return fmt.Errorf("%w: %v", ErrMarkerMoved, err)
 	}
-	if err != nil {
-		return fmt.Errorf("record position on marker %s: %w", name, err)
-	}
-	return nil
+	return err
 }
 
 // ErrMarkerMoved is returned by WriteMarkerLSN when the marker no longer names the primary
@@ -328,7 +322,7 @@ func (c *Client) ClearAcceptLagTarget(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return c.patchMarker(ctx, name, patch, "clear "+AcceptLagAnnotation)
+	return c.patchMarker(ctx, name, types.MergePatchType, patch, "clear "+AcceptLagAnnotation)
 }
 
 // ClearSwitchoverTarget removes the switchover-target annotation from the marker

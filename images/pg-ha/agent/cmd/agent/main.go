@@ -784,7 +784,17 @@ func (a *agent) tick(ctx context.Context) {
 	// share the branch's fence budget with the routing assertion it could starve. Bounded,
 	// gate-enabled only, and compared against the position observe() just read rather than
 	// a private cache, so a marker that was deleted and recreated is re-populated.
-	if a.cfg.MaxLagOnFailoverBytes > 0 && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
+	//
+	// Not on a tick whose marker read failed with nothing to fall back on: Decide declared
+	// that tick "skip rather than act on defaults", and writing to the marker from a zero
+	// MarkerState would be exactly that. And the whole block shares ONE fence budget: it
+	// sits between this tick's single metr.Beat() and act(), so three separate budgets
+	// against a blackholed apiserver (highwater, position, acceptance clear) would add up
+	// to three reconcile intervals -- the /healthz staleness threshold -- and have the
+	// kubelet kill the serving primary precisely while the apiserver is unreachable
+	// (#298). One budget caps the block at what any single marker write may already cost.
+	if a.cfg.MaxLagOnFailoverBytes > 0 && !obs.MarkerUnreadable && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
+		gctx, gcancel := context.WithTimeout(ctx, a.fenceBudget())
 		// The highwater first, for the same reason and under the same pause exemption. The
 		// Promote branch advances it, but not on every path (the lease re-check returns
 		// early; the shared fence budget can run out after the slot pass), and the
@@ -792,23 +802,22 @@ func (a *agent) tick(ctx context.Context) {
 		// position write below is fenced to the marker's primary and timeline, so a marker
 		// left behind that way would make it refuse for the whole pause -- the exact window
 		// the record exists for. No-op when the marker is current (the common case).
-		mctx, mcancel := context.WithTimeout(ctx, a.fenceBudget())
-		a.advanceMarker(mctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		mcancel()
-		a.recordPrimaryPosition(ctx, obs)
+		a.advanceMarker(gctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		a.recordPrimaryPosition(gctx, obs)
 		// The acceptance is one-shot and belongs to the episode it was set in: whichever
 		// node serves read-write clears it -- the node it named, one tick after promoting,
 		// or a returning primary that made it moot. Left behind, it would silently waive the
-		// bound on a later, unrelated failover.
+		// bound on a later, unrelated failover. The flip side is documented: it is set in
+		// answer to a refusal, not staged ahead of one, because a still-serving primary
+		// spends it too.
 		if obs.AcceptLagTarget != "" {
-			cctx, ccancel := context.WithTimeout(ctx, a.fenceBudget())
-			if cerr := a.kube.ClearAcceptLagTarget(cctx, a.cfg.MarkerName); cerr != nil {
+			if cerr := a.kube.ClearAcceptLagTarget(gctx, a.cfg.MarkerName); cerr != nil {
 				a.log.Warn("clear pg-ha/accept-failover-lag now that a primary is serving (#273)", "err", cerr)
 			} else {
 				a.log.Info("cleared pg-ha/accept-failover-lag: a primary is serving, so the acceptance is spent (#273)", "named", obs.AcceptLagTarget, "primary", a.cfg.PodName)
 			}
-			ccancel()
 		}
+		gcancel()
 	}
 	a.opMu.Lock()
 	err := a.act(ctx, dec, obs)
@@ -1129,10 +1138,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Primary:   m.Primary,
 	}
 	// #273: the primary's last recorded position, the lag gate's reference. An absent or
-	// unparseable value leaves LSNOK false and the gate steps aside (it never blocks on a
-	// position it cannot read; the highwater guards above it are what fail closed).
+	// unparseable value is flagged so the gate refuses rather than measuring nothing: a
+	// malformed marker field fails closed, as every reader of the marker does (#174).
 	if m.LSN != "" {
 		o.Marker.LSN, o.Marker.LSNOK = pg.ParseLSN(m.LSN)
+		o.Marker.LSNMalformed = !o.Marker.LSNOK
 	}
 	o.MaxLagBytes = a.cfg.MaxLagOnFailoverBytes
 	o.AcceptLagTarget = m.AcceptLagTarget
@@ -1154,6 +1164,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
+	o.MarkerName = a.cfg.MarkerName
 	// Pause-gated, exactly like LocalStuck below (#298 review). Both are stateful,
 	// time-based signals computed here rather than in the pure Decide, and both feed a
 	// DESTRUCTIVE branch -- LocalStuck a self-health ReleaseLease, StandbyStalled a
@@ -3405,11 +3416,10 @@ func (a *agent) recordPrimaryPosition(ctx context.Context, obs reconcile.Observa
 	if obs.Marker.Present && obs.Marker.LSNOK && obs.Marker.LSN == obs.Local.LSN {
 		return
 	}
-	wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
-	defer cancel()
+	// ctx is the caller's fence budget, shared with the other marker writes of this tick.
 	// Fenced to this pod on this timeline (see WriteMarkerLSN): a write that outlives the
 	// lease cannot put a previous-timeline position under a successor's timeline.
-	if err := a.kube.WriteMarkerLSN(wctx, a.cfg.MarkerName, a.cfg.PodName, uint32(obs.Local.Timeline), obs.Local.LSN.String()); err != nil {
+	if err := a.kube.WriteMarkerLSN(ctx, a.cfg.MarkerName, a.cfg.PodName, uint32(obs.Local.Timeline), obs.Local.LSN.String()); err != nil {
 		if errors.Is(err, k8s.ErrMarkerMoved) {
 			// Expected for a tick or two around a promotion while the highwater catches up;
 			// persisting, it means the marker names a primary that is not this serving node.

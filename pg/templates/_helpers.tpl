@@ -1802,7 +1802,7 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-pg[0-9]+$" $tag -}}
 {{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
 {{- if semverCompare "< 2.1.0" $ver -}}
-{{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart 2.3.0 ships it), or set maximumLagOnFailover to 0." $lag $tag) -}}
+{{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart %s ships it), or set maximumLagOnFailover to 0." $lag $tag .Chart.Version) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
