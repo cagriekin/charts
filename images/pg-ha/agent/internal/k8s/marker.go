@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -221,13 +222,42 @@ func (c *Client) patchMarker(ctx context.Context, name string, patch []byte, wha
 // "lsn", PostgreSQL "X/Y" text) for the #273 lag gate. The caller skips the call when the
 // marker it just observed already carries the position, so this is one patch per change.
 // The highwater, the primary name and every annotation are untouched.
-func (c *Client) WriteMarkerLSN(ctx context.Context, name, lsn string) error {
-	patch, err := json.Marshal(map[string]any{"data": map[string]string{"lsn": lsn}})
+//
+// The write is FENCED to the marker state the position was measured under: a JSON patch
+// whose test ops require data.primary == primary and data.timeline == timeline before the
+// add. Without it, a patch still in flight from a primary that has just lost the lease (the
+// record runs off the fence budget, not under the tick's operation lock) could land AFTER
+// the successor's WriteMarker advanced the timeline and retired the old position, putting a
+// previous-timeline LSN back on the marker under the new timeline -- exactly the stale
+// same-timeline comparison the retirement exists to prevent (#273 review). A failed test
+// op comes back 422 Invalid and means "the marker moved on"; that is the fence doing its
+// job; it is reported as ErrMarkerMoved so the caller can say so without treating it as
+// an apiserver failure. An absent marker is a nil no-op.
+func (c *Client) WriteMarkerLSN(ctx context.Context, name, primary string, timeline uint32, lsn string) error {
+	patch, err := json.Marshal([]map[string]any{
+		{"op": "test", "path": "/data/primary", "value": primary},
+		{"op": "test", "path": "/data/timeline", "value": strconv.FormatUint(uint64(timeline), 10)},
+		{"op": "add", "path": "/data/lsn", "value": lsn},
+	})
 	if err != nil {
 		return err
 	}
-	return c.patchMarker(ctx, name, patch, "record position")
+	_, err = c.cs.CoreV1().ConfigMaps(c.namespace).Patch(ctx, name, types.JSONPatchType, patch, metav1.PatchOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if apierrors.IsInvalid(err) {
+		return fmt.Errorf("%w: %v", ErrMarkerMoved, err)
+	}
+	if err != nil {
+		return fmt.Errorf("record position on marker %s: %w", name, err)
+	}
+	return nil
 }
+
+// ErrMarkerMoved is returned by WriteMarkerLSN when the marker no longer names the primary
+// and timeline the position was measured under, so the fenced write was refused (#273).
+var ErrMarkerMoved = errors.New("marker names another primary or timeline; position not recorded")
 
 // annotateMarker applies set (values) and unset (keys) to the marker ConfigMap's
 // annotations in one read-modify-write. It is the single write path for the pause

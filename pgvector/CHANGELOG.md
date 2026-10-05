@@ -12,7 +12,7 @@
   timeline advance), and a lease-holding standby that trails it by more refuses to promote and
   releases the lease -- the cluster waits for a closer standby or the returning primary.
   `pg_ha_agent_promotions_refused_lag_total` counts refusals and `PGHAAgentPromotionRefusedLag`
-  pages on them. The explicit acceptance of the loss is a new annotation,
+  fires on them (with the PrometheusRule enabled and the agent scraped). The explicit acceptance of the loss is a new annotation,
   `pg-ha/accept-failover-lag=<pod>` on the marker (one-shot; names the refusing, most-advanced
   standby, which then promotes); a pending `pg-ha/switchover-target` is never read as one. Default `0`
   (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0,

@@ -384,7 +384,8 @@
             "maximumLagOnFailover": {
               "type": "integer",
               "minimum": 0,
-              "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0."
+              "maximum": 9007199254740991,
+              "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0. Capped at 2^53-1: values parse through float64 and a larger one is silently rounded or, past int64, wraps negative and disables the gate."
             }
           }
         }
@@ -755,7 +756,8 @@
             "maximumLagOnFailover": {
               "type": "integer",
               "minimum": 0,
-              "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0."
+              "maximum": 9007199254740991,
+              "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0. Capped at 2^53-1: values parse through float64 and a larger one is silently rounded or, past int64, wraps negative and disables the gate."
             }
           }
         }

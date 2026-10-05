@@ -490,7 +490,7 @@ func TestMarkerLSNRecord(t *testing.T) {
 	cs := fake.NewSimpleClientset()
 	c := NewWithClient(cs, ns)
 	ctx := context.Background()
-	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000120"); err != nil {
 		t.Fatalf("absent marker must be a no-op: %v", err)
 	}
 	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Present {
@@ -499,7 +499,7 @@ func TestMarkerLSNRecord(t *testing.T) {
 	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000120"); err != nil {
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000120"); err != nil {
 		t.Fatal(err)
 	}
 	m, err := c.ReadMarker(ctx, "pg-primary")
@@ -509,7 +509,7 @@ func TestMarkerLSNRecord(t *testing.T) {
 	// One merge patch, no read-modify-write: it cannot conflict with the control API's
 	// annotation writes or the Promote branch's WriteMarker.
 	before := len(cs.Actions())
-	if err := c.WriteMarkerLSN(ctx, "pg-primary", "0/3000200"); err != nil {
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000200"); err != nil {
 		t.Fatal(err)
 	}
 	verbs := ""
@@ -536,6 +536,25 @@ func TestMarkerLSNRecord(t *testing.T) {
 	}
 	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "" || m.Timeline != 8 {
 		t.Errorf("position must be dropped on a timeline advance: %+v", m)
+	}
+	// The fence: a write measured under a superseded identity (the old primary, the old
+	// timeline) must not land. The fake tracker surfaces a failed JSON-patch test op as a
+	// plain error where the apiserver answers 422 Invalid; either way the marker is untouched.
+	for _, stale := range []struct {
+		primary string
+		tl      uint32
+	}{{"pg-1", 8}, {"pg-0", 7}} {
+		err := c.WriteMarkerLSN(ctx, "pg-primary", stale.primary, stale.tl, "0/1")
+		m, _ := c.ReadMarker(ctx, "pg-primary")
+		if m.LSN != "" || m.Timeline != 8 || m.Primary != "pg-0" {
+			t.Errorf("stale write (%s, tl %d) must not land (err=%v): %+v", stale.primary, stale.tl, err, m)
+		}
+	}
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-0", 8, "0/2"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/2" {
+		t.Errorf("the current identity's write must land: %+v", m)
 	}
 }
 

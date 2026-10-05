@@ -214,6 +214,15 @@ lag_str_rc=0; helm template test-pg "${CHART_DIR}" --set-string ha.agent.maximum
 assert_gt "#273: a string value is refused by the schema" "${lag_str_rc}" 0
 lag_neg_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=-1 >/dev/null 2>&1 || lag_neg_rc=$?
 assert_gt "#273: a negative value is refused by the schema" "${lag_neg_rc}" 0
+# Past int64 the value wraps negative through int64, the env is omitted and the gate is silently
+# off; past 2^53 it is already rounded by float64. The schema caps it at the exact-integer limit.
+lag_big_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=9007199254740992 >/dev/null 2>&1 || lag_big_rc=$?
+assert_gt "#273: a value above 2^53-1 is refused by the schema" "${lag_big_rc}" 0
+lag_dir=$(mktemp -d)
+printf 'ha:\n  agent:\n    maximumLagOnFailover: 9223372036854775808\n' > "${lag_dir}/lag-overflow.yaml"
+lag_wrap_rc=0; helm template test-pg "${CHART_DIR}" -f "${lag_dir}/lag-overflow.yaml" >/dev/null 2>&1 || lag_wrap_rc=$?
+assert_gt "#273: a value past int64 in a values file is refused rather than wrapping the gate off" "${lag_wrap_rc}" 0
+rm -rf "${lag_dir}"
 lag_rule=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
 assert_contains "#273: the refused-promotion alert is shipped" "${lag_rule}" "alert: PGHAAgentPromotionRefusedLag"
 assert_contains "#273: ... on the refusal counter" "${lag_rule}" "pg_ha_agent_promotions_refused_lag_total"

@@ -785,6 +785,16 @@ func (a *agent) tick(ctx context.Context) {
 	// gate-enabled only, and compared against the position observe() just read rather than
 	// a private cache, so a marker that was deleted and recreated is re-populated.
 	if a.cfg.MaxLagOnFailoverBytes > 0 && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
+		// The highwater first, for the same reason and under the same pause exemption. The
+		// Promote branch advances it, but not on every path (the lease re-check returns
+		// early; the shared fence budget can run out after the slot pass), and the
+		// StayPrimary branch that would otherwise catch up does not run while paused. The
+		// position write below is fenced to the marker's primary and timeline, so a marker
+		// left behind that way would make it refuse for the whole pause -- the exact window
+		// the record exists for. No-op when the marker is current (the common case).
+		mctx, mcancel := context.WithTimeout(ctx, a.fenceBudget())
+		a.advanceMarker(mctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		mcancel()
 		a.recordPrimaryPosition(ctx, obs)
 		// The acceptance is one-shot and belongs to the episode it was set in: whichever
 		// node serves read-write clears it -- the node it named, one tick after promoting,
@@ -3389,7 +3399,7 @@ func (a *agent) gossipFresh(g k8s.NodeStatus) bool {
 // tick. Best-effort and bounded: a missed write means the reference trails by one more
 // tick, and the gate reads the lag it yields as a floor anyway.
 func (a *agent) recordPrimaryPosition(ctx context.Context, obs reconcile.Observation) {
-	if !obs.Local.LSNOK {
+	if !obs.Local.LSNOK || !obs.Local.TimelineOK {
 		return
 	}
 	if obs.Marker.Present && obs.Marker.LSNOK && obs.Marker.LSN == obs.Local.LSN {
@@ -3397,7 +3407,17 @@ func (a *agent) recordPrimaryPosition(ctx context.Context, obs reconcile.Observa
 	}
 	wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 	defer cancel()
-	if err := a.kube.WriteMarkerLSN(wctx, a.cfg.MarkerName, obs.Local.LSN.String()); err != nil {
+	// Fenced to this pod on this timeline (see WriteMarkerLSN): a write that outlives the
+	// lease cannot put a previous-timeline position under a successor's timeline.
+	if err := a.kube.WriteMarkerLSN(wctx, a.cfg.MarkerName, a.cfg.PodName, uint32(obs.Local.Timeline), obs.Local.LSN.String()); err != nil {
+		if errors.Is(err, k8s.ErrMarkerMoved) {
+			// Expected for a tick or two around a promotion while the highwater catches up;
+			// persisting, it means the marker names a primary that is not this serving node.
+			a.log.Warn("position not recorded: the marker does not name this primary on its timeline (#273 lag gate)",
+				"node", a.cfg.PodName, "timeline", uint32(obs.Local.Timeline),
+				"markerPrimary", obs.Marker.Primary, "markerTimeline", obs.Marker.Timeline, "markerPresent", obs.Marker.Present)
+			return
+		}
 		a.log.Warn("record primary position on the marker (#273 lag gate)", "err", err)
 	}
 }

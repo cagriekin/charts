@@ -571,7 +571,8 @@ ha:
     # standby that trails that position by more than this many bytes REFUSES to promote and
     # releases the lease. The cluster then has no primary until a closer standby appears or
     # the primary returns -- the intended trade (RPO over availability) -- and
-    # PGHAAgentPromotionRefusedLag pages. An operator accepts the loss explicitly with
+    # PGHAAgentPromotionRefusedLag fires (with ha.agent.monitoring.prometheusRule.enabled and
+    # the agent scraped; paging is your alert routing). An operator accepts the loss explicitly with
     # `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<pod>`, naming
     # the refusing node (the most-advanced standby; the refusal prints the command): it
     # promotes and clears the annotation. A pending

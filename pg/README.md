@@ -780,7 +780,8 @@ holding would fence the former primary the moment it came back, which is the one
 data the gate exists to keep. Releasing lets the returning primary reacquire and resume with
 nothing discarded. Until then the cluster has no primary: standbys take turns acquiring and
 releasing, `pg_ha_agent_promotions_refused_lag_total` counts each refusal,
-`PGHAAgentPromotionRefusedLag` pages, the agent logs one `ERROR` per episode, and
+`PGHAAgentPromotionRefusedLag` fires (when `ha.agent.monitoring.prometheusRule.enabled` is set
+and the agent is scraped), the agent logs one `ERROR` per episode, and
 `GET /v1/cluster` carries the reason.
 
 What it does not do. Barring apiserver errors the recorded position trails the true one by at
