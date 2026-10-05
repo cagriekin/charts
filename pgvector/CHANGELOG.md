@@ -7,13 +7,15 @@
 - **RPO gate on automatic failover: `ha.agent.maximumLagOnFailover` (#273).** The election
   promotes the most-advanced reachable standby; without a bound that standby can still be far
   behind the lost primary, so an asymmetric outage accepted unbounded data loss. With the gate
-  set (bytes; Patroni's `maximum_lag_on_failover`), the serving primary records its write
-  position on the `<fullname>-primary` marker every tick, and a lease-holding standby that
-  trails it by more refuses to promote and releases the lease -- the cluster waits for a closer
-  standby or the returning primary. `pg_ha_agent_promotions_refused_lag_total` counts refusing
-  ticks and `PGHAAgentPromotionRefusedLag` pages on them; `pg-ha/switchover-target=<pod>` on the
-  marker is the explicit override (one-shot). Default `0` (off): no behaviour or marker-traffic
-  change unless set. Ships in the pg-ha image at 2.1.0.
+  set (bytes; Patroni's `maximum_lag_on_failover`), the lease holder records its write position
+  on the `<fullname>-primary` marker on every tick it serves (paused or not; dropped on a
+  timeline advance), and a lease-holding standby that trails it by more refuses to promote and
+  releases the lease -- the cluster waits for a closer standby or the returning primary.
+  `pg_ha_agent_promotions_refused_lag_total` counts refusals and `PGHAAgentPromotionRefusedLag`
+  pages on them. The explicit acceptance of the loss is a new annotation,
+  `pg-ha/accept-failover-lag=<pod>` on the marker (one-shot; names the refusing, most-advanced
+  standby, which then promotes); a pending `pg-ha/switchover-target` is never read as one. Default `0`
+  (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0.
 
 ## 2.2.1 - 2026-09-26
 

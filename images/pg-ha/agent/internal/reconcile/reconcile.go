@@ -103,9 +103,12 @@ type MarkerState struct {
 	// LSN is the last write position the serving primary recorded on the marker (#273),
 	// LSNOK false when none was recorded or it did not parse. The lag gate's reference:
 	// it survives the primary's pod, unlike gossip, so it still says where the primary
-	// was after the primary is gone. Written once per primary tick while the gate is
-	// enabled, so it trails the true position by at most one reconcile interval -- the
-	// lag computed from it is a floor on the real loss, never an overestimate.
+	// was after the primary is gone. Written on every tick the holder serves read-write
+	// while the gate is enabled (paused or not), so barring apiserver errors it trails the
+	// true position by at most one reconcile interval -- the lag computed from it is a
+	// floor on the real loss, never an overestimate. The marker is a ConfigMap any
+	// namespace writer can edit, like the highwater it sits beside (#298): a forged
+	// position can only make the gate refuse (fail closed), never promote.
 	LSN   pg.LSN
 	LSNOK bool
 }
@@ -188,6 +191,14 @@ type Observation struct {
 	// promotes the most-advanced REACHABLE standby whatever its distance from the lost
 	// primary, so an asymmetric outage can accept unbounded data loss.
 	MaxLagBytes uint64
+	// AcceptLagTarget is the pod an operator named with the pg-ha/accept-failover-lag
+	// annotation (#273): their explicit acceptance of the loss the gate would refuse. It
+	// waives the gate for that node only, and only once that node is the holder the ranking
+	// settled on -- the most-advanced reachable standby, which is also the node whose
+	// refusal is being logged. Naming a further-behind node is ignored, and the refusal says
+	// which node to name instead: letting it jump the ranking would discard even more WAL
+	// than the gate refused, and hand-offs in both directions would livelock. "" when none.
+	AcceptLagTarget string
 }
 
 // LagGateReason is the fixed prefix of the Decision.Reason a lag-refused promotion
@@ -426,9 +437,9 @@ func Decide(o Observation) Decision {
 // deliberately narrow: it never blocks when the gate is off, when either position is
 // unknown, or when the marker's timeline is not the local one (a standby below the
 // highwater is already refused by unsafeToServe; a standby above it cannot exist). An
-// explicit operator request -- the switchover-target annotation naming THIS node -- is
-// the override the issue asks for: the operator has looked at the lag and accepted it,
-// and automatic promotion is what the gate bounds, not a manual one.
+// explicit operator acceptance -- the pg-ha/accept-failover-lag annotation naming THIS
+// node -- is the override the issue asks for: the operator has looked at the lag and
+// accepted it, and automatic promotion is what the gate bounds, not a manual one.
 func lagExceedsFailoverLimit(o Observation) (bool, string) {
 	if o.MaxLagBytes == 0 || !o.Marker.Present || o.Marker.Malformed || !o.Marker.LSNOK || !o.Local.LSNOK {
 		return false, ""
@@ -444,11 +455,15 @@ func lagExceedsFailoverLimit(o Observation) (bool, string) {
 	if lag <= o.MaxLagBytes {
 		return false, ""
 	}
-	if o.SwitchoverTarget != "" && o.SwitchoverTarget == o.LocalNode {
+	if o.AcceptLagTarget == o.LocalNode {
 		return false, ""
 	}
-	return true, fmt.Sprintf("%s: this standby is %d bytes behind the primary's last recorded position %s (limit %d; set ha.agent.maximumLagOnFailover=0 to disable, or request this node explicitly with the pg-ha/switchover-target annotation to accept the loss)",
-		LagGateReason, lag, o.Marker.LSN, o.MaxLagBytes)
+	ignored := ""
+	if o.AcceptLagTarget != "" {
+		ignored = fmt.Sprintf("; pg-ha/accept-failover-lag names %q, but %s is the most-advanced reachable standby and the one that would promote, so the acceptance is ignored -- annotate %s instead", o.AcceptLagTarget, o.LocalNode, o.LocalNode)
+	}
+	return true, fmt.Sprintf("%s: this standby is %d bytes behind the primary's last recorded position %s (limit %d; set ha.agent.maximumLagOnFailover=0 to disable, or accept the loss with `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=%s`%s)",
+		LagGateReason, lag, o.Marker.LSN, o.MaxLagBytes, o.LocalNode, ignored)
 }
 
 // sameTimelinePrimary returns a reachable live primary on exactly the local

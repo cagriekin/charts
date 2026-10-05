@@ -2,10 +2,11 @@
 # RPO gate on automatic failover (#273): ha.agent.maximumLagOnFailover. A lease-holding
 # standby further than the limit behind the primary's last marker-recorded position must
 # REFUSE to promote and release the lease; a caught-up standby must still fail over normally;
-# the pg-ha/switchover-target annotation must override the refusal; and the former primary
-# must rejoin afterwards. Lag is induced by patching the marker's recorded position while the
-# cluster is paused (the primary only writes it when unpaused), so the scenario is
-# deterministic and needs no real replication stall. Standalone, opt-in:
+# the pg-ha/accept-failover-lag annotation must override the refusal; and the former primary
+# must rejoin afterwards. Lag is induced by planting a far-future position on the marker once
+# the primary is gone (recording continues while paused, so the plant has to follow the
+# scale-down), so the scenario is deterministic and needs no real replication stall.
+# Standalone, opt-in:
 # `make -C pg test-agent-lag-gate`.
 set -euo pipefail
 
@@ -126,16 +127,24 @@ pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO lag_gate (v) VALUES ('${FV2}')" "t
 sleep 3
 
 # --- blocked failover: the recorded position is far ahead of the surviving standby ---
-# Pause first so the primary stops rewriting data.lsn, plant a far-future position, remove the
-# primary for good (scale to 1: a deleted pod would just come back), then resume. The surviving
-# standby acquires the lease, measures a lag far above the limit, and must refuse.
-echo "Pausing, planting a far-future recorded position, scaling the primary away..."
+# Pause so the surviving standby takes no action yet, remove the primary for good (scale to 1:
+# a deleted pod would just come back), plant a far-future position on the marker, then resume.
+# The standby acquires the lease, measures a lag far above the limit, and must refuse.
+echo "Pausing, scaling the primary away, planting a far-future recorded position..."
 kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/pause=true --overwrite >/dev/null
-sleep 12
-kubectl patch configmap "${MARKER}" -n "${NAMESPACE}" --type merge -p '{"data":{"lsn":"FFFFFFFF/FFFFFFF0"}}' >/dev/null
+# Recording is observation, not action: it must continue while paused, or a long maintenance
+# window would leave a stale reference for a failover right after resume.
+lsn_paused_before=$(marker_lsn)
+pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO lag_gate (v) SELECT repeat('y', 1000) FROM generate_series(1, 2000)" "testuser" "testdb" >/dev/null
+lsn_paused_after=""; elapsed=0
+while [[ ${elapsed} -lt 60 ]]; do
+  lsn_paused_after=$(marker_lsn); [[ -n "${lsn_paused_after}" && "${lsn_paused_after}" != "${lsn_paused_before}" ]] && break; sleep 5; elapsed=$((elapsed + 5))
+done
+assert_not_eq "#273: the recorded position keeps advancing while the cluster is paused" "${lsn_paused_before}" "${lsn_paused_after}"
 kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=1 >/dev/null
 kubectl wait --for=delete "pod/${POD1}" -n "${NAMESPACE}" --timeout=180s >/dev/null 2>&1 || true
-assert_eq "#273: the planted position survived the scale-down" "FFFFFFFF/FFFFFFF0" "$(marker_lsn)"
+kubectl patch configmap "${MARKER}" -n "${NAMESPACE}" --type merge -p '{"data":{"lsn":"FFFFFFFF/FFFFFFF0"}}' >/dev/null
+assert_eq "#273: the planted position is on the marker" "FFFFFFFF/FFFFFFF0" "$(marker_lsn)"
 kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/pause- >/dev/null 2>&1 || true
 
 echo "Observing ${POD0} for 60s: it must stay a standby and refuse to promote..."
@@ -158,9 +167,9 @@ assert_contains "#273: the decision carries the lag gate reason" \
   "$(kubectl logs -n "${NAMESPACE}" "${POD0}" -c postgresql --since=3m 2>/dev/null | grep -m1 'lag gate (#273)' || true)" \
   "bytes behind the primary's last recorded position"
 
-# --- operator override: name the standby explicitly ---
-echo "Overriding with pg-ha/switchover-target=${POD0}..."
-kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/switchover-target="${POD0}" --overwrite >/dev/null
+# --- operator acceptance: name the standby explicitly ---
+echo "Accepting the loss with pg-ha/accept-failover-lag=${POD0}..."
+kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/accept-failover-lag="${POD0}" --overwrite >/dev/null
 promoted=false; elapsed=0
 while [[ ${elapsed} -lt ${FAILOVER_BUDGET} ]]; do
   rec=$(in_recovery "${POD0}")
@@ -168,13 +177,13 @@ while [[ ${elapsed} -lt ${FAILOVER_BUDGET} ]]; do
   if [[ "${rec}" == "f" && "${holder}" == "${POD0}" ]]; then promoted=true; echo "  override promoted ${POD0} after ${elapsed}s"; break; fi
   sleep 3; elapsed=$((elapsed + 3))
 done
-assert_eq "#273: the switchover-target override promotes the lagging standby" "true" "${promoted}"
+assert_eq "#273: the accept-failover-lag annotation promotes the lagging standby" "true" "${promoted}"
 cleared=""; elapsed=0
 while [[ ${elapsed} -lt 60 ]]; do
-  cleared=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-target}' 2>/dev/null || echo "")
+  cleared=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/accept-failover-lag}' 2>/dev/null || echo "")
   [[ -z "${cleared}" ]] && break; sleep 5; elapsed=$((elapsed + 5))
 done
-assert_eq "#273: the override annotation is one-shot (cleared after the promote)" "" "${cleared}"
+assert_eq "#273: the acceptance is one-shot (cleared after the promote)" "" "${cleared}"
 assert_eq "#273: data written before the block is on the new primary" "${FV2}" "$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT v FROM lag_gate WHERE v='${FV2}'" "testuser" "testdb" 2>/dev/null || true)"
 # The new primary records its own position again, replacing the planted one.
 lsn_new=""; elapsed=0

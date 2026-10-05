@@ -396,7 +396,7 @@ ha:
     cascadingReplication: false
     # RPO gate on automatic failover (#273), in bytes; 0 disables. A lease-holding standby
     # further than this behind the primary's last recorded position refuses to promote and
-    # releases the lease (override: pg-ha/switchover-target=<pod>). See the pg chart values.
+    # releases the lease (accept the loss: pg-ha/accept-failover-lag=<pod>). See the pg chart values.
     maximumLagOnFailover: 0
     # Logical failover slot sync (#308), PostgreSQL 17+. Off by default. When true, the
     # primary reconciles synchronized_standby_slots to its current standbys' physical

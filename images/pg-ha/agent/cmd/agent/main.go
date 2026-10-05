@@ -226,10 +226,9 @@ type agent struct {
 	lastPubPos k8s.NodeStatus // position fields only (UpdatedAtUnix zeroed)
 	lastPubAt  time.Time
 
-	// #273 lag gate: the last primary position written to the marker (skip the write when
-	// unchanged), and a latch so the refusal is logged at Error once per episode rather than
-	// every tick (the counter carries the per-tick signal).
-	lastMarkerLSN   string
+	// #273 lag gate: a latch so a refusal is logged at Error once per episode -- an episode
+	// ends when some node is observed serving read-write again -- rather than on every
+	// re-acquisition (the counter carries the per-refusal signal).
 	lagRefusedLatch bool
 
 	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
@@ -766,16 +765,27 @@ func (a *agent) tick(ctx context.Context) {
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
 	// #273: a lag-refused promotion is the one ReleaseLease an operator has to hear about
 	// -- the cluster stays without a primary until a closer candidate appears, the primary
-	// returns, or they override. Counted every tick (the alert's signal), logged at Error
-	// once per episode.
+	// returns, or they accept the loss. Counted per refusal (the alert's signal), logged at
+	// Error once per episode; the episode ends when a node is seen serving read-write.
 	if dec.Action == reconcile.ReleaseLease && strings.Contains(dec.Reason, reconcile.LagGateReason) {
 		a.metr.IncPromotionRefusedLag()
 		if !a.lagRefusedLatch {
-			a.log.Error("refusing automatic promotion: this standby's lag exceeds ha.agent.maximumLagOnFailover; the cluster has no primary until a caught-up node appears, the primary returns, or an operator requests this node with pg-ha/switchover-target (#273)", "reason", dec.Reason)
+			a.log.Error("refusing automatic promotion: this standby's lag exceeds ha.agent.maximumLagOnFailover; the cluster has no primary until a caught-up node appears, the primary returns, or an operator accepts the loss with pg-ha/accept-failover-lag=<pod> (#273)", "reason", dec.Reason)
 			a.lagRefusedLatch = true
 		}
-	} else {
+	} else if (obs.Local.Running && !obs.Local.InRecovery) || anyReachablePrimaryPeer(obs.Peers) {
 		a.lagRefusedLatch = false
+	}
+	// #273: record where the primary is, so a candidate can measure its lag against it after
+	// this pod is gone (gossip dies with the pod; the marker does not). From tick(), not the
+	// StayPrimary branch: it must keep running while PAUSED -- a pause is observation-only
+	// for everything else, and a 20-minute maintenance window would otherwise leave a
+	// 20-minute-old reference for a failover two seconds after resume -- and it must not
+	// share the branch's fence budget with the routing assertion it could starve. Bounded,
+	// gate-enabled only, and compared against the position observe() just read rather than
+	// a private cache, so a marker that was deleted and recreated is re-populated.
+	if a.cfg.MaxLagOnFailoverBytes > 0 && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
+		a.recordPrimaryPosition(ctx, obs)
 	}
 	a.opMu.Lock()
 	err := a.act(ctx, dec, obs)
@@ -1102,6 +1112,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		o.Marker.LSN, o.Marker.LSNOK = pg.ParseLSN(m.LSN)
 	}
 	o.MaxLagBytes = a.cfg.MaxLagOnFailoverBytes
+	o.AcceptLagTarget = m.AcceptLagTarget
 	// Cross-check the marker highwater against observed reality (#298 security review).
 	// The marker is a ConfigMap a namespace writer can forge, and unsafeToServe trusts
 	// its timeline: a wildly-high (or unparseable) value trips the guard on every node
@@ -1510,13 +1521,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.metr.IncPromotion()
-		// #273: an operator who named THIS node as the switchover target to override the lag
-		// gate has been obeyed; the request is one-shot like every switchover (the serving
-		// primary clears it in the Switchover branch, which a dead primary never reaches).
-		if obs.SwitchoverTarget == a.cfg.PodName {
+		// #273: an operator who accepted the lag for THIS node has been obeyed; the
+		// acceptance is one-shot so it cannot waive the bound on a later, unrelated failover.
+		if obs.AcceptLagTarget == a.cfg.PodName {
 			cctx, ccancel := context.WithTimeout(ctx, a.fenceBudget())
-			if cerr := a.kube.ClearSwitchoverTarget(cctx, a.cfg.MarkerName); cerr != nil {
-				a.log.Warn("clear the switchover-target annotation after an operator-overridden promote (#273)", "err", cerr)
+			if cerr := a.kube.ClearAcceptLagTarget(cctx, a.cfg.MarkerName); cerr != nil {
+				a.log.Warn("clear pg-ha/accept-failover-lag after the accepted promote (#273)", "err", cerr)
 			}
 			ccancel()
 		}
@@ -1640,12 +1650,6 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		// #273: record where this primary is, so a candidate can measure its lag against
-		// it after this pod is gone (gossip dies with the pod; the marker does not). One
-		// bounded write per tick, only while the gate is enabled, skipped when the position
-		// has not moved. After the highwater write, so the marker exists and carries its
-		// timeline before it ever carries a position.
-		a.recordPrimaryPosition(wctx, obs.Local)
 		// THE path that expires a restore claim in practice (#288 review, round 4). The
 		// documented restore procedure is scale to 0, restore into the target ordinal's PVC,
 		// scale up -- and pgbackrest runs with --target-action=promote, so that pod comes back
@@ -3376,23 +3380,32 @@ func (a *agent) gossipFresh(g k8s.NodeStatus) bool {
 }
 
 // recordPrimaryPosition writes this primary's write LSN to the marker for the #273 lag
-// gate. Enabled-only (the default leaves the marker's API traffic exactly as before), and
-// skipped when the position is unchanged since the last write, so an idle primary costs
-// nothing. Best-effort: a missed write means the reference trails by one more tick, and
-// the gate reads the lag it yields as a floor anyway.
-func (a *agent) recordPrimaryPosition(ctx context.Context, ls reconcile.LocalState) {
-	if a.cfg.MaxLagOnFailoverBytes == 0 || !ls.LSNOK {
+// gate. Skipped when the marker already carries this position (as observed this tick), so
+// an idle primary costs nothing and a marker that lost the key is repopulated on the next
+// tick. Best-effort and bounded: a missed write means the reference trails by one more
+// tick, and the gate reads the lag it yields as a floor anyway.
+func (a *agent) recordPrimaryPosition(ctx context.Context, obs reconcile.Observation) {
+	if !obs.Local.LSNOK {
 		return
 	}
-	lsn := ls.LSN.String()
-	if lsn == a.lastMarkerLSN {
+	if obs.Marker.Present && obs.Marker.LSNOK && obs.Marker.LSN == obs.Local.LSN {
 		return
 	}
-	if err := a.kube.WriteMarkerLSN(ctx, a.cfg.MarkerName, lsn); err != nil {
+	wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer cancel()
+	if err := a.kube.WriteMarkerLSN(wctx, a.cfg.MarkerName, obs.Local.LSN.String()); err != nil {
 		a.log.Warn("record primary position on the marker (#273 lag gate)", "err", err)
-		return
 	}
-	a.lastMarkerLSN = lsn
+}
+
+// anyReachablePrimaryPeer reports whether some peer is observed serving read-write.
+func anyReachablePrimaryPeer(peers []reconcile.PeerState) bool {
+	for i := range peers {
+		if peers[i].Reachable && peers[i].Role == pg.RolePrimary {
+			return true
+		}
+	}
+	return false
 }
 
 // advanceMarker records tl as the durable highwater (the #125 marker) when it is

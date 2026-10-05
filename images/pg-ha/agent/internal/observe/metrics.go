@@ -19,9 +19,11 @@ type Metrics struct {
 	isPaused      atomic.Int64 // 0/1 gauge (maintenance mode, Part H1)
 	renewFailures atomic.Int64
 	promotions    atomic.Int64
-	// promotionsRefusedLag counts ticks on which the lease holder refused to promote because
-	// its lag exceeded the #273 gate. It advances once per refusing tick and stops when a
-	// candidate within the limit appears or the primary returns, so the rate is the signal.
+	// promotionsRefusedLag counts refusals: lease acquisitions a standby ended by releasing
+	// because its lag exceeded the #273 gate. A refusal releases the lease, so the next
+	// chance to refuse is the next acquisition (after the step-down cooldown), not the next
+	// tick; the counter climbs for as long as the episode lasts and stops when a candidate
+	// within the limit promotes or the primary returns.
 	promotionsRefusedLag atomic.Int64
 	demotes              atomic.Int64
 	fences               atomic.Int64
@@ -222,7 +224,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_is_paused", "Whether maintenance mode is active (automatic failover suspended).", "gauge", m.isPaused.Load()},
 		{"pg_ha_agent_renew_failures_total", "Lease renew failures.", "counter", m.renewFailures.Load()},
 		{"pg_ha_agent_promotions_total", "Promotions performed.", "counter", m.promotions.Load()},
-		{"pg_ha_agent_promotions_refused_lag_total", "Ticks on which the lease-holding standby refused automatic promotion because its lag behind the primary's last recorded position exceeded ha.agent.maximumLagOnFailover (#273); while this climbs the cluster has no primary.", "counter", m.promotionsRefusedLag.Load()},
+		{"pg_ha_agent_promotions_refused_lag_total", "Automatic promotions refused because the lease-holding standby's lag behind the primary's last recorded position exceeded ha.agent.maximumLagOnFailover (#273): one per lease acquisition that ended in a release. While this climbs the cluster has no primary.", "counter", m.promotionsRefusedLag.Load()},
 		{"pg_ha_agent_demotes_total", "Demotions performed.", "counter", m.demotes.Load()},
 		{"pg_ha_agent_fences_total", "Soft fences performed.", "counter", m.fences.Load()},
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},

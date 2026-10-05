@@ -28,6 +28,11 @@ func ParseLSN(s string) (lsn LSN, ok bool) {
 	if err != nil {
 		return LSN{}, false
 	}
+	// Both halves are 32-bit in PostgreSQL (an LSN is a 64-bit byte offset); a wider
+	// segment is not a position, and Uint64 would fold it into one that looks like one.
+	if hi > 0xFFFFFFFF || lo > 0xFFFFFFFF {
+		return LSN{}, false
+	}
 	return LSN{Hi: hi, Lo: lo}, true
 }
 

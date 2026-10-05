@@ -609,8 +609,13 @@ func TestLagGateRefusesAFarBehindHolder(t *testing.T) {
 		{"no recorded position: the gate steps aside", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}, MaxLagBytes: 1}, Promote, ""},
 		{"unknown local LSN: the gate steps aside", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true}, Marker: marker, MaxLagBytes: 1}, Promote, ""},
 		{"recorded position from another timeline is not compared", Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(6), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true}, Marker: MarkerState{Present: true, Timeline: tl(5), LSN: ls(0, 0x1000+2<<20), LSNOK: true}, MaxLagBytes: 1}, Promote, ""},
-		{"operator override: switchover-target naming this node promotes despite the lag", Observation{HoldLease: true, LocalNode: "pg-1", SwitchoverTarget: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, Promote, ""},
-		{"a switchover-target naming ANOTHER node is no override", Observation{HoldLease: true, LocalNode: "pg-1", SwitchoverTarget: "pg-2", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, LagGateReason},
+		{"operator acceptance naming this node promotes despite the lag", Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, Promote, ""},
+		{"a pending switchover-target is NOT an acceptance of the loss", Observation{HoldLease: true, LocalNode: "pg-1", SwitchoverTarget: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, LagGateReason},
+		{"acceptance naming a further-behind node is ignored and the refusal names this node", Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-2", Local: local, Marker: marker, MaxLagBytes: 1 << 20,
+			Peers: []PeerState{standby("pg-2", 5, 0, 0x800)}}, ReleaseLease, "annotate pg-1 instead"},
+		{"the refusal tells the operator which node to annotate", Observation{HoldLease: true, LocalNode: "pg-1", Local: local, Marker: marker, MaxLagBytes: 1 << 20}, ReleaseLease, "pg-ha/accept-failover-lag=pg-1"},
+		{"acceptance is inert while the gate is off", Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-2", Local: local, Marker: marker, MaxLagBytes: 0,
+			Peers: []PeerState{standby("pg-2", 5, 0, 0x800)}}, Promote, ""},
 	}
 	for _, c := range cases {
 		got := Decide(c.obs)
@@ -626,6 +631,25 @@ func TestLagGateRefusesAFarBehindHolder(t *testing.T) {
 // The gate ranks AFTER the handoff to a more-advanced reachable peer and after the highwater
 // guard: a holder that must release for either of those reasons never reaches it, so the lag
 // reason only ever describes a node that would otherwise have promoted.
+// The acceptance never jumps the most-advanced ranking (invariant 8): a further-behind node
+// that was named still hands the lease to the more-advanced standby, which then refuses on
+// lag and tells the operator to annotate IT instead -- no livelock, no extra WAL discarded.
+func TestLagAcceptanceDoesNotJumpTheMostAdvancedRanking(t *testing.T) {
+	marker := MarkerState{Present: true, Timeline: tl(5), LSN: ls(0, 0x1000+2<<20), LSNOK: true}
+	named := Observation{HoldLease: true, LocalNode: "pg-2", AcceptLagTarget: "pg-2", Marker: marker, MaxLagBytes: 1 << 20,
+		Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x100), LSNOK: true},
+		Peers: []PeerState{standby("pg-1", 5, 0, 0x1000)}}
+	if got := Decide(named); got.Action != ReleaseLease || got.Target != "pg-1" || strings.Contains(got.Reason, LagGateReason) {
+		t.Errorf("the named but further-behind node must still hand off to the most-advanced one: %+v", got)
+	}
+	ahead := Observation{HoldLease: true, LocalNode: "pg-1", AcceptLagTarget: "pg-2", Marker: marker, MaxLagBytes: 1 << 20,
+		Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true},
+		Peers: []PeerState{standby("pg-2", 5, 0, 0x100)}}
+	if got := Decide(ahead); got.Action != ReleaseLease || !strings.Contains(got.Reason, "annotate pg-1 instead") {
+		t.Errorf("the most-advanced node must refuse and name itself: %+v", got)
+	}
+}
+
 func TestLagGateDoesNotPreemptEarlierGuards(t *testing.T) {
 	local := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(0, 0x1000), LSNOK: true}
 	marker := MarkerState{Present: true, Timeline: tl(5), LSN: ls(0, 0x1000+2<<20), LSNOK: true}

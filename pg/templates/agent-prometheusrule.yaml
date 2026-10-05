@@ -75,9 +75,10 @@ spec:
             summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
             description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
         {{- /* #273: the lag gate refused an automatic promotion. The counter advances once per
-               refusing tick and stops when a candidate within the limit appears, the primary
-               returns, or an operator overrides -- while it climbs the cluster has NO primary,
-               by design (RPO over availability), which is exactly what must page. */}}
+               refusal (each lease acquisition a lagging standby ends by releasing) and stops
+               when a candidate within the limit promotes, the primary returns, or an operator
+               accepts the loss -- while it climbs the cluster has NO primary, by design (RPO
+               over availability), which is exactly what must page. */}}
         - alert: PGHAAgentPromotionRefusedLag
           expr: increase(pg_ha_agent_promotions_refused_lag_total{ {{ $m }} }[5m]) > 0
           for: 0m
@@ -85,7 +86,7 @@ spec:
             severity: critical
           annotations:
             summary: "pg-ha-agent refused to promote: standby lag exceeds ha.agent.maximumLagOnFailover ({{ include "pg.fullname" . }})"
-            description: "The lease-holding standby is further behind the primary's last recorded position than ha.agent.maximumLagOnFailover allows, so it released the lease instead of promoting (#273). There is no primary. Either wait for the primary to return, accept the loss with `kubectl annotate configmap {{ include "pg.fullname" . }}-primary pg-ha/switchover-target=<pod>`, or lower the limit."
+            description: "The lease-holding standby is further behind the primary's last recorded position than ha.agent.maximumLagOnFailover allows, so it released the lease instead of promoting (#273). There is no primary. Either wait for the primary to return, accept the loss with `kubectl annotate configmap {{ include "pg.fullname" . }}-primary pg-ha/accept-failover-lag=<pod>`, or lower the limit. Inspect the marker's data.lsn if the lag looks implausible: it is the recorded reference."
         {{- /* #298 security review. The primary marker is a ConfigMap any namespace writer
                can forge, and unsafeToServe trusts its recorded timeline: an implausibly high
                or unparseable highwater trips that guard on EVERY node and freezes automatic

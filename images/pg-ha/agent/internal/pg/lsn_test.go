@@ -70,6 +70,14 @@ func TestRoleStringsAreTheContract(t *testing.T) {
 	}
 }
 
+func TestParseLSNRejectsOversizedSegments(t *testing.T) {
+	for _, s := range []string{"0/FFFFFFFFFFFFFFFF", "100000000/0", "1/100000000"} {
+		if _, ok := ParseLSN(s); ok {
+			t.Errorf("ParseLSN(%q) must fail: a segment wider than 32 bits is not a position", s)
+		}
+	}
+}
+
 func TestLSNStringRoundTrips(t *testing.T) {
 	for _, s := range []string{"0/3000120", "1A/FF000000", "FFFFFFFF/FFFFFFFF"} {
 		l, ok := ParseLSN(s)
