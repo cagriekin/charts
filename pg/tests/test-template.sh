@@ -239,6 +239,30 @@ assert_eq "#273: a custom image tag is not checked" "0" "${lag_custom_rc}"
 lag_sa_rc=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=2.0.2-pg18 >/dev/null 2>&1 || lag_sa_rc=$?
 assert_eq "#273: standalone mode skips the image guard" "0" "${lag_sa_rc}"
 
+# #271: every resources block the templates read is declared through one shared schema
+# definition. Before, not one was: a scalar (easy with --set or a templated values file) rendered
+# an invalid container spec that only the API server rejected, and a typo'd reqests: a silently
+# resource-less container. The error must name the path; both quantity spellings and extended
+# resources must keep rendering, or a working values file would break.
+res_scalar=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.resources=oops 2>&1 || true)
+assert_contains "#271: a scalar resources block fails the render, naming the path" "${res_scalar}" "at '/postgresql/resources': got string, want object"
+res_bool=$(helm template test-pg "${CHART_DIR}" --set postgresql.resources.requests.cpu=true 2>&1 || true)
+assert_contains "#271: a boolean quantity fails, naming the leaf" "${res_bool}" "at '/postgresql/resources/requests/cpu': got boolean, want number or string"
+res_typo=$(helm template test-pg "${CHART_DIR}" --set postgresql.resources.reqests.cpu=1 2>&1 || true)
+assert_contains "#271: a typo'd reqests: is rejected rather than silently dropped" "${res_typo}" "additional properties 'reqests' not allowed"
+# Parents the schema had never declared (created for this) and the two blocks with non-standard names.
+for res_path in pgpool.metrics.resources backup.validation.resources pgbackrest.cronjob.resources ha.initContainerResources postgresql.extensions.installResources; do
+  res_out=$(helm template test-pg "${CHART_DIR}" --set-string "${res_path}=oops" 2>&1 || true)
+  assert_contains "#271: ${res_path} is validated" "${res_out}" "at '/${res_path//./\/}': got string, want object"
+done
+res_ok_rc=0; helm template test-pg "${CHART_DIR}" --set postgresql.resources.requests.cpu=1 --set-string postgresql.resources.limits.cpu=100m --set postgresql.resources.limits.memory=1Gi >/dev/null 2>&1 || res_ok_rc=$?
+assert_eq "#271: numeric and string quantities both render" "0" "${res_ok_rc}"
+res_dir=$(mktemp -d)
+printf 'postgresql:\n  resources:\n    requests:\n      cpu: 1\n      memory: 1Gi\n    limits:\n      nvidia.com/gpu: 1\n      hugepages-2Mi: 128Mi\n' > "${res_dir}/ext.yaml"
+res_ext_rc=0; helm template test-pg "${CHART_DIR}" -f "${res_dir}/ext.yaml" >/dev/null 2>&1 || res_ext_rc=$?
+assert_eq "#271: extended resources (nvidia.com/gpu, hugepages-2Mi) render" "0" "${res_ext_rc}"
+rm -rf "${res_dir}"
+
 # #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
 # value renders as a YAML scalar the API server rejects with an unmarshal error).
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)

@@ -3,6 +3,31 @@
   "title": "pgvector chart values (enum guards)",
   "description": "Partial schema: constrains the values whose typos silently misconfigure HA. additionalProperties stays open so the rest of values.yaml is unconstrained.",
   "type": "object",
+  "definitions": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Kubernetes ResourceRequirements as the charts pass it through: requests and limits only (#271). Closed on purpose -- a typo'd reqests:/limts: used to render a silently resource-less container, and a scalar here (easy with --set or a templated values file) an invalid container spec that only the API server rejected, after the release was already going out. Any further ResourceRequirements field (claims) has to be added here deliberately.",
+      "properties": {
+        "requests": {
+          "$ref": "#/definitions/resourceList"
+        },
+        "limits": {
+          "$ref": "#/definitions/resourceList"
+        }
+      }
+    },
+    "resourceList": {
+      "type": "object",
+      "description": "A resource quantity map. Values are string or number: both quantity spellings (cpu: 1, cpu: \"100m\", memory: 1Gi) must keep working, and the key set stays open so extended resources (nvidia.com/gpu, hugepages-2Mi) are not rejected.",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number"
+        ]
+      }
+    }
+  },
   "properties": {
     "postgresql": {
       "type": "object",
@@ -220,6 +245,9 @@
                 }
               },
               "description": "Prebuilt extension image (#320) -- packages resolved once at build time, so pods do a plain cp with no apt and no egress at pod start, and the copy container stays unprivileged. Mutually exclusive with packages and aptSources; requires a tag or digest. See the pg chart README."
+            },
+            "installResources": {
+              "$ref": "#/definitions/resources"
             }
           }
         },
@@ -262,6 +290,9 @@
             "type": "string",
             "pattern": "^[^'\r\n]*$"
           }
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
         }
       }
     },
@@ -388,6 +419,9 @@
               "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0. Capped at 2^53-1: values parse through float64 and a larger one is silently rounded or, past int64, wraps negative and disables the gate."
             }
           }
+        },
+        "initContainerResources": {
+          "$ref": "#/definitions/resources"
         }
       },
       "description": "DEPRECATED alias for ha.* (#291). Structurally IDENTICAL to ha on purpose: the issue requires both spellings to validate during the alias window, so making this permissive would silently drop enum and type checking for every key an existing values file still spells the old way. Keys under it are merged over the ha.* defaults key by key. Generated from the ha shape -- keep them identical; test-template.sh asserts it."
@@ -453,6 +487,17 @@
               "description": "Seconds between re-attach passes."
             }
           }
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "resources": {
+              "$ref": "#/definitions/resources"
+            }
+          }
         }
       }
     },
@@ -467,6 +512,9 @@
             "verify-full"
           ],
           "description": "libpq sslmode for the exporter -> postgres connection. Must be >= require when postgresql.tls.require is true."
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
         }
       }
     },
@@ -595,6 +643,9 @@
             },
             "backoffLimit": {
               "type": "integer"
+            },
+            "resources": {
+              "$ref": "#/definitions/resources"
             }
           }
         },
@@ -619,6 +670,9 @@
             },
             "backupSet": {
               "type": "string"
+            },
+            "resources": {
+              "$ref": "#/definitions/resources"
             }
           }
         },
@@ -669,6 +723,20 @@
             },
             "backoffLimit": {
               "type": "integer"
+            },
+            "resources": {
+              "$ref": "#/definitions/resources"
+            }
+          }
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        },
+        "cronjob": {
+          "type": "object",
+          "properties": {
+            "resources": {
+              "$ref": "#/definitions/resources"
             }
           }
         }
@@ -797,6 +865,9 @@
               "description": "RPO gate on automatic failover in bytes (#273; Patroni's maximum_lag_on_failover). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease. 0 disables. Integer, not a string: it is rendered through int64 and a quoted value would read as 0. Capped at 2^53-1: values parse through float64 and a larger one is silently rounded or, past int64, wraps negative and disables the gate."
             }
           }
+        },
+        "initContainerResources": {
+          "$ref": "#/definitions/resources"
         }
       }
     },
@@ -834,6 +905,17 @@
                   "type": "string"
                 }
               }
+            }
+          }
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        },
+        "validation": {
+          "type": "object",
+          "properties": {
+            "resources": {
+              "$ref": "#/definitions/resources"
             }
           }
         }

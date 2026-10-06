@@ -91,3 +91,48 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "etcd: an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default."
+
+  # --- #271: resources blocks are validated through the shared schema definition ---
+  # A scalar or a typo'd key used to pass helm and fail only at the API server (or render a
+  # silently resource-less container). The error names the path.
+  - it: a scalar resources block fails schema validation (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      resources: oops
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/resources': got string, want object"
+  - it: a boolean quantity fails schema validation (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      resources.requests.cpu: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/resources/requests/cpu': got boolean, want number or string"
+  - it: a typo'd reqests key is rejected (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      resources.reqests.cpu: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "additional properties 'reqests' not allowed"
+  - it: the RBAC bootstrap resources block is validated too (#271)
+    templates:
+      - templates/rbac-bootstrap-job.yaml
+    set:
+      rbac.resources: oops
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/rbac/resources': got string, want object"
+  - it: numeric and string quantities both render (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      resources.requests.cpu: 1
+      resources.limits.cpu: 100m
+      resources.limits.memory: 1Gi
+    asserts:
+      - notFailedTemplate: {}
