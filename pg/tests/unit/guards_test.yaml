@@ -1153,7 +1153,7 @@ tests:
       postgresql.resources: oops
     asserts:
       - failedTemplate:
-          errorPattern: "at '/postgresql/resources': got string, want object"
+          errorPattern: "(at '/postgresql/resources': got string, want object|postgresql.resources: Invalid type\\. Expected: object, given: string)"
   - it: a typo'd reqests key is rejected (#271)
     templates:
       - templates/statefulset.yaml
@@ -1161,7 +1161,7 @@ tests:
       postgresql.resources.reqests.cpu: 1
     asserts:
       - failedTemplate:
-          errorPattern: "additional properties 'reqests' not allowed"
+          errorPattern: "(additional properties 'reqests' not allowed|Additional property reqests is not allowed)"
   - it: a nested resources block the schema had never declared is validated (#271)
     templates:
       - templates/statefulset.yaml
@@ -1170,7 +1170,7 @@ tests:
       pgpool.metrics.resources: oops
     asserts:
       - failedTemplate:
-          errorPattern: "at '/pgpool/metrics/resources': got string, want object"
+          errorPattern: "(at '/pgpool/metrics/resources': got string, want object|pgpool.metrics.resources: Invalid type\\. Expected: object, given: string)"
   - it: numeric and string quantities both render (#271)
     templates:
       - templates/statefulset.yaml

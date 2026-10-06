@@ -244,16 +244,18 @@ assert_eq "#273: standalone mode skips the image guard" "0" "${lag_sa_rc}"
 # an invalid container spec that only the API server rejected, and a typo'd reqests: a silently
 # resource-less container. The error must name the path; both quantity spellings and extended
 # resources must keep rendering, or a working values file would break.
+# Two wordings: Helm 4 (local) says "at '/a/b': got string, want object"; Helm 3.14 (CI) says
+# "a.b: Invalid type. Expected: object, given: string". Each needle accepts both (BRE alternation).
 res_scalar=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.resources=oops 2>&1 || true)
-assert_contains "#271: a scalar resources block fails the render, naming the path" "${res_scalar}" "at '/postgresql/resources': got string, want object"
+assert_contains "#271: a scalar resources block fails the render, naming the path" "${res_scalar}" "at '/postgresql/resources': got string, want object\|postgresql.resources: Invalid type. Expected: object, given: string"
 res_bool=$(helm template test-pg "${CHART_DIR}" --set postgresql.resources.requests.cpu=true 2>&1 || true)
-assert_contains "#271: a boolean quantity fails, naming the leaf" "${res_bool}" "at '/postgresql/resources/requests/cpu': got boolean, want number or string"
+assert_contains "#271: a boolean quantity fails, naming the leaf" "${res_bool}" "at '/postgresql/resources/requests/cpu': got boolean, want number or string\|postgresql.resources.requests.cpu: Invalid type. Expected: \[string,number\], given: boolean"
 res_typo=$(helm template test-pg "${CHART_DIR}" --set postgresql.resources.reqests.cpu=1 2>&1 || true)
-assert_contains "#271: a typo'd reqests: is rejected rather than silently dropped" "${res_typo}" "additional properties 'reqests' not allowed"
+assert_contains "#271: a typo'd reqests: is rejected rather than silently dropped" "${res_typo}" "additional properties 'reqests' not allowed\|Additional property reqests is not allowed"
 # Parents the schema had never declared (created for this) and the two blocks with non-standard names.
 for res_path in pgpool.metrics.resources backup.validation.resources pgbackrest.cronjob.resources ha.initContainerResources postgresql.extensions.installResources; do
   res_out=$(helm template test-pg "${CHART_DIR}" --set-string "${res_path}=oops" 2>&1 || true)
-  assert_contains "#271: ${res_path} is validated" "${res_out}" "at '/${res_path//./\/}': got string, want object"
+  assert_contains "#271: ${res_path} is validated" "${res_out}" "at '/${res_path//./\/}': got string, want object\|${res_path}: Invalid type. Expected: object, given: string"
 done
 res_ok_rc=0; helm template test-pg "${CHART_DIR}" --set postgresql.resources.requests.cpu=1 --set-string postgresql.resources.limits.cpu=100m --set postgresql.resources.limits.memory=1Gi >/dev/null 2>&1 || res_ok_rc=$?
 assert_eq "#271: numeric and string quantities both render" "0" "${res_ok_rc}"
