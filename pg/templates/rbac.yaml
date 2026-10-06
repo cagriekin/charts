@@ -54,14 +54,20 @@ rules:
       - "patch"
 {{- if eq (include "pg.agentMode" .) "true" }}
   # Durable primary marker (<fullname>-primary): the agent records the highest
-  # timeline here (#125) via Get -> Create-if-absent -> Update. get/update are
-  # scoped to the one marker name; create stays unscoped (resourceNames cannot
-  # restrict create). The agent records its failover decisions in a structured
-  # audit log (not core/v1 Events), so it needs no events grant.
+  # timeline here (#125) via Get -> Create-if-absent -> Update, and the serving
+  # primary's write position (an RFC 6902 JSON patch whose test ops fence it to
+  # the recorded primary and timeline) plus the lag-acceptance clear (a merge
+  # patch) (#273) -- a patch touches one key without a read-modify-write race
+  # against the pause/switchover annotations an operator edits, so an admission
+  # policy must allow both application/json-patch+json and application/merge-
+  # patch+json on this object. get/update/patch
+  # are scoped to the one marker name; create stays unscoped (resourceNames
+  # cannot restrict create). The agent records its failover decisions in a
+  # structured audit log (not core/v1 Events), so it needs no events grant.
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["{{ include "pg.fullname" . }}-primary"]
-    verbs: ["get", "update"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]

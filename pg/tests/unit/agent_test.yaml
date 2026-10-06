@@ -54,6 +54,30 @@ tests:
             name: POD_CIDR
           any: true
 
+  # --- #273: the RPO gate env is emitted only when the knob is set ---
+  - it: agent env carries MAX_LAG_ON_FAILOVER_BYTES only when ha.agent.maximumLagOnFailover is set
+    values:
+      - ../values-agent.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: MAX_LAG_ON_FAILOVER_BYTES
+          any: true
+  - it: agent env carries MAX_LAG_ON_FAILOVER_BYTES as a quoted integer when set (#273)
+    values:
+      - ../values-agent.yaml
+    set:
+      ha.agent.maximumLagOnFailover: 1048576
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: MAX_LAG_ON_FAILOVER_BYTES
+            value: "1048576"
+
   # --- Scenario 5: agent RBAC ---
   - it: agent Role grants the leader Lease (coordination.k8s.io) and no delete
     values:

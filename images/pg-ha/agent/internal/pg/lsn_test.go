@@ -69,3 +69,23 @@ func TestRoleStringsAreTheContract(t *testing.T) {
 		t.Errorf("an out-of-range Role = %q, want unknown", got)
 	}
 }
+
+func TestParseLSNRejectsOversizedSegments(t *testing.T) {
+	for _, s := range []string{"0/FFFFFFFFFFFFFFFF", "100000000/0", "1/100000000"} {
+		if _, ok := ParseLSN(s); ok {
+			t.Errorf("ParseLSN(%q) must fail: a segment wider than 32 bits is not a position", s)
+		}
+	}
+}
+
+func TestLSNStringRoundTrips(t *testing.T) {
+	for _, s := range []string{"0/3000120", "1A/FF000000", "FFFFFFFF/FFFFFFFF"} {
+		l, ok := ParseLSN(s)
+		if !ok {
+			t.Fatalf("ParseLSN(%q) failed", s)
+		}
+		if got := l.String(); got != s {
+			t.Errorf("String() = %q, want %q", got, s)
+		}
+	}
+}

@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-full test-upgrade \
-        test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-scaledown test-agent-rolling test-config test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars test-migrate-native test-migrate-repmgrd byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-agent test-agent-lag-gate test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-scaledown test-agent-rolling test-config test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars test-migrate-native test-migrate-repmgrd byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -14,6 +14,7 @@ help:
 	@echo "  test-minimal    - Run minimal install tests"
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-agent      - Run lease-based agent install + failover tests"
+	@echo "  test-agent-lag-gate - Run the #273 RPO gate test (lagging standby refuses to promote; override; rejoin)"
 	@echo "  test-agent-control - Run agent control REST API tests (mTLS, pause, switchover)"
 	@echo "  test-agent-control-restore - Run API-driven pgBackRest restore tests"
 	@echo "  test-agent-etcd - Run agent etcd-DCS test (bundled etcd; standalone, opt-in)"
@@ -58,6 +59,11 @@ test-cluster: test-minimal test-agent test-full test-upgrade test-scaledown test
 test-agent: cluster-exists
 	@bash $(TESTS_DIR)/test-agent.sh
 	@bash $(TESTS_DIR)/test-agent-failover.sh
+
+# RPO gate on automatic failover (#273): a caught-up standby still fails over, a lagging one
+# refuses and releases, pg-ha/accept-failover-lag promotes it, the ex-primary rejoins.
+test-agent-lag-gate: cluster-exists
+	@bash $(TESTS_DIR)/test-agent-lag-gate.sh
 
 # Agent control REST API (#276): mTLS enforcement, the read surface, and pause /
 # switchover through the API (including that a switchover really moves leadership).

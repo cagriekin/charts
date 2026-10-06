@@ -15,15 +15,21 @@ import (
 // Metrics holds the agent's counters/gauges. All access is atomic so the metrics
 // goroutine and the reconcile loop are race-free.
 type Metrics struct {
-	isLeader        atomic.Int64 // 0/1 gauge
-	isPaused        atomic.Int64 // 0/1 gauge (maintenance mode, Part H1)
-	renewFailures   atomic.Int64
-	promotions      atomic.Int64
-	demotes         atomic.Int64
-	fences          atomic.Int64
-	reconcileErrors atomic.Int64
-	recoveryStarts  atomic.Int64 // recovery-mode (read-only WAL replay) entries
-	lastBeatUnixNs  atomic.Int64 // last reconcile-loop heartbeat
+	isLeader      atomic.Int64 // 0/1 gauge
+	isPaused      atomic.Int64 // 0/1 gauge (maintenance mode, Part H1)
+	renewFailures atomic.Int64
+	promotions    atomic.Int64
+	// promotionsRefusedLag counts refusals: lease acquisitions a standby ended by releasing
+	// because its lag exceeded the #273 gate. A refusal releases the lease, so the next
+	// chance to refuse is the next acquisition (after the step-down cooldown), not the next
+	// tick; the counter climbs for as long as the episode lasts and stops when a candidate
+	// within the limit promotes or the primary returns.
+	promotionsRefusedLag atomic.Int64
+	demotes              atomic.Int64
+	fences               atomic.Int64
+	reconcileErrors      atomic.Int64
+	recoveryStarts       atomic.Int64 // recovery-mode (read-only WAL replay) entries
+	lastBeatUnixNs       atomic.Int64 // last reconcile-loop heartbeat
 	// markerTamper counts ticks on which the primary marker looked forged or corrupt
 	// (#298 security review): an implausible/unparseable highwater freezes promotions
 	// via unsafeToServe, so this makes a tamper-induced write outage alertable.
@@ -110,15 +116,16 @@ func (m *Metrics) SetLeader(v bool) { m.isLeader.Store(b2i(v)) }
 func (m *Metrics) SetPaused(v bool) { m.isPaused.Store(b2i(v)) }
 
 // SetTLSInactive publishes whether requested server TLS is actually absent (#335).
-func (m *Metrics) SetTLSInactive(v bool) { m.tlsInactive.Store(b2i(v)) }
-func (m *Metrics) IncRenewFailure()      { m.renewFailures.Add(1) }
-func (m *Metrics) IncPromotion()         { m.promotions.Add(1) }
-func (m *Metrics) IncDemote()            { m.demotes.Add(1) }
-func (m *Metrics) IncFence()             { m.fences.Add(1) }
-func (m *Metrics) IncReconcileError()    { m.reconcileErrors.Add(1) }
-func (m *Metrics) IncRecoveryStart()     { m.recoveryStarts.Add(1) }
-func (m *Metrics) IncMarkerTamper()      { m.markerTamper.Add(1) }
-func (m *Metrics) IncSlotRecycled()      { m.slotsRecycled.Add(1) }
+func (m *Metrics) SetTLSInactive(v bool)   { m.tlsInactive.Store(b2i(v)) }
+func (m *Metrics) IncRenewFailure()        { m.renewFailures.Add(1) }
+func (m *Metrics) IncPromotion()           { m.promotions.Add(1) }
+func (m *Metrics) IncPromotionRefusedLag() { m.promotionsRefusedLag.Add(1) }
+func (m *Metrics) IncDemote()              { m.demotes.Add(1) }
+func (m *Metrics) IncFence()               { m.fences.Add(1) }
+func (m *Metrics) IncReconcileError()      { m.reconcileErrors.Add(1) }
+func (m *Metrics) IncRecoveryStart()       { m.recoveryStarts.Add(1) }
+func (m *Metrics) IncMarkerTamper()        { m.markerTamper.Add(1) }
+func (m *Metrics) IncSlotRecycled()        { m.slotsRecycled.Add(1) }
 
 // Control-API counters. IncControlRequest counts every authenticated request,
 // IncControlRejected every one refused by authn/authz, IncControlIntent every
@@ -217,6 +224,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_is_paused", "Whether maintenance mode is active (automatic failover suspended).", "gauge", m.isPaused.Load()},
 		{"pg_ha_agent_renew_failures_total", "Lease renew failures.", "counter", m.renewFailures.Load()},
 		{"pg_ha_agent_promotions_total", "Promotions performed.", "counter", m.promotions.Load()},
+		{"pg_ha_agent_promotions_refused_lag_total", "Automatic promotions refused because the lease-holding standby's lag behind the primary's last recorded position exceeded ha.agent.maximumLagOnFailover (#273): one per lease acquisition that ended in a release. While this climbs the cluster has no primary.", "counter", m.promotionsRefusedLag.Load()},
 		{"pg_ha_agent_demotes_total", "Demotions performed.", "counter", m.demotes.Load()},
 		{"pg_ha_agent_fences_total", "Soft fences performed.", "counter", m.fences.Load()},
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},

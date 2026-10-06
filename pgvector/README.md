@@ -294,6 +294,7 @@ A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a
 | `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `ha.agent.maximumLagOnFailover` | RPO gate on automatic failover, in bytes (#273): a lease-holding standby further than this behind the primary's last recorded position refuses to promote and releases the lease; `0` disables. See the [pg chart README](../pg/README.md#rpo-gate-on-automatic-failover-273) | `0` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself, taking topology from `pg_stat_replication` and owning its physical replication slots (#288/#289). The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**. An existing 1.x cluster migrates in place on `helm upgrade` — no re-clone, timeline preserved (#292); see the [pg chart README runbook](../pg/README.md#migrating-a-live-repmgr-cluster-to-native-292). | `native` |
 

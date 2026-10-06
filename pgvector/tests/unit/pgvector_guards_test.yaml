@@ -247,7 +247,18 @@ tests:
     set:
       etcd.enabled: true
       ha.agent.dcs.backend: etcd
-      ha.image.tag: 2.1.0-pg18
+      ha.image.tag: 2.1.1-pg18
     asserts:
       - failedTemplate:
           errorPattern: 'must match ha.image'
+
+  # The RPO gate (#273) is read by the agent from image 2.1.0 on; an older chart-scheme tag would
+  # leave the operator believing a guard is armed when nothing is, so the pairing fails fast.
+  - it: maximumLagOnFailover with a pre-2.1.0 image tag fails fast (#273)
+    set:
+      ha.agent.maximumLagOnFailover: 1048576
+      ha.image.tag: 2.0.2-pg18
+      etcd.rbac.bootstrapImage.tag: 2.0.2-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'needs the pg-ha image at 2.1.0 or later'

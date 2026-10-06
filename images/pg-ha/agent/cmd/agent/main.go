@@ -226,6 +226,11 @@ type agent struct {
 	lastPubPos k8s.NodeStatus // position fields only (UpdatedAtUnix zeroed)
 	lastPubAt  time.Time
 
+	// #273 lag gate: a latch so a refusal is logged at Error once per episode -- an episode
+	// ends when some node is observed serving read-write again -- rather than on every
+	// re-acquisition (the counter carries the per-refusal signal).
+	lagRefusedLatch bool
+
 	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
 	// the OnLost fence callback never drive the supervisor concurrently (single
 	// transition path; also avoids a concurrent-Stop deadlock).
@@ -758,6 +763,62 @@ func (a *agent) tick(ctx context.Context) {
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
+	// #273: a lag-refused promotion is the one ReleaseLease an operator has to hear about
+	// -- the cluster stays without a primary until a closer candidate appears, the primary
+	// returns, or they accept the loss. Counted per refusal (the alert's signal), logged at
+	// Error once per episode; the episode ends when a node is seen serving read-write.
+	if dec.Action == reconcile.ReleaseLease && strings.Contains(dec.Reason, reconcile.LagGateReason) {
+		a.metr.IncPromotionRefusedLag()
+		if !a.lagRefusedLatch {
+			a.log.Error("refusing automatic promotion: this standby's lag exceeds ha.agent.maximumLagOnFailover; the cluster has no primary until a caught-up node appears, the primary returns, or an operator accepts the loss with pg-ha/accept-failover-lag=<pod> (#273)", "reason", dec.Reason)
+			a.lagRefusedLatch = true
+		}
+	} else if (obs.Local.Running && !obs.Local.InRecovery) || anyReachablePrimaryPeer(obs.Peers) {
+		a.lagRefusedLatch = false
+	}
+	// #273: record where the primary is, so a candidate can measure its lag against it after
+	// this pod is gone (gossip dies with the pod; the marker does not). From tick(), not the
+	// StayPrimary branch: it must keep running while PAUSED -- a pause is observation-only
+	// for everything else, and a 20-minute maintenance window would otherwise leave a
+	// 20-minute-old reference for a failover two seconds after resume -- and it must not
+	// share the branch's fence budget with the routing assertion it could starve. Bounded,
+	// gate-enabled only, and compared against the position observe() just read rather than
+	// a private cache, so a marker that was deleted and recreated is re-populated.
+	//
+	// Not on a tick whose marker read failed with nothing to fall back on: Decide declared
+	// that tick "skip rather than act on defaults", and writing to the marker from a zero
+	// MarkerState would be exactly that. And the whole block shares ONE fence budget: it
+	// sits between this tick's single metr.Beat() and act(), so three separate budgets
+	// against a blackholed apiserver (highwater, position, acceptance clear) would add up
+	// to three reconcile intervals -- the /healthz staleness threshold -- and have the
+	// kubelet kill the serving primary precisely while the apiserver is unreachable
+	// (#298). One budget caps the block at what any single marker write may already cost.
+	if a.cfg.MaxLagOnFailoverBytes > 0 && !obs.MarkerUnreadable && obs.HoldLease && obs.Local.Running && !obs.Local.InRecovery && a.dcs.IsLeader() {
+		gctx, gcancel := context.WithTimeout(ctx, a.fenceBudget())
+		// The highwater first, for the same reason and under the same pause exemption. The
+		// Promote branch advances it, but not on every path (the lease re-check returns
+		// early; the shared fence budget can run out after the slot pass), and the
+		// StayPrimary branch that would otherwise catch up does not run while paused. The
+		// position write below is fenced to the marker's primary and timeline, so a marker
+		// left behind that way would make it refuse for the whole pause -- the exact window
+		// the record exists for. No-op when the marker is current (the common case).
+		a.advanceMarker(gctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		a.recordPrimaryPosition(gctx, obs)
+		// The acceptance is one-shot and belongs to the episode it was set in: whichever
+		// node serves read-write clears it -- the node it named, one tick after promoting,
+		// or a returning primary that made it moot. Left behind, it would silently waive the
+		// bound on a later, unrelated failover. The flip side is documented: it is set in
+		// answer to a refusal, not staged ahead of one, because a still-serving primary
+		// spends it too.
+		if obs.AcceptLagTarget != "" {
+			if cerr := a.kube.ClearAcceptLagTarget(gctx, a.cfg.MarkerName); cerr != nil {
+				a.log.Warn("clear pg-ha/accept-failover-lag now that a primary is serving (#273)", "err", cerr)
+			} else {
+				a.log.Info("cleared pg-ha/accept-failover-lag: a primary is serving, so the acceptance is spent (#273)", "named", obs.AcceptLagTarget, "primary", a.cfg.PodName)
+			}
+		}
+		gcancel()
+	}
 	a.opMu.Lock()
 	err := a.act(ctx, dec, obs)
 	a.opMu.Unlock()
@@ -1076,6 +1137,15 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Timeline:  pg.Timeline(m.Timeline),
 		Primary:   m.Primary,
 	}
+	// #273: the primary's last recorded position, the lag gate's reference. An absent or
+	// unparseable value is flagged so the gate refuses rather than measuring nothing: a
+	// malformed marker field fails closed, as every reader of the marker does (#174).
+	if m.LSN != "" {
+		o.Marker.LSN, o.Marker.LSNOK = pg.ParseLSN(m.LSN)
+		o.Marker.LSNMalformed = !o.Marker.LSNOK
+	}
+	o.MaxLagBytes = a.cfg.MaxLagOnFailoverBytes
+	o.AcceptLagTarget = m.AcceptLagTarget
 	// Cross-check the marker highwater against observed reality (#298 security review).
 	// The marker is a ConfigMap a namespace writer can forge, and unsafeToServe trusts
 	// its timeline: a wildly-high (or unparseable) value trips the guard on every node
@@ -1094,6 +1164,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
+	o.MarkerName = a.cfg.MarkerName
 	// Pause-gated, exactly like LocalStuck below (#298 review). Both are stateful,
 	// time-based signals computed here rather than in the pure Decide, and both feed a
 	// DESTRUCTIVE branch -- LocalStuck a self-health ReleaseLease, StandbyStalled a
@@ -3331,6 +3402,44 @@ func (a *agent) gossipFresh(g k8s.NodeStatus) bool {
 	age := time.Now().Unix() - g.UpdatedAtUnix
 	tol := int64(a.cfg.RenewDeadline.Seconds())
 	return age >= -tol && time.Duration(age)*time.Second <= 4*a.cfg.ReconcileInterval
+}
+
+// recordPrimaryPosition writes this primary's write LSN to the marker for the #273 lag
+// gate. Skipped when the marker already carries this position (as observed this tick), so
+// an idle primary costs nothing and a marker that lost the key is repopulated on the next
+// tick. Best-effort and bounded: a missed write means the reference trails by one more
+// tick, and the gate reads the lag it yields as a floor anyway.
+func (a *agent) recordPrimaryPosition(ctx context.Context, obs reconcile.Observation) {
+	if !obs.Local.LSNOK || !obs.Local.TimelineOK {
+		return
+	}
+	if obs.Marker.Present && obs.Marker.LSNOK && obs.Marker.LSN == obs.Local.LSN {
+		return
+	}
+	// ctx is the caller's fence budget, shared with the other marker writes of this tick.
+	// Fenced to this pod on this timeline (see WriteMarkerLSN): a write that outlives the
+	// lease cannot put a previous-timeline position under a successor's timeline.
+	if err := a.kube.WriteMarkerLSN(ctx, a.cfg.MarkerName, a.cfg.PodName, uint32(obs.Local.Timeline), obs.Local.LSN.String()); err != nil {
+		if errors.Is(err, k8s.ErrMarkerMoved) {
+			// Expected for a tick or two around a promotion while the highwater catches up;
+			// persisting, it means the marker names a primary that is not this serving node.
+			a.log.Warn("position not recorded: the marker does not name this primary on its timeline (#273 lag gate)",
+				"node", a.cfg.PodName, "timeline", uint32(obs.Local.Timeline),
+				"markerPrimary", obs.Marker.Primary, "markerTimeline", obs.Marker.Timeline, "markerPresent", obs.Marker.Present)
+			return
+		}
+		a.log.Warn("record primary position on the marker (#273 lag gate)", "err", err)
+	}
+}
+
+// anyReachablePrimaryPeer reports whether some peer is observed serving read-write.
+func anyReachablePrimaryPeer(peers []reconcile.PeerState) bool {
+	for i := range peers {
+		if peers[i].Reachable && peers[i].Role == pg.RolePrimary {
+			return true
+		}
+	}
+	return false
 }
 
 // advanceMarker records tl as the durable highwater (the #125 marker) when it is

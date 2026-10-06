@@ -350,7 +350,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.0.2-pg18
+    tag: 2.1.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -394,6 +394,10 @@ ha:
     # agent only picks a verifiably-safe same-timeline upstream, falls back to the
     # primary otherwise, and re-homes on failover. See the pg chart for detail.
     cascadingReplication: false
+    # RPO gate on automatic failover (#273), in bytes; 0 disables. A lease-holding standby
+    # further than this behind the primary's last recorded position refuses to promote and
+    # releases the lease (accept the loss: pg-ha/accept-failover-lag=<pod>). See the pg chart values.
+    maximumLagOnFailover: 0
     # Logical failover slot sync (#308), PostgreSQL 17+. Off by default. When true, the
     # primary reconciles synchronized_standby_slots to its current standbys' physical
     # slots so a logical failover slot survives the primary moving. Requires
@@ -1250,4 +1254,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.0.2-pg18
+      tag: 2.1.0-pg18

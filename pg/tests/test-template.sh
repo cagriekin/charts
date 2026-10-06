@@ -202,6 +202,43 @@ casc_bool_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.cascadingReplication=true >/dev/null 2>&1 || casc_bool_rc=$?
 assert_eq "#298: a real boolean cascadingReplication renders" "0" "${casc_bool_rc}"
 
+# #273: the RPO gate. Off by default (no env, so the agent's environment is byte-identical);
+# an integer renders quoted (k8s env values are strings); a string or a negative is refused by
+# the schema -- a quoted value would read as 0 through int64 and silently disable the guard.
+lag_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#273: no MAX_LAG_ON_FAILOVER_BYTES at the default (gate off)" "${lag_default}" "MAX_LAG_ON_FAILOVER_BYTES"
+lag_on=$(helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#273: the knob renders the agent env" "${lag_on}" "name: MAX_LAG_ON_FAILOVER_BYTES"
+assert_contains "#273: ... quoted, as an integer" "${lag_on}" 'value: "1048576"'
+lag_str_rc=0; helm template test-pg "${CHART_DIR}" --set-string ha.agent.maximumLagOnFailover=1MB >/dev/null 2>&1 || lag_str_rc=$?
+assert_gt "#273: a string value is refused by the schema" "${lag_str_rc}" 0
+lag_neg_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=-1 >/dev/null 2>&1 || lag_neg_rc=$?
+assert_gt "#273: a negative value is refused by the schema" "${lag_neg_rc}" 0
+# Past int64 the value wraps negative through int64, the env is omitted and the gate is silently
+# off; past 2^53 it is already rounded by float64. The schema caps it at the exact-integer limit.
+lag_big_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=9007199254740992 >/dev/null 2>&1 || lag_big_rc=$?
+assert_gt "#273: a value above 2^53-1 is refused by the schema" "${lag_big_rc}" 0
+lag_dir=$(mktemp -d)
+printf 'ha:\n  agent:\n    maximumLagOnFailover: 9223372036854775808\n' > "${lag_dir}/lag-overflow.yaml"
+lag_wrap_rc=0; helm template test-pg "${CHART_DIR}" -f "${lag_dir}/lag-overflow.yaml" >/dev/null 2>&1 || lag_wrap_rc=$?
+assert_gt "#273: a value past int64 in a values file is refused rather than wrapping the gate off" "${lag_wrap_rc}" 0
+rm -rf "${lag_dir}"
+lag_rule=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#273: the refused-promotion alert is shipped" "${lag_rule}" "alert: PGHAAgentPromotionRefusedLag"
+assert_contains "#273: ... on the refusal counter" "${lag_rule}" "pg_ha_agent_promotions_refused_lag_total"
+# The knob is read by the agent from image 2.1.0 on; pairing it with an older chart-scheme tag
+# must fail the render (the gate would be silently inactive), a custom tag is not second-guessed,
+# and standalone mode runs no agent so the guard stays out of the way there (nil-safe, #298).
+lag_old_img=$(helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=2.0.2-pg18 2>&1 || true)
+assert_contains "#273: the knob with a pre-2.1.0 chart-scheme image tag fails the render" "${lag_old_img}" "needs the pg-ha image at 2.1.0 or later"
+assert_contains "#273: ... naming the offending tag" "${lag_old_img}" "2.0.2-pg18"
+lag_pin_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 >/dev/null 2>&1 || lag_pin_rc=$?
+assert_eq "#273: the knob renders with the chart's pinned image" "0" "${lag_pin_rc}"
+lag_custom_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=internal-build-42 --set etcd.rbac.bootstrapImage.tag=internal-build-42 >/dev/null 2>&1 || lag_custom_rc=$?
+assert_eq "#273: a custom image tag is not checked" "0" "${lag_custom_rc}"
+lag_sa_rc=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=2.0.2-pg18 >/dev/null 2>&1 || lag_sa_rc=$?
+assert_eq "#273: standalone mode skips the image guard" "0" "${lag_sa_rc}"
+
 # #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
 # value renders as a YAML scalar the API server rejects with an unmarshal error).
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)
@@ -2026,7 +2063,7 @@ assert_contains "agent rbac: lease scoped to <fullname>-leader" "${agent_rbac}" 
 assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${agent_rbac}" "test-pg-primary"
 # marker.go does Get -> Create-if-absent -> Update, so the scoped rule must grant
 # update (not patch) or every marker advance would be Forbidden once wired
-assert_contains "agent rbac: marker configmaps grant get+update (marker.go uses Update)" "${agent_rbac}" '"get", "update"'
+assert_contains "agent rbac: marker configmaps grant get+update+patch (marker.go uses Update; #273 records the position by JSON patch)" "${agent_rbac}" '"get", "update", "patch"'
 assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
 # agent mode records decisions in a structured audit log, not core/v1 Events, so
 # the events:create grant (service-updater only) must be dropped (least privilege)
@@ -6307,7 +6344,7 @@ assert_eq "#291: a valid reconcileInterval renders (guards the loop above)" "0" 
 # next image bump would silently reintroduce the drift.
 etcd_boot_args=(--set etcd.enabled=true --set ha.agent.dcs.backend=etcd)
 etcd_drift=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.tag=2.1.0-pg18 2>&1 || true)
+  --set ha.image.tag=2.1.1-pg18 2>&1 || true)
 assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails the render" \
   "${etcd_drift}" "must match ha.image"
 etcd_lock_rc=0

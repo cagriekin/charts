@@ -483,3 +483,101 @@ func TestWriteMarkerTreatsAnUnparseableTimelineAsNoConstraint(t *testing.T) {
 		t.Errorf("timeline = %d, want 3", m.Timeline)
 	}
 }
+
+// #273: the primary's position rides on the marker beside the highwater, survives a highwater
+// advance, is a no-op on an absent marker, and skips the write when unchanged.
+func TestMarkerLSNRecord(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000120"); err != nil {
+		t.Fatalf("absent marker must be a no-op: %v", err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Present {
+		t.Fatalf("WriteMarkerLSN must not create the marker: %+v", m)
+	}
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000120"); err != nil {
+		t.Fatal(err)
+	}
+	m, err := c.ReadMarker(ctx, "pg-primary")
+	if err != nil || m.LSN != "0/3000120" || m.Timeline != 7 || m.Primary != "pg-1" {
+		t.Fatalf("read back: %+v err=%v", m, err)
+	}
+	// One merge patch, no read-modify-write: it cannot conflict with the control API's
+	// annotation writes or the Promote branch's WriteMarker.
+	before := len(cs.Actions())
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-1", 7, "0/3000200"); err != nil {
+		t.Fatal(err)
+	}
+	verbs := ""
+	for _, a := range cs.Actions()[before:] {
+		verbs += a.GetVerb() + " "
+	}
+	if verbs != "patch " {
+		t.Errorf("WriteMarkerLSN must be exactly one patch, got %q", verbs)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000200" || m.Primary != "pg-1" || m.Timeline != 7 {
+		t.Errorf("patch must touch only lsn: %+v", m)
+	}
+	// A same-timeline rewrite keeps the position; a timeline ADVANCE retires it, because the
+	// gate only ever compares same-timeline positions and a stale one would be compared
+	// against the new timeline the moment it is recorded as current.
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/3000200" {
+		t.Errorf("same-timeline rewrite dropped the position: %+v", m)
+	}
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 8); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "" || m.Timeline != 8 {
+		t.Errorf("position must be dropped on a timeline advance: %+v", m)
+	}
+	// The fence: a write measured under a superseded identity (the old primary, the old
+	// timeline) must not land. The fake tracker surfaces a failed JSON-patch test op as a
+	// plain error where the apiserver answers 422 Invalid; either way the marker is untouched.
+	for _, stale := range []struct {
+		primary string
+		tl      uint32
+	}{{"pg-1", 8}, {"pg-0", 7}} {
+		err := c.WriteMarkerLSN(ctx, "pg-primary", stale.primary, stale.tl, "0/1")
+		m, _ := c.ReadMarker(ctx, "pg-primary")
+		if m.LSN != "" || m.Timeline != 8 || m.Primary != "pg-0" {
+			t.Errorf("stale write (%s, tl %d) must not land (err=%v): %+v", stale.primary, stale.tl, err, m)
+		}
+	}
+	if err := c.WriteMarkerLSN(ctx, "pg-primary", "pg-0", 8, "0/2"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.LSN != "0/2" {
+		t.Errorf("the current identity's write must land: %+v", m)
+	}
+}
+
+// #273: the lag acceptance is read from its own annotation and cleared one-shot.
+func TestMarkerAcceptLagTarget(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: ns, Annotations: map[string]string{AcceptLagAnnotation: " pg-2 ", SwitchoverTargetAnnotation: "pg-1"}},
+		Data:       map[string]string{"primary": "pg-0", "timeline": "5"},
+	})
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	m, err := c.ReadMarker(ctx, "pg-primary")
+	if err != nil || m.AcceptLagTarget != "pg-2" || m.SwitchoverTarget != "pg-1" {
+		t.Fatalf("read: %+v err=%v", m, err)
+	}
+	if err := c.ClearAcceptLagTarget(ctx, "pg-primary"); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = c.ReadMarker(ctx, "pg-primary")
+	if m.AcceptLagTarget != "" || m.SwitchoverTarget != "pg-1" {
+		t.Errorf("clear must drop only the acceptance: %+v", m)
+	}
+	if err := c.ClearAcceptLagTarget(ctx, "absent"); err != nil {
+		t.Errorf("absent marker must be a no-op: %v", err)
+	}
+}

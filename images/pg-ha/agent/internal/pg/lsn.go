@@ -1,6 +1,7 @@
 package pg
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,11 @@ func ParseLSN(s string) (lsn LSN, ok bool) {
 	if err != nil {
 		return LSN{}, false
 	}
+	// Both halves are 32-bit in PostgreSQL (an LSN is a 64-bit byte offset); a wider
+	// segment is not a position, and Uint64 would fold it into one that looks like one.
+	if hi > 0xFFFFFFFF || lo > 0xFFFFFFFF {
+		return LSN{}, false
+	}
 	return LSN{Hi: hi, Lo: lo}, true
 }
 
@@ -34,6 +40,10 @@ func ParseLSN(s string) (lsn LSN, ok bool) {
 // itself stores it in. Used to subtract two positions into a byte distance (replay
 // lag); comparisons should prefer Greater, which needs no arithmetic.
 func (l LSN) Uint64() uint64 { return l.Hi<<32 | l.Lo }
+
+// String renders the LSN in PostgreSQL's own text form ("X/Y", upper-case hex), the form
+// ParseLSN accepts, so a position can round-trip through the marker ConfigMap (#273).
+func (l LSN) String() string { return fmt.Sprintf("%X/%X", l.Hi, l.Lo) }
 
 // Greater reports whether a is a strictly higher LSN than b: the hi segment
 // dominates, then lo. Both compare numerically, never lexicographically (#131) —

@@ -517,7 +517,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.0.2-pg18
+    tag: 2.1.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -562,6 +562,26 @@ ha:
     # falls back to the primary otherwise, and re-homes on failover -- a broken or
     # promoted upstream never strands a standby. Most useful at higher replicaCount.
     cascadingReplication: false
+    # RPO gate on automatic failover (#273; Patroni's maximum_lag_on_failover), in BYTES.
+    # 0 (default) disables it: the election promotes the most-advanced reachable standby
+    # however far behind the lost primary it is, so an asymmetric outage can accept
+    # unbounded data loss. When set, the serving primary records its write position on the
+    # <fullname>-primary marker on every tick it serves (paused or not; one bounded
+    # ConfigMap write; gossip dies with the pod, the marker does not), and a lease-holding
+    # standby that trails that position by more than this many bytes REFUSES to promote and
+    # releases the lease. The cluster then has no primary until a closer standby appears or
+    # the primary returns -- the intended trade (RPO over availability) -- and
+    # PGHAAgentPromotionRefusedLag fires (with ha.agent.monitoring.prometheusRule.enabled and
+    # the agent scraped; paging is your alert routing). An operator accepts the loss explicitly with
+    # `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<pod>`, naming
+    # the refusing node (the most-advanced standby; the refusal prints the command): it
+    # promotes and clears the annotation. Set it in answer to a refusal, not ahead of one:
+    # any node serving read-write clears it, a still-serving primary included. A pending
+    # switchover request is never read as such an acceptance. Barring apiserver errors the
+    # recorded position trails the true one by at most one reconcileInterval, so the
+    # measured lag is a floor on the real loss. Controlled switchovers are unaffected (the
+    # target must be caught up anyway). Patroni's default is 1048576 (1 MiB).
+    maximumLagOnFailover: 0
     # Logical failover slot sync (#308), PostgreSQL 17+. Off by default. When true:
     #   - postgresql-configmap.yaml sets sync_replication_slots = on (the slot-sync
     #     worker; harmless on a primary, needed on a standby that will run one).
@@ -1545,4 +1565,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.0.2-pg18
+      tag: 2.1.0-pg18

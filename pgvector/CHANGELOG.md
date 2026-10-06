@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 2.3.0 - 2026-10-05
+
+### Added
+
+- **RPO gate on automatic failover: `ha.agent.maximumLagOnFailover` (#273).** The election
+  promotes the most-advanced reachable standby; without a bound that standby can still be far
+  behind the lost primary, so an asymmetric outage accepted unbounded data loss. With the gate
+  set (bytes; Patroni's `maximum_lag_on_failover`), the lease holder records its write position
+  on the `<fullname>-primary` marker on every tick it serves (paused or not; dropped on a
+  timeline advance), and a lease-holding standby that trails it by more refuses to promote and
+  releases the lease -- the cluster waits for a closer standby or the returning primary.
+  `pg_ha_agent_promotions_refused_lag_total` counts refusals and `PGHAAgentPromotionRefusedLag`
+  fires on them (with the PrometheusRule enabled and the agent scraped). The explicit acceptance of the loss is a new annotation,
+  `pg-ha/accept-failover-lag=<pod>` on the marker (one-shot; names the refusing, most-advanced
+  standby, which then promotes); a pending `pg-ha/switchover-target` is never read as one. Default `0`
+  (off): no behaviour or marker-traffic change unless set. Ships in the pg-ha image at 2.1.0,
+  which this release pins; setting the knob against an older `ha.image.tag` fails the render.
+  The agent's Role gains `patch` on the one marker ConfigMap (the position is recorded by an
+  RFC 6902 JSON patch fenced to the recorded primary and timeline, the acceptance cleared by a
+  merge patch; neither races an operator's annotation edit); a BYO Role must grant it too.
+  A recorded position that does not parse makes the gate refuse (fail closed), like every
+  other malformed marker field.
+
 ## 2.2.1 - 2026-09-26
 
 ### Fixed

@@ -637,6 +637,7 @@ render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Accept the loss per incident with `pg-ha/accept-failover-lag=<pod>` on the marker. Needs the pg-ha image at 2.1.0 or later (render-enforced). See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
 | `ha.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
 | `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself. The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**, so a stale pin fails loudly instead of being ignored. See [Replication Mechanics](#replication-mechanics-experimental-287) below. | `native` |
 
@@ -758,6 +759,62 @@ If you were already on the default (agent) — which has been the default since 
 from your values if you set it explicitly, since 2.0.0 rejects the key either way.
 
 GitOps/ArgoCD: the Lease, the primary-marker ConfigMap, and the write-Service `.spec.selector` are runtime-owned by the agent — `ignoreDifferences` on the Service selector and do not prune the Lease/marker, or auto-sync will fight the agent. Set `postgresql.existingSecret.enabled=true` (the `lookup`-based password generation returns nil under ArgoCD).
+
+### RPO gate on automatic failover (#273)
+
+The election promotes the most-advanced **reachable** standby. Without a bound, that standby
+can still be far behind the primary it replaces — an asymmetric outage (the primary and its
+best standby lost together, a standby stalled for an hour) then costs whatever WAL the survivor
+never received. `ha.agent.maximumLagOnFailover` is that bound, in bytes (Patroni's
+`maximum_lag_on_failover`; its default is 1 MiB, this chart's is `0`, off).
+
+How it works. While the gate is enabled the lease holder records its write position on the
+`<fullname>-primary` marker ConfigMap on every tick it serves read-write — paused or not, since
+recording is observation, not action (`data.lsn`, one bounded write, skipped when unchanged;
+the marker outlives the pod, unlike the gossip annotation, and the position is dropped when
+the highwater timeline advances so it is never compared across timelines). A standby that
+acquires the lease compares its own position with that record **last**, after every other
+guard (highwater, a more-advanced reachable peer, cold-boot settling): if it is more than the
+limit behind, it refuses to promote and **releases the lease** rather than holding it —
+holding would fence the former primary the moment it came back, which is the one node whose
+data the gate exists to keep. Releasing lets the returning primary reacquire and resume with
+nothing discarded. Until then the cluster has no primary: standbys take turns acquiring and
+releasing, `pg_ha_agent_promotions_refused_lag_total` counts each refusal,
+`PGHAAgentPromotionRefusedLag` fires (when `ha.agent.monitoring.prometheusRule.enabled` is set
+and the agent is scraped), the agent logs one `ERROR` per episode, and
+`GET /v1/cluster` carries the reason.
+
+What it does not do. Barring apiserver errors the recorded position trails the true one by at
+most one `reconcileInterval`, so the measured lag is a floor on the real loss, not a ceiling.
+The marker is a ConfigMap any namespace writer can edit, as #298 already notes for the
+highwater beside it: a writer there can lower or clear the position and so waive the bound,
+exactly as they can set the acceptance annotation or delete the marker, so the gate bounds
+accidents, not an adversary who holds write on the marker. A recorded position that does not
+parse makes the gate refuse (fail closed), like every other malformed marker field, and the
+refusal reason prints what it compared against. It is also not applied to a standby already
+*above* the marker's timeline: a primary that promoted and died before its highwater advance
+landed leaves a position from the previous history, which the gate does not compare across.
+It bounds *automatic*
+promotion only: a controlled switchover is unaffected (its target must be caught up anyway),
+and a *pending* switchover request is never read as acceptance of the loss. An operator
+accepts the loss explicitly with a dedicated annotation naming the node that should promote:
+
+```bash
+kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<standby-pod>
+```
+
+Name the node the refusal names: the most-advanced reachable standby, which is the one
+refusing (its `ERROR` line and `GET /v1/cluster` print the exact command). It promotes on its
+next tick however far behind it is, and the annotation is cleared (one-shot: whichever node
+next serves read-write clears it, so an acceptance left over from an episode the returning
+primary ended cannot waive a later failover's bound). Set it in answer to a refusal, not ahead
+of one: a still-serving primary spends it on its next tick too, so an acceptance staged before
+a planned destructive step is gone by the time the failover happens -- pause the cluster for
+that instead. Naming a further-behind node is ignored,
+and the refusal says which node to name instead: letting it jump the most-advanced ranking
+would discard even more WAL than the gate refused.
+`kubectl annotate ... pg-ha/accept-failover-lag-` withdraws it. Lowering the value to `0` with
+`helm upgrade` is the other way out; it rolls the pods.
 
 ### Maintenance mode (pause)
 
