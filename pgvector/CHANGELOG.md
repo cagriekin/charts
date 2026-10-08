@@ -35,6 +35,17 @@
   newline from an `echo`-written Secret no longer breaks PCP auth); a newline inside it fails
   the init container with the fix named.
 
+### Changed
+
+- **Every `resources` block is validated by `values.schema.json` (#271).** The 13 blocks the
+  templates read are declared through one shared definition: `requests`/`limits` only (a typo'd
+  `reqests:` is rejected instead of rendering a silently resource-less container), a scalar fails
+  the render naming the path instead of reaching the API server, and quantities stay string or
+  number with the key set open, so `cpu: 1`, `cpu: "100m"`, `memory: 1Gi` and extended resources
+  (`nvidia.com/gpu`, `hugepages-2Mi`) all render as before. No default or template changed.
+
+
+
 ## 2.3.0 - 2026-10-05
 
 ### Added

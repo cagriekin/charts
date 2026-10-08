@@ -3,7 +3,24 @@
   "title": "etcd chart values (enum guards)",
   "description": "Partial schema: constrains the values whose typos silently misconfigure the bundled etcd. additionalProperties stays open so the rest of values.yaml is unconstrained.",
   "type": "object",
+  "definitions": {
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Kubernetes ResourceRequirements as the charts pass it through: requests and limits only (#271). Closed on purpose -- a typo'd reqests:/limts: used to render a silently resource-less container, and a scalar here (easy with --set or a templated values file) an invalid container spec that only the API server rejected, after the release was already going out. Any further ResourceRequirements field (claims) has to be added here deliberately.",
+      "properties": {
+        "requests": { "$ref": "#/definitions/resourceList" },
+        "limits": { "$ref": "#/definitions/resourceList" }
+      }
+    },
+    "resourceList": {
+      "type": "object",
+      "description": "A resource quantity map. Values are string or number: both quantity spellings (cpu: 1, cpu: \"100m\", memory: 1Gi) must keep working, and the key set stays open so extended resources (nvidia.com/gpu, hugepages-2Mi) are not rejected.",
+      "additionalProperties": { "type": ["string", "number"] }
+    }
+  },
   "properties": {
+    "resources": { "$ref": "#/definitions/resources" },
     "image": {
       "type": "object",
       "properties": {
@@ -28,6 +45,7 @@
     "rbac": {
       "type": "object",
       "properties": {
+        "resources": { "$ref": "#/definitions/resources" },
         "enabled": { "type": "boolean" },
         "bootstrapImage": {
           "type": "object",

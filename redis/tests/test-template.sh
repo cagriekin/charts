@@ -229,5 +229,21 @@ acl_byo=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" \
 assert_eq "acl: existingSecret without per-user passwordSecret.name fails" "1" "${byo_rc}"
 assert_contains "acl: BYO-secret guard names the cause" "${acl_byo}" "must set passwordSecret.name"
 
+# #271: resources blocks are validated through one shared schema definition (a scalar or a
+# typo'd key used to reach the API server, or render a silently resource-less container).
+# Two wordings: Helm 4 (local) says "at '/a/b': got string, want object"; Helm 3.14 (CI) says
+# "a.b: Invalid type. Expected: object, given: string". Each needle accepts both (BRE alternation).
+for res_path in redis.resources redis.bootstrap.resources sentinel.resources exporter.resources; do
+  res_out=$(helm template r "${CHART_DIR}" --set-string "${res_path}=oops" 2>&1) && res_rc=0 || res_rc=$?
+  assert_eq "#271: a scalar ${res_path} fails" "1" "${res_rc}"
+  assert_contains "#271: ... naming the path" "${res_out}" "at '/${res_path//./\/}': got string, want object\|${res_path}: Invalid type. Expected: object, given: string"
+done
+res_bool=$(helm template r "${CHART_DIR}" --set redis.resources.requests.cpu=true 2>&1) || true
+assert_contains "#271: a boolean quantity fails, naming the leaf" "${res_bool}" "at '/redis/resources/requests/cpu': got boolean, want number or string\|redis.resources.requests.cpu: Invalid type. Expected: \[string,number\], given: boolean"
+res_typo=$(helm template r "${CHART_DIR}" --set redis.resources.limts.cpu=1 2>&1) || true
+assert_contains "#271: a typo'd limts: is rejected" "${res_typo}" "additional properties 'limts' not allowed\|Additional property limts is not allowed"
+helm template r "${CHART_DIR}" --set redis.resources.requests.cpu=1 --set-string redis.resources.limits.cpu=100m --set redis.resources.limits.memory=1Gi >/dev/null 2>&1 && res_ok_rc=0 || res_ok_rc=$?
+assert_eq "#271: numeric and string quantities both render" "0" "${res_ok_rc}"
+
 end_suite
 print_summary

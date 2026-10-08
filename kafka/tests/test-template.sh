@@ -155,5 +155,21 @@ qodd=$(helm template test-kafka "${CHART_DIR}" \
   --set kafka.controller.replicaCount=1 2>&1) && qodd_rc=0 || qodd_rc=$?
 assert_eq "guard: template succeeds with odd controller replicaCount" "0" "${qodd_rc}"
 
+# #271: resources blocks are validated through one shared schema definition (a scalar or a
+# typo'd key used to reach the API server, or render a silently resource-less container).
+# Two wordings: Helm 4 (local) says "at '/a/b': got string, want object"; Helm 3.14 (CI) says
+# "a.b: Invalid type. Expected: object, given: string". Each needle accepts both (BRE alternation).
+for res_path in kafka.controller.resources kafka.broker.resources exporters.kafka.resources; do
+  res_out=$(helm template test-kafka "${CHART_DIR}" --set-string "${res_path}=oops" 2>&1) && res_rc=0 || res_rc=$?
+  assert_eq "#271: a scalar ${res_path} fails" "1" "${res_rc}"
+  assert_contains "#271: ... naming the path" "${res_out}" "at '/${res_path//./\/}': got string, want object\|${res_path}: Invalid type. Expected: object, given: string"
+done
+res_bool=$(helm template test-kafka "${CHART_DIR}" --set kafka.broker.resources.limits.memory=true 2>&1) || true
+assert_contains "#271: a boolean quantity fails, naming the leaf" "${res_bool}" "at '/kafka/broker/resources/limits/memory': got boolean, want number or string\|kafka.broker.resources.limits.memory: Invalid type. Expected: \[string,number\], given: boolean"
+res_typo=$(helm template test-kafka "${CHART_DIR}" --set kafka.broker.resources.reqests.cpu=1 2>&1) || true
+assert_contains "#271: a typo'd reqests: is rejected" "${res_typo}" "additional properties 'reqests' not allowed\|Additional property reqests is not allowed"
+helm template test-kafka "${CHART_DIR}" --set kafka.broker.resources.requests.cpu=1 --set-string kafka.broker.resources.limits.cpu=100m --set kafka.broker.resources.limits.memory=1Gi >/dev/null 2>&1 && res_ok_rc=0 || res_ok_rc=$?
+assert_eq "#271: numeric and string quantities both render" "0" "${res_ok_rc}"
+
 end_suite
 print_summary

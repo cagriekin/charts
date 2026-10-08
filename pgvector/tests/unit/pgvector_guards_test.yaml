@@ -262,3 +262,41 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'needs the pg-ha image at 2.1.0 or later'
+
+  # --- #271: resources blocks are validated through the shared schema definition ---
+  # A scalar or a typo'd key used to pass helm and fail only at the API server (or render a
+  # silently resource-less container). The error names the path.
+  - it: a scalar resources block fails schema validation (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.resources: oops
+    asserts:
+      - failedTemplate:
+          errorPattern: "(at '/postgresql/resources': got string, want object|postgresql.resources: Invalid type\\. Expected: object, given: string)"
+  - it: a typo'd reqests key is rejected (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.resources.reqests.cpu: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "(additional properties 'reqests' not allowed|Additional property reqests is not allowed)"
+  - it: a nested resources block the schema had never declared is validated (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.resources: oops
+    asserts:
+      - failedTemplate:
+          errorPattern: "(at '/pgpool/metrics/resources': got string, want object|pgpool.metrics.resources: Invalid type\\. Expected: object, given: string)"
+  - it: numeric and string quantities both render (#271)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.resources.requests.cpu: 1
+      postgresql.resources.limits.cpu: 100m
+      postgresql.resources.limits.memory: 1Gi
+    asserts:
+      - notFailedTemplate: {}
