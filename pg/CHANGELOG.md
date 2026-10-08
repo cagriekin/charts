@@ -1,5 +1,14 @@
 # pg chart changelog
 
+## 2.4.1 - 2026-10-08
+
+### Changed
+
+- **Vendored etcd subchart 0.1.15 (#271 follow-up).** No behaviour change: etcd 0.1.14's
+  `values.schema.json` was changed in place (it now validates `etcd.resources` and
+  `etcd.rbac.resources` like every other chart), and a subchart whose content moves must move
+  its version, so the vendored package is `etcd-0.1.15.tgz` and `dependencies[].version` says so.
+
 ## 2.4.0 - 2026-10-08
 
 ### Fixed
