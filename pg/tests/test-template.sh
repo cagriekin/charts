@@ -2076,6 +2076,20 @@ assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${age
 agent_pgpool=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent-pgpool.yaml" \
   --show-only templates/pgpool-configmap.yaml 2>&1)
 assert_contains "agent pgpool: backend0 RW Service ALWAYS_PRIMARY" "${agent_pgpool}" "backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'"
+# #361: the RO backend is detachable so an unreachable standby cannot stall every session (and,
+# through the probes, restart the proxy); the RW backend stays the agent's to move.
+assert_contains "#361: agent pgpool: RO backend is detachable" "${agent_pgpool}" "backend_flag1 = 'ALLOW_TO_FAILOVER'"
+assert_not_contains "#361: ... and no longer DISALLOW_TO_FAILOVER" "${agent_pgpool}" "backend_flag1 = 'DISALLOW_TO_FAILOVER'"
+pgpool_dep_361=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_eq "#361: the re-attach loop runs beside pgpool (pcp_attach_node once)" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pcp_attach_node -h 127.0.0.1')"
+assert_eq "#361: both probes pin SELECT 1 to the primary" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'NO LOAD BALANCE\*/ SELECT 1')"
+pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpool_dep_361_off}" "pcp_attach_node"
+assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"
+pgpool_361_bad_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.interval=0 >/dev/null 2>&1 || pgpool_361_bad_rc=$?
+assert_gt "#361: a zero re-attach interval is refused by the schema" "${pgpool_361_bad_rc}" 0
+pgpool_361_str_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set-string pgpool.healthCheck.maxRetries=many >/dev/null 2>&1 || pgpool_361_str_rc=$?
+assert_gt "#361: a non-integer health-check knob is refused by the schema" "${pgpool_361_str_rc}" 0
 assert_contains "agent pgpool: backend1 is the RO Service" "${agent_pgpool}" "test-pg-readonly"
 assert_contains "agent pgpool: failover disabled" "${agent_pgpool}" "failover_command = ''"
 assert_contains "agent pgpool: fail_over_on_backend_error off" "${agent_pgpool}" "fail_over_on_backend_error = off"

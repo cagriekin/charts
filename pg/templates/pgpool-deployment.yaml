@@ -102,6 +102,14 @@ spec:
               # Hashing here from the admin Secret keeps the credential out of
               # the ConfigMap. busybox md5sum of the raw password matches pg_md5.
               printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_ADMIN_PASSWORD" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # .pcppass for the re-attach loop in the pgpool container (#361): the pcp_*
+              # tools read it through PCPPASSFILE, 0600 like libpq's pgpass. It lives in
+              # the emptyDir beside pcp.conf, so the PCP password never enters the pgpool
+              # container's environment. Same escaping as pgpass: \ -> \\, : -> \:
+              PCP_PASS_ESC=$(printf '%s' "$PCP_ADMIN_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              PCP_USER_ESC=$(printf '%s' "$PCP_ADMIN_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              printf '127.0.0.1:9898:%s:%s\n' "$PCP_USER_ESC" "$PCP_PASS_ESC" > /usr/local/etc/.pcppass
+              chmod 0600 /usr/local/etc/.pcppass
               # Byte-safe placeholder splice: sed replacement corrupts
               # values containing / & or \, and awk -v assignments eat
               # backslashes, so values travel via ENVIRON.
@@ -216,6 +224,38 @@ spec:
               # signal worth logging); `|| true` keeps a no-op reap non-fatal so a
               # healthy first boot with nothing to remove still starts pgpool.
               ipcrm -a || true
+{{- if .Values.pgpool.reattach.enabled }}
+              # Re-attach loop (#361). The RO backend is detachable (see pgpool.conf), and
+              # pgpool never health-checks a detached node, so something has to bring it
+              # back when the standby returns. pgpool's auto_failback cannot: it matches
+              # backend_application_name against pg_stat_replication and the agent names
+              # standbys by pod, which the -readonly Service backend can never equal. So:
+              # every interval, for each backend pgpool reports "down", if it answers
+              # pg_isready again, pcp_attach_node. Covers the standalone single backend
+              # too, where the only route back used to be a liveness restart (#122).
+              # A background sibling of pgpool, not a sidecar: it needs pgpool's own PCP
+              # port, credentials and tools, and nothing else. It stays alive for the
+              # pod's life, so pgpool (PID 1 after the exec) never has to reap it.
+              (
+                PCPPASSFILE=/usr/local/etc/.pcppass; export PCPPASSFILE
+                PCP_USER=$(cut -d: -f1 /usr/local/etc/pcp.conf)
+                sleep 15
+                while :; do
+                  n=$(pcp_node_count -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>/dev/null) || n=0
+                  i=0
+                  while [ "$i" -lt "${n:-0}" ]; do
+                    # pcp_node_info: hostname port status weight status_name ...
+                    set -- $(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$i" 2>/dev/null)
+                    if [ "${5:-}" = "down" ] && pg_isready -h "$1" -p "$2" -t 3 >/dev/null 2>&1; then
+                      echo "[reattach] backend $i ($1:$2) answers again; re-attaching (#361)"
+                      pcp_attach_node -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$i" >/dev/null 2>&1 || echo "[reattach] pcp_attach_node $i failed; retrying next interval"
+                    fi
+                    i=$((i + 1))
+                  done
+                  sleep {{ int .Values.pgpool.reattach.interval }}
+                done
+              ) &
+{{- end }}
               exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf
           {{- end }}
           ports:
@@ -258,12 +298,15 @@ spec:
           # on the frontend; the backend side authenticates via pool_passwd.
           # A failing liveness restarts pgpool with a fresh status file,
           # which re-runs backend discovery and reattaches recovered nodes.
+          # /*NO LOAD BALANCE*/ pins the probe to the primary (#361): the
+          # proxy is healthy when the write path works, and a read backend
+          # that is detached or lagging must not make it unready or restart it.
           livenessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
@@ -273,7 +316,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

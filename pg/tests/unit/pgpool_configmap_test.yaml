@@ -43,3 +43,34 @@ tests:
       - notMatchRegex:
           path: data["pgpool.conf"]
           pattern: backend_hostname[0-9]+ = '[^']*-readonly
+
+  # --- #361: the RO backend is detachable, the RW backend never is ---
+  # A session connects to every attached backend first; an unreachable RO Service used to stall
+  # every session and, through the probes, restart PgPool. Detaching ends the stall.
+  - it: agent mode keeps the RW backend non-detachable and lets the RO backend detach (#361)
+    set:
+      pgpool.enabled: true
+      postgresql.replicaCount: 1
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag0 = 'ALWAYS_PRIMARY\|DISALLOW_TO_FAILOVER'
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag1 = 'ALLOW_TO_FAILOVER'
+      - notMatchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag1 = 'DISALLOW_TO_FAILOVER'
+  - it: health-check defaults detach an unreachable RO backend in well under a minute (#361)
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_timeout = 10\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_max_retries = 3\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_retry_delay = 2\n

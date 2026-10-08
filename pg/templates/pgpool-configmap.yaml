@@ -23,9 +23,25 @@ data:
     # agent mode: pgpool fronts the RW (<fullname>) and RO (<fullname>-readonly)
     # Services for single-endpoint read/write split. The agent owns failover, so
     # pgpool never changes roles -- writes pin to the ALWAYS_PRIMARY backend, reads
-    # balance to the RO backend (primary weight 0). DISALLOW_TO_FAILOVER on both +
-    # failover_command='' keep pgpool a stateless router; health checks stay ON so
-    # it recycles connections when the RW Service endpoint moves after a failover.
+    # balance to the RO backend (primary weight 0). failover_command='' keeps pgpool
+    # a stateless router; health checks stay ON so it recycles connections when the
+    # RW Service endpoint moves after a failover.
+    #
+    # The RW backend is DISALLOW_TO_FAILOVER: the agent decides who is primary, pgpool
+    # never detaches it. The RO backend is NOT (#361): every new session opens a
+    # connection to every attached backend first, so an RO Service with no ready
+    # endpoint -- the only standby unready, or a Parallel rollout -- made every
+    # session wait on that connect. On a CNI that rejects, pgpool skipped the backend
+    # after a short stall; on one that drops (observed on CCE), the stall outlived the
+    # probes' budget, the liveness SELECT failed six times and the kubelet restarted
+    # pgpool in a loop -- writes down for 75 minutes with a healthy primary. Letting
+    # pgpool DETACH the RO backend ends the stall -- at the first session that cannot
+    # reach it, or after pgpool.healthCheck.maxRetries failed checks when no session
+    # tries -- so reads fall through to the primary and the proxy stays up. Detaching is pgpool-internal state, not a role
+    # change, so the agent still owns failover. Re-attach is the re-attach loop in the
+    # pgpool container (pgpool.reattach): pgpool's own auto_failback matches
+    # backend_application_name against pg_stat_replication, and the agent names
+    # standbys by pod, which a Service backend cannot match.
     backend_hostname0 = '{{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
 {{- if gt (int .Values.postgresql.replicaCount) 0 }}
@@ -45,7 +61,7 @@ data:
     backend_hostname1 = '{{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port1 = 5432
     backend_weight1 = 1
-    backend_flag1 = 'DISALLOW_TO_FAILOVER'
+    backend_flag1 = 'ALLOW_TO_FAILOVER'
     backend_application_name1 = 'readonly'
 {{- end }}
 {{- /* There is no HA arm between these two any more (#298 review). One rendered a

@@ -900,11 +900,28 @@ pgpool:
     interval: 3
     count: 5
 
+  # Backend health check. Since #361 the RO backend is detachable: a session that cannot
+  # reach it detaches it at once, and when no session tries these numbers bound how long
+  # the check takes to do the same, worst case about maxRetries x (timeout + retryDelay)
+  # after the first failed check, i.e. ~36s at these defaults (the previous
+  # 10 x (30 + 3) was over five minutes). The RW backend is
+  # never detached whatever these say (DISALLOW_TO_FAILOVER); a failed check there only
+  # recycles cached connections, which is what makes failover transparent.
   healthCheck:
     period: 10
-    timeout: 30
-    maxRetries: 10
-    retryDelay: 3
+    timeout: 10
+    maxRetries: 3
+    retryDelay: 2
+
+  # Re-attach loop (#361). pgpool never health-checks a backend it has detached, and its
+  # own auto_failback cannot see a Service backend (it matches backend_application_name
+  # against pg_stat_replication, where the agent names standbys by pod). So the pgpool
+  # container runs a sibling loop: every `interval` seconds, each backend pgpool reports
+  # down is probed with pg_isready and, once it answers, re-attached with pcp_attach_node.
+  # Disable only if you re-attach by hand (pcp_attach_node) or by your own tooling.
+  reattach:
+    enabled: true
+    interval: 10
 
   podSecurityContext:
     runAsNonRoot: true

@@ -643,7 +643,7 @@ render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod` — **enforced at render time** since 2.0.0 (#291): client-go requires it and the agent refuses to start otherwise, so a violating triple used to render cleanly and then CrashLoopBackOff every pod at once. The realistic way to produce one is mixing the `repmgr.agent.*` alias with `ha.agent.*` across two values files — these three keys are cross-validated, so taking one from a legacy file and two from a newer `-f` yields a combination neither file contains. Set all three under the same name. A value that is not a Go duration (`15`, `20 s`) is rejected too, and the `etcd` DCS backend additionally requires `leaseDuration >= 5s` — its lease TTL is whole seconds. Units are case-sensitive (`15S` is an error), an empty value is rejected, and `reconcileInterval` is checked the same way even though it is not part of the ordering. Values Go accepts are accepted: `.5s`, `5.s`, `+15s`, `1m30s`, `2h45m`, `15µs`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
-The agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself. With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
+The agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself. The RW backend is never detached (the agent decides who is primary); the RO backend **is** detachable (#361): every new PgPool session first connects to every attached backend, so an RO Service with no ready endpoint, which is what one unready standby or a `Parallel` rollout produces, stalled every session on that connect. Where the CNI drops instead of rejecting, the stall outlived the probes and the kubelet restarted PgPool in a loop, taking writes down with a healthy primary. After `pgpool.healthCheck.maxRetries` failed checks (~36 s at the defaults) PgPool now detaches the RO backend and reads fall through to the primary; a re-attach loop in the pgpool container (`pgpool.reattach`) brings it back with `pcp_attach_node` once the Service answers `pg_isready` again. With `postgresql.replicaCount: 1` there is exactly one standby, so expect reads to fall through to the primary whenever it restarts. With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
 
 ### Replication Mechanics (EXPERIMENTAL, #287)
 
@@ -1592,9 +1592,11 @@ in its status.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `pgpool.healthCheck.period` | Health check interval in seconds | `10` |
-| `pgpool.healthCheck.timeout` | Health check timeout in seconds | `30` |
-| `pgpool.healthCheck.maxRetries` | Max retries before marking backend down | `10` |
-| `pgpool.healthCheck.retryDelay` | Seconds between retries | `3` |
+| `pgpool.healthCheck.timeout` | Health check timeout in seconds | `10` |
+| `pgpool.healthCheck.maxRetries` | Failed checks before PgPool detaches the RO backend (the RW backend is never detached). Detach latency is about `maxRetries x (timeout + retryDelay)` (#361) | `3` |
+| `pgpool.healthCheck.retryDelay` | Seconds between retries | `2` |
+| `pgpool.reattach.enabled` | Run the re-attach loop in the pgpool container: a backend PgPool reports `down` is re-attached with `pcp_attach_node` once it answers `pg_isready` (#361). PgPool's own `auto_failback` cannot see a Service backend | `true` |
+| `pgpool.reattach.interval` | Seconds between re-attach passes | `10` |
 
 #### PGPool-II Metrics Exporter
 
@@ -3216,7 +3218,7 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 i
 
 | Column | Meaning |
 |--------|---------|
-| `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. |
+| `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. Only the RO backend can reach `down` in agent mode; the re-attach loop brings it back once the `-readonly` Service answers again (#361). |
 | `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with the Lease holder, restart PGPool-II. |
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |

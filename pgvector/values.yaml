@@ -663,11 +663,18 @@ pgpool:
     interval: 3
     count: 5
 
+  # Detach latency for an unreachable RO backend is ~maxRetries x (timeout + retryDelay)
+  # (#361); the RW backend is never detached. Full reasoning in the pg chart.
   healthCheck:
     period: 10
-    timeout: 30
-    maxRetries: 10
-    retryDelay: 3
+    timeout: 10
+    maxRetries: 3
+    retryDelay: 2
+
+  # Re-attaches a detached backend once pg_isready answers again (#361).
+  reattach:
+    enabled: true
+    interval: 10
 
   podSecurityContext:
     runAsNonRoot: true

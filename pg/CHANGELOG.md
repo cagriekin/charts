@@ -1,5 +1,24 @@
 # pg chart changelog
 
+## Unreleased
+
+### Fixed
+
+- **PgPool no longer goes down with the only standby (#361).** The RO backend
+  (`<fullname>-readonly`) is now detachable: every new PgPool session first connects to every
+  attached backend, so an RO Service with no ready endpoint (one unready standby, a `Parallel`
+  rollout) stalled every session on that connect, and on a CNI that drops rather than rejects
+  the stall outlived the probes and the kubelet restarted PgPool in a loop -- writes down for
+  75 minutes with a healthy primary. PgPool now detaches the backend (at the first session that
+  cannot reach it, or after `pgpool.healthCheck.maxRetries` failed checks) and reads fall through
+  to the primary; a re-attach loop in the pgpool
+  container (`pgpool.reattach`, on by default) brings it back with `pcp_attach_node` once the
+  Service answers `pg_isready`, because PgPool's `auto_failback` matches
+  `backend_application_name` and the agent names standbys by pod. The RW backend keeps
+  `DISALLOW_TO_FAILOVER`; the agent still owns failover. Health-check defaults shrink to
+  `timeout: 10`, `maxRetries: 3`, `retryDelay: 2` (detach in ~36 s instead of ~5.5 min); the
+  probes pin their `SELECT 1` to the primary. **The pgpool pods roll once.**
+
 ## 2.3.0 - 2026-10-05
 
 ### Added

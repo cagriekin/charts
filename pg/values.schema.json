@@ -416,6 +416,43 @@
               "description": "libpq sslmode for pgpool -> postgres backend connections. Must be >= require when postgresql.tls.require is true."
             }
           }
+        },
+        "healthCheck": {
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Seconds between backend health checks; 0 disables them."
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxRetries": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Failed checks before pgpool detaches a detachable backend (the RO one, #361); the RW backend is never detached."
+            },
+            "retryDelay": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "reattach": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Run the re-attach loop in the pgpool container (#361): a backend pgpool reports down is re-attached with pcp_attach_node once pg_isready answers."
+            },
+            "interval": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Seconds between re-attach passes."
+            }
+          }
         }
       }
     },
