@@ -1808,6 +1808,16 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
+{{- define "pg.validatePgpoolReattach" -}}
+{{- /* The re-attach loop (#361) is part of the chart's default pgpool command, so a custom
+       pgpool.command silently drops the only thing that re-attaches a detached read backend
+       while pgpool.reattach.enabled still reads true. Refuse the pairing: an inert safety
+       feature is the class of misconfiguration the chart fails at render time on. */ -}}
+{{- if and .Values.pgpool.enabled ((.Values.pgpool.reattach).enabled) .Values.pgpool.command -}}
+{{- fail "pgpool.reattach.enabled=true but pgpool.command is set: the re-attach loop (#361) lives in the chart's default pgpool command, so a custom command drops it and a detached read backend would never come back. Either copy the loop from the chart's default command into yours, or set pgpool.reattach.enabled=false." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.validateRemovedBackupMc" -}}
 {{- /* backup.mc.* was the MinIO client image for the pg_dump backup Jobs. MinIO withdrew
        its images from Docker Hub and quay.io and took dl.min.io down, so no value under this

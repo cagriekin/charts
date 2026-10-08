@@ -28,10 +28,13 @@ tests:
           pattern: 'ipcrm -a \|\| true[\s\S]*exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf'
 
   # --- override: pgpool.command replaces the default verbatim ---
+  # reattach.enabled=false alongside: the re-attach loop (#361) lives in the default
+  # command, so a custom command with it still enabled is refused at render time (below).
   - it: pgpool.command overrides the default startup command
     template: templates/pgpool-deployment.yaml
     set:
       pgpool.enabled: true
+      pgpool.reattach.enabled: false
       pgpool.command:
         - /custom/entrypoint.sh
         - --flag
@@ -41,3 +44,71 @@ tests:
           value:
             - /custom/entrypoint.sh
             - --flag
+
+  # --- #361: re-attach loop and primary-pinned probes ---
+  - it: the default command runs the re-attach loop beside pgpool (#361)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: pcp_attach_node -h 127.0.0.1 -p 9898
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: pg_isready -h "\$host" -p "\$port" -t 3
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: pcp_node_info -h 127.0.0.1 -p 9898 -U "\$PCP_USER" -w 2>&1
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: sleep 10\n
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: exec pgpool -D -n
+  - it: pgpool.reattach.enabled=false drops the loop and keeps the exec (#361)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.reattach.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: pcp_attach_node
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: exec pgpool -D -n
+  - it: the init container writes a 0600 .pcppass for the loop (#361)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: /usr/local/etc/\.pcppass\n\s*chmod 0600 /usr/local/etc/\.pcppass
+      # pcp.conf and .pcppass must hash/carry the SAME normalised password, or a trailing
+      # newline in the Secret breaks the loop's PCP auth silently; an embedded one is refused.
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: PCP_PASS=\$\(printf '%s' "\$PCP_ADMIN_PASSWORD"\)[\s\S]*contains a newline[\s\S]*printf '%s' "\$PCP_PASS" \| md5sum[\s\S]*PCP_PASS_ESC=\$\(printf '%s' "\$PCP_PASS"
+  - it: both probes pin SELECT 1 to the primary (#361)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+      - matchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+  # The loop lives in the default command; a custom command with it still enabled would
+  # silently drop the only thing that re-attaches a read backend, so the render refuses.
+  - it: pgpool.command with pgpool.reattach.enabled fails fast (#361)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.command: ["/bin/sh", "-c", "exec pgpool -n"]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool.reattach.enabled=true but pgpool.command is set'

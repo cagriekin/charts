@@ -43,3 +43,50 @@ tests:
       - notMatchRegex:
           path: data["pgpool.conf"]
           pattern: backend_hostname[0-9]+ = '[^']*-readonly
+
+  # --- #361: the RO backend is detachable, the RW backend never is ---
+  # A session connects to every attached backend first; an unreachable RO Service used to stall
+  # every session and, through the probes, restart PgPool. Detaching ends the stall.
+  - it: agent mode keeps the RW backend non-detachable and lets the RO backend detach (#361)
+    set:
+      pgpool.enabled: true
+      postgresql.replicaCount: 1
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag0 = 'ALWAYS_PRIMARY\|DISALLOW_TO_FAILOVER'
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag1 = 'ALLOW_TO_FAILOVER'
+      - notMatchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag1 = 'DISALLOW_TO_FAILOVER'
+  # Only the health check detaches; worst case period + timeout + maxRetries x (timeout +
+  # retryDelay) = 5 + 5 + 2 x 6 = 22s, inside the 60s liveness budget that used to be blown.
+  - it: health-check defaults detach an unreachable RO backend inside the liveness budget (#361)
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_period = 5\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_timeout = 5\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_max_retries = 2\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_retry_delay = 1\n
+  # The tighter defaults must not start detaching the standalone primary: with a single
+  # backend a detach only delays recovery (nothing re-probes a down node but the loop).
+  - it: the standalone primary is never detached either (#361)
+    set:
+      pgpool.enabled: true
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag0 = 'ALWAYS_PRIMARY\|DISALLOW_TO_FAILOVER'

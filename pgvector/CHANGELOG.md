@@ -1,5 +1,40 @@
 # pgvector chart changelog
 
+## 2.4.0 - 2026-10-08
+
+### Fixed
+
+- **PgPool no longer goes down with the only standby (#361).** The RO backend
+  (`<fullname>-readonly`) is now detachable: every new PgPool session first connects to every
+  attached backend, so an RO Service with no ready endpoint (one unready standby, a `Parallel`
+  rollout) stalled every session on that connect, and on a CNI that drops rather than rejects
+  the stall outlived the probes and the kubelet restarted PgPool in a loop -- writes down for
+  75 minutes with a healthy primary. The health check now detaches the backend (a session's own
+  connect failure does not; pgpool only marks the node down for that child) and reads fall
+  through to the primary. Health-check defaults shrink to `period: 5`, `timeout: 5`,
+  `maxRetries: 2`, `retryDelay: 1`: detach in ~22 s worst case instead of ~5.5 min, inside the
+  60 s liveness budget. The detach kills the children holding a connection to that backend, so
+  in-flight sessions see one `server closed the connection unexpectedly` and reconnect -- the
+  trade for not stalling every session until the standby returns. The RW backend keeps
+  `DISALLOW_TO_FAILOVER`, and the standalone primary gains it (detaching the only primary never
+  helped; now the first session after its restart simply works). The probes pin their
+  `SELECT 1` to the primary. **The pgpool pods roll once.**
+
+### Added
+
+- **`pgpool.reattach` (#361).** PgPool never health-checks a backend it has detached, and its
+  `auto_failback` matches `backend_application_name` against `pg_stat_replication`, where the
+  agent names standbys by pod, so a Service backend never comes back on its own. The pgpool
+  container runs a sibling loop (every `pgpool.reattach.interval` seconds, default 10) that
+  re-attaches with `pcp_attach_node` any backend reported `down` once it answers `pg_isready`,
+  using a 0600 `.pcppass` the init container writes beside `pcp.conf`. It is part of the default
+  `pgpool.command`; setting `pgpool.command` with it enabled fails the render. PCP failures are
+  logged once per episode rather than swallowed. It re-attaches a node detached by hand with
+  `pcp_detach_node` too (membership is the agent's; disable the loop for PgPool-level manual
+  control). The admin password is normalised once for `pcp.conf` and `.pcppass` (a trailing
+  newline from an `echo`-written Secret no longer breaks PCP auth); a newline inside it fails
+  the init container with the fix named.
+
 ## 2.3.0 - 2026-10-05
 
 ### Added

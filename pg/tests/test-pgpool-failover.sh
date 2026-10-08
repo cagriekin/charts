@@ -107,5 +107,51 @@ else
   skip "#32: PGPool has a healthy backend after failover (failover did not complete)"
 fi
 
+# --- #361: losing the only standby must not take PGPool (and writes) down ---
+# Every new PGPool session connects to every attached backend first, so an RO Service with no
+# ready endpoint used to stall every session; on a CNI that drops instead of rejecting, the
+# stall outlived the probes and the kubelet restarted PGPool in a loop with a healthy primary.
+# The RO backend is now detachable: PGPool must mark it down, keep serving writes without a
+# restart, and the re-attach loop must bring it back once the Service answers again. KinD's
+# kube-proxy REJECTS an endpointless Service, so this exercises the detach/re-attach path, not
+# the drop-induced stall (which the health-check and probe budgets cover at render time).
+echo "  #361: waiting for the former primary to rejoin so the -readonly Service has an endpoint..."
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
+ro_ready=false; s=0
+while [[ ${s} -lt 240 ]]; do
+  ro_eps=$(kubectl get endpointslices -n "${NAMESPACE}" -l "kubernetes.io/service-name=${FULLNAME}-readonly" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{" "}{end}' 2>/dev/null || true)
+  nodes_pre=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
+  if [[ "${ro_eps}" == *true* ]] && printf '%s\n' "${nodes_pre}" | grep -q -- "-readonly.*|up|"; then ro_ready=true; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#361: precondition -- the RO backend is attached and the -readonly Service has a ready endpoint" "true" "${ro_ready}"
+PGPOOL_POD=$(kubectl get pod -n "${NAMESPACE}" -l app.kubernetes.io/component=pgpool -o jsonpath='{.items[0].metadata.name}')
+restarts_before=$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].restartCount}')
+echo "  #361: emptying the -readonly Service (what one unready standby produces)..."
+kubectl patch svc "${FULLNAME}-readonly" -n "${NAMESPACE}" --type merge -p '{"spec":{"selector":{"pg-role":"no-such-role"}}}' >/dev/null
+detached=false; s=0
+while [[ ${s} -lt 120 ]]; do
+  nodes_mid=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
+  if printf '%s\n' "${nodes_mid}" | grep -q -- "-readonly.*|down|"; then detached=true; echo "  RO backend detached after ${s}s"; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#361: PGPool detaches the unreachable RO backend" "true" "${detached}"
+W361="standby-away-$(date +%s)"
+w361=$(via_pgpool "${STANDBY}" "INSERT INTO pp_fo (v) VALUES ('${W361}'); SELECT v FROM pp_fo WHERE v='${W361}'" || true)
+assert_contains "#361: writes and reads flow through PGPool with the RO backend down" "${w361}" "${W361}"
+assert_eq "#361: PGPool stays Ready" "true" "$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].ready}')"
+assert_eq "#361: ... and is not restarted" "${restarts_before}" "$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].restartCount}')"
+echo "  #361: restoring the -readonly Service; the re-attach loop must bring the backend back..."
+kubectl patch svc "${FULLNAME}-readonly" -n "${NAMESPACE}" --type merge -p '{"spec":{"selector":{"pg-role":"standby"}}}' >/dev/null
+reattached=false; s=0
+while [[ ${s} -lt 120 ]]; do
+  nodes_post=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
+  if printf '%s\n' "${nodes_post}" | grep -q -- "-readonly.*|up|"; then reattached=true; echo "  RO backend re-attached after ${s}s"; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#361: the re-attach loop re-attaches the RO backend once the Service answers" "true" "${reattached}"
+assert_contains "#361: ... and says so in the pgpool log" "$(kubectl logs -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool --since=10m 2>/dev/null | grep -m1 '\[reattach\]' || true)" "re-attaching"
+assert_eq "#361: no restart across the whole episode" "${restarts_before}" "$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].restartCount}')"
+
 end_suite
 print_summary

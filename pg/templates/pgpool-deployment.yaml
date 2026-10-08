@@ -1,3 +1,4 @@
+{{- include "pg.validatePgpoolReattach" . -}}
 {{- if .Values.pgpool.enabled }}
 {{- /* Removed in favor of pgpool.admin.*; fail instead of silently falling
        back to the chart defaults when stale values are still set. */}}
@@ -101,7 +102,28 @@ spec:
               # emits), NOT sha256, so sha256 made every pcp_* command fail.
               # Hashing here from the admin Secret keeps the credential out of
               # the ConfigMap. busybox md5sum of the raw password matches pg_md5.
-              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_ADMIN_PASSWORD" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # One normalised copy feeds BOTH pcp.conf and .pcppass (#361 review): a
+              # Secret written with `echo` carries a trailing newline, and hashing it
+              # into pcp.conf while $(...) stripped it from .pcppass left the re-attach
+              # loop unable to authenticate -- silently, until the first detach. $(...)
+              # drops trailing newlines from both. A newline INSIDE the password cannot
+              # be expressed in the line-based .pcppass (or typed to any pcp_* tool), so
+              # that one is refused with the fix rather than shipped half-working.
+              PCP_PASS=$(printf '%s' "$PCP_ADMIN_PASSWORD")
+              nl='
+              '
+              case "$PCP_PASS" in *"$nl"*)
+                echo "pgpool admin password contains a newline, which the PCP tools cannot carry; remove it from the admin Secret (pgpool.admin / pgpool.admin.existingSecret)" >&2; exit 1;;
+              esac
+              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_PASS" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # .pcppass for the re-attach loop in the pgpool container (#361): the pcp_*
+              # tools read it through PCPPASSFILE, 0600 like libpq's pgpass. It lives in
+              # the emptyDir beside pcp.conf, so the PCP password never enters the pgpool
+              # container's environment. Same escaping as pgpass: \ -> \\, : -> \:
+              PCP_PASS_ESC=$(printf '%s' "$PCP_PASS" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              PCP_USER_ESC=$(printf '%s' "$PCP_ADMIN_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              printf '127.0.0.1:9898:%s:%s\n' "$PCP_USER_ESC" "$PCP_PASS_ESC" > /usr/local/etc/.pcppass
+              chmod 0600 /usr/local/etc/.pcppass
               # Byte-safe placeholder splice: sed replacement corrupts
               # values containing / & or \, and awk -v assignments eat
               # backslashes, so values travel via ENVIRON.
@@ -216,6 +238,53 @@ spec:
               # signal worth logging); `|| true` keeps a no-op reap non-fatal so a
               # healthy first boot with nothing to remove still starts pgpool.
               ipcrm -a || true
+{{- if .Values.pgpool.reattach.enabled }}
+              # Re-attach loop (#361). The RO backend is detachable (see pgpool.conf), and
+              # pgpool never health-checks a detached node, so something has to bring it
+              # back when the standby returns. pgpool's auto_failback cannot: it matches
+              # backend_application_name against pg_stat_replication and the agent names
+              # standbys by pod, which the -readonly Service backend can never equal. So:
+              # every interval, each backend pgpool reports "down" that answers pg_isready
+              # again is re-attached with pcp_attach_node. That includes a node an operator
+              # detached by hand with pcp_detach_node: under this chart membership is the
+              # agent's (pg-role labels and the Services), not pgpool's, so to keep a
+              # standby out of the read pool make it unready or scale it away, and to run
+              # pgpool-level manual control set pgpool.reattach.enabled=false first
+              # (#361 review). A background sibling of pgpool,
+              # not a sidecar: it needs pgpool's own PCP port, credentials and tools, and
+              # nothing else. It stays alive for the pod's life, so pgpool (PID 1 after
+              # the exec) never has to reap it. pgpool.command replaces this whole block;
+              # pg.validatePgpoolReattach refuses that pairing at render time.
+              (
+                PCPPASSFILE=/usr/local/etc/.pcppass; export PCPPASSFILE
+                PCP_USER=$(cut -d: -f1 /usr/local/etc/pcp.conf)
+                pcp_ok=1
+                sleep 15
+                while :; do
+                  # One PCP call lists every backend, one per line:
+                  #   hostname port status weight status_name backend_status role ...
+                  if info=$(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then
+                    [ "$pcp_ok" = 1 ] || echo "[reattach] PCP answers again"
+                    pcp_ok=1
+                    printf '%s\n' "$info" | awk '$5 == "down" { print NR - 1, $1, $2 }' | while read -r idx host port; do
+                      if pg_isready -h "$host" -p "$port" -t 3 >/dev/null 2>&1; then
+                        echo "[reattach] backend $idx ($host:$port) answers again; re-attaching (#361)"
+                        pcp_attach_node -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$idx" 2>&1 | sed 's/^/[reattach] /'
+                      fi
+                    done
+                  elif [ "$pcp_ok" = 1 ]; then
+                    # Once per episode, not every pass. Silent failure here would leave a
+                    # detached backend detached for good with nothing in the log: the
+                    # liveness probe is pinned to the primary and no longer restarts pgpool
+                    # over a missing read backend. Causes seen: an unreadable .pcppass, a
+                    # PCP user with ':' in it, an image without the pcp tools.
+                    echo "[reattach] pcp_node_info failed; nothing will be re-attached until this clears: $info"
+                    pcp_ok=0
+                  fi
+                  sleep {{ int .Values.pgpool.reattach.interval }}
+                done
+              ) &
+{{- end }}
               exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf
           {{- end }}
           ports:
@@ -258,12 +327,15 @@ spec:
           # on the frontend; the backend side authenticates via pool_passwd.
           # A failing liveness restarts pgpool with a fresh status file,
           # which re-runs backend discovery and reattaches recovered nodes.
+          # /*NO LOAD BALANCE*/ pins the probe to the primary (#361): the
+          # proxy is healthy when the write path works, and a read backend
+          # that is detached or lagging must not make it unready or restart it.
           livenessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
@@ -273,7 +345,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

@@ -416,6 +416,43 @@
               "description": "libpq sslmode for pgpool -> postgres backend connections. Must be >= require when postgresql.tls.require is true."
             }
           }
+        },
+        "healthCheck": {
+          "type": "object",
+          "properties": {
+            "period": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Seconds between backend health checks; 0 disables them."
+            },
+            "timeout": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxRetries": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Failed checks before pgpool detaches a detachable backend (the RO one in agent mode, #361); the RW backend and the standalone primary are never detached. Only the health check detaches; keep period + timeout + maxRetries x (timeout + retryDelay) inside the pgpool liveness budget (60s)."
+            },
+            "retryDelay": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "reattach": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Run the re-attach loop in the pgpool container (#361): a backend pgpool reports down is re-attached with pcp_attach_node once pg_isready answers. Part of the chart's default pgpool command; setting pgpool.command with this enabled fails the render."
+            },
+            "interval": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Seconds between re-attach passes."
+            }
+          }
         }
       }
     },

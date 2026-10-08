@@ -900,11 +900,35 @@ pgpool:
     interval: 3
     count: 5
 
+  # Backend health check. Since #361 the RO backend is detachable, and ONLY the health
+  # check detaches it (a session's own connect failure does not; pgpool just marks the
+  # node down for that child). These numbers are therefore how long sessions stall on an
+  # unreachable standby before pgpool detaches it and reads fall through to the primary:
+  # worst case period + timeout + maxRetries x (timeout + retryDelay), ~22s at these
+  # defaults. They must stay well inside the pgpool liveness budget (6 x 10s), or the
+  # restart loop the detach exists to prevent comes back; the previous 10 x (30 + 3)
+  # was over five minutes. The RW backend (and the standalone primary) is never detached
+  # whatever these say -- DISALLOW_TO_FAILOVER -- a failed check there only recycles
+  # cached connections, which is what makes failover transparent.
   healthCheck:
-    period: 10
-    timeout: 30
-    maxRetries: 10
-    retryDelay: 3
+    period: 5
+    timeout: 5
+    maxRetries: 2
+    retryDelay: 1
+
+  # Re-attach loop (#361). pgpool never health-checks a backend it has detached, and its
+  # own auto_failback cannot see a Service backend (it matches backend_application_name
+  # against pg_stat_replication, where the agent names standbys by pod). So the pgpool
+  # container runs a sibling loop: every `interval` seconds, each backend pgpool reports
+  # down is probed with pg_isready and, once it answers, re-attached with pcp_attach_node.
+  # Part of the chart's default pgpool command: setting pgpool.command with this enabled
+  # fails the render. It re-attaches a node detached by hand with pcp_detach_node too:
+  # membership is the agent's (pg-role labels, the Services), so take a standby out of
+  # the read pool by making it unready or scaling it away, and disable this first if you
+  # want pgpool-level manual control of what is attached.
+  reattach:
+    enabled: true
+    interval: 10
 
   podSecurityContext:
     runAsNonRoot: true
