@@ -2086,6 +2086,12 @@ assert_eq "#361: both probes pin SELECT 1 to the primary" "2" "$(printf '%s\n' "
 pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpool_dep_361_off}" "pcp_attach_node"
 assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"
+pgpool_361_cmd=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' 2>&1 || true)
+assert_contains "#361: pgpool.command with the re-attach loop enabled fails the render" "${pgpool_361_cmd}" "pgpool.reattach.enabled=true but pgpool.command is set"
+pgpool_361_cmd_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' --set pgpool.reattach.enabled=false >/dev/null 2>&1 || pgpool_361_cmd_rc=$?
+assert_eq "#361: ... and renders once the loop is disabled" "0" "${pgpool_361_cmd_rc}"
+pgpool_361_sa=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set ha.enabled=false --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#361: the standalone primary is not detachable either" "${pgpool_361_sa}" "backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'"
 pgpool_361_bad_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.interval=0 >/dev/null 2>&1 || pgpool_361_bad_rc=$?
 assert_gt "#361: a zero re-attach interval is refused by the schema" "${pgpool_361_bad_rc}" 0
 pgpool_361_str_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set-string pgpool.healthCheck.maxRetries=many >/dev/null 2>&1 || pgpool_361_str_rc=$?

@@ -364,11 +364,11 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `pgpool.healthCheck.period` | Health check interval in seconds | `10` |
-| `pgpool.healthCheck.timeout` | Health check timeout in seconds | `10` |
-| `pgpool.healthCheck.maxRetries` | Failed checks before PgPool detaches the RO backend (the RW backend is never detached); latency ~ `maxRetries x (timeout + retryDelay)` (#361) | `3` |
-| `pgpool.healthCheck.retryDelay` | Seconds between retries | `2` |
-| `pgpool.reattach.enabled` | Re-attach a backend PgPool reports `down` once it answers `pg_isready` again (#361) | `true` |
+| `pgpool.healthCheck.period` | Health check interval in seconds | `5` |
+| `pgpool.healthCheck.timeout` | Health check timeout in seconds | `5` |
+| `pgpool.healthCheck.maxRetries` | Failed health checks before PgPool detaches the RO backend (the RW backend is never detached); worst case `period + timeout + maxRetries x (timeout + retryDelay)` (#361) | `2` |
+| `pgpool.healthCheck.retryDelay` | Seconds between retries | `1` |
+| `pgpool.reattach.enabled` | Re-attach a backend PgPool reports `down` once it answers `pg_isready` again (#361). Part of the default `pgpool.command` | `true` |
 | `pgpool.reattach.interval` | Seconds between re-attach passes | `10` |
 
 #### PGPool-II Metrics Exporter

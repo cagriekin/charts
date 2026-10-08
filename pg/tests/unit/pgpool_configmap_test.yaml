@@ -61,16 +61,32 @@ tests:
       - notMatchRegex:
           path: data["pgpool.conf"]
           pattern: backend_flag1 = 'DISALLOW_TO_FAILOVER'
-  - it: health-check defaults detach an unreachable RO backend in well under a minute (#361)
+  # Only the health check detaches; worst case period + timeout + maxRetries x (timeout +
+  # retryDelay) = 5 + 5 + 2 x 6 = 22s, inside the 60s liveness budget that used to be blown.
+  - it: health-check defaults detach an unreachable RO backend inside the liveness budget (#361)
     set:
       pgpool.enabled: true
     asserts:
       - matchRegex:
           path: data["pgpool.conf"]
-          pattern: health_check_timeout = 10\n
+          pattern: health_check_period = 5\n
       - matchRegex:
           path: data["pgpool.conf"]
-          pattern: health_check_max_retries = 3\n
+          pattern: health_check_timeout = 5\n
       - matchRegex:
           path: data["pgpool.conf"]
-          pattern: health_check_retry_delay = 2\n
+          pattern: health_check_max_retries = 2\n
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: health_check_retry_delay = 1\n
+  # The tighter defaults must not start detaching the standalone primary: with a single
+  # backend a detach only delays recovery (nothing re-probes a down node but the loop).
+  - it: the standalone primary is never detached either (#361)
+    set:
+      pgpool.enabled: true
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_flag0 = 'ALWAYS_PRIMARY\|DISALLOW_TO_FAILOVER'

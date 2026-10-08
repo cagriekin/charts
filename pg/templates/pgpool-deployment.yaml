@@ -1,3 +1,4 @@
+{{- include "pg.validatePgpoolReattach" . -}}
 {{- if .Values.pgpool.enabled }}
 {{- /* Removed in favor of pgpool.admin.*; fail instead of silently falling
        back to the chart defaults when stale values are still set. */}}
@@ -230,28 +231,38 @@ spec:
               # back when the standby returns. pgpool's auto_failback cannot: it matches
               # backend_application_name against pg_stat_replication and the agent names
               # standbys by pod, which the -readonly Service backend can never equal. So:
-              # every interval, for each backend pgpool reports "down", if it answers
-              # pg_isready again, pcp_attach_node. Covers the standalone single backend
-              # too, where the only route back used to be a liveness restart (#122).
-              # A background sibling of pgpool, not a sidecar: it needs pgpool's own PCP
-              # port, credentials and tools, and nothing else. It stays alive for the
-              # pod's life, so pgpool (PID 1 after the exec) never has to reap it.
+              # every interval, each backend pgpool reports "down" that answers pg_isready
+              # again is re-attached with pcp_attach_node. A background sibling of pgpool,
+              # not a sidecar: it needs pgpool's own PCP port, credentials and tools, and
+              # nothing else. It stays alive for the pod's life, so pgpool (PID 1 after
+              # the exec) never has to reap it. pgpool.command replaces this whole block;
+              # pg.validatePgpoolReattach refuses that pairing at render time.
               (
                 PCPPASSFILE=/usr/local/etc/.pcppass; export PCPPASSFILE
                 PCP_USER=$(cut -d: -f1 /usr/local/etc/pcp.conf)
+                pcp_ok=1
                 sleep 15
                 while :; do
-                  n=$(pcp_node_count -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>/dev/null) || n=0
-                  i=0
-                  while [ "$i" -lt "${n:-0}" ]; do
-                    # pcp_node_info: hostname port status weight status_name ...
-                    set -- $(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$i" 2>/dev/null)
-                    if [ "${5:-}" = "down" ] && pg_isready -h "$1" -p "$2" -t 3 >/dev/null 2>&1; then
-                      echo "[reattach] backend $i ($1:$2) answers again; re-attaching (#361)"
-                      pcp_attach_node -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$i" >/dev/null 2>&1 || echo "[reattach] pcp_attach_node $i failed; retrying next interval"
-                    fi
-                    i=$((i + 1))
-                  done
+                  # One PCP call lists every backend, one per line:
+                  #   hostname port status weight status_name backend_status role ...
+                  if info=$(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then
+                    [ "$pcp_ok" = 1 ] || echo "[reattach] PCP answers again"
+                    pcp_ok=1
+                    printf '%s\n' "$info" | awk '$5 == "down" { print NR - 1, $1, $2 }' | while read -r idx host port; do
+                      if pg_isready -h "$host" -p "$port" -t 3 >/dev/null 2>&1; then
+                        echo "[reattach] backend $idx ($host:$port) answers again; re-attaching (#361)"
+                        pcp_attach_node -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -n "$idx" 2>&1 | sed 's/^/[reattach] /'
+                      fi
+                    done
+                  elif [ "$pcp_ok" = 1 ]; then
+                    # Once per episode, not every pass. Silent failure here would leave a
+                    # detached backend detached for good with nothing in the log: the
+                    # liveness probe is pinned to the primary and no longer restarts pgpool
+                    # over a missing read backend. Causes seen: an unreadable .pcppass, a
+                    # PCP user with ':' in it, an image without the pcp tools.
+                    echo "[reattach] pcp_node_info failed; nothing will be re-attached until this clears: $info"
+                    pcp_ok=0
+                  fi
                   sleep {{ int .Values.pgpool.reattach.interval }}
                 done
               ) &

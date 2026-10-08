@@ -27,21 +27,29 @@ data:
     # a stateless router; health checks stay ON so it recycles connections when the
     # RW Service endpoint moves after a failover.
     #
-    # The RW backend is DISALLOW_TO_FAILOVER: the agent decides who is primary, pgpool
-    # never detaches it. The RO backend is NOT (#361): every new session opens a
+    # The RW backend is DISALLOW_TO_FAILOVER: the agent decides who is primary and
+    # pgpool never detaches it. The RO backend is NOT (#361). Every new session opens a
     # connection to every attached backend first, so an RO Service with no ready
-    # endpoint -- the only standby unready, or a Parallel rollout -- made every
-    # session wait on that connect. On a CNI that rejects, pgpool skipped the backend
-    # after a short stall; on one that drops (observed on CCE), the stall outlived the
-    # probes' budget, the liveness SELECT failed six times and the kubelet restarted
-    # pgpool in a loop -- writes down for 75 minutes with a healthy primary. Letting
-    # pgpool DETACH the RO backend ends the stall -- at the first session that cannot
-    # reach it, or after pgpool.healthCheck.maxRetries failed checks when no session
-    # tries -- so reads fall through to the primary and the proxy stays up. Detaching is pgpool-internal state, not a role
-    # change, so the agent still owns failover. Re-attach is the re-attach loop in the
-    # pgpool container (pgpool.reattach): pgpool's own auto_failback matches
-    # backend_application_name against pg_stat_replication, and the agent names
-    # standbys by pod, which a Service backend cannot match.
+    # endpoint -- the only standby unready, or a Parallel rollout -- made every session
+    # wait on that connect. Where the CNI rejects, pgpool skipped the backend after a
+    # short stall; where it drops (observed on CCE), the stall outlived the probes'
+    # budget, the liveness SELECT failed six times and the kubelet restarted pgpool in
+    # a loop -- writes down for 75 minutes with a healthy primary. A connect failure
+    # alone does not detach anything (failover_on_backend_error is off, so the child
+    # only marks the node down for itself and restarts); the HEALTH CHECK does, after
+    # pgpool.healthCheck.maxRetries failures, and only for a backend without
+    # DISALLOW_TO_FAILOVER. Once detached the RO backend is skipped without a wait,
+    # reads fall through to the primary and the proxy stays up. The health-check
+    # defaults are sized so that detach lands well inside the liveness budget
+    # (6 x 10s): worst case period + timeout + maxRetries x (timeout + retryDelay),
+    # ~22s at the defaults. The detach itself kills the children holding a connection
+    # to that backend -- in-flight sessions see "server closed the connection
+    # unexpectedly" once -- which is the trade for not stalling every session until
+    # the standby returns. Detaching is pgpool-internal state, not a role change, so
+    # the agent still owns failover. Re-attach is the loop in the pgpool container
+    # (pgpool.reattach): pgpool's own auto_failback matches backend_application_name
+    # against pg_stat_replication, and the agent names standbys by pod, which a
+    # Service backend can never equal.
     backend_hostname0 = '{{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
 {{- if gt (int .Values.postgresql.replicaCount) 0 }}
@@ -53,10 +61,10 @@ data:
     backend_application_name0 = 'primary'
 {{- if gt (int .Values.postgresql.replicaCount) 0 }}
 
-    # RO backend only when standbys exist. With replicaCount=0 the -readonly
-    # Service has zero endpoints, so a backend1 here would fail every health
-    # check and churn pgpool into repeated "restarting myself" cycles, tearing
-    # down live connections to the healthy primary. Omit it -> single-backend
+    # RO backend only when standbys exist (#207). With replicaCount=0 the -readonly
+    # Service never has an endpoint: a backend1 here would be detached by the health
+    # check within seconds, re-probed by the re-attach loop every interval for the life
+    # of the release, and serve nothing in between (#361). Omit it -> single-backend
     # router to the primary, which is valid and stable for primary-only agent mode.
     backend_hostname1 = '{{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port1 = 5432
@@ -75,10 +83,15 @@ data:
        HA pgpool backends" would edit -- to no effect anywhere. The agent fronts the RW/RO
        Services, so the two-backend layout above IS the HA layout; the else below is standalone. */}}
 {{- else }}
+    # standalone: the primary is pinned by name. DISALLOW_TO_FAILOVER too (#361): the
+    # health-check defaults now detach a backend in ~22s, and detaching the only
+    # primary buys nothing -- sessions fail either way while it is down, but a
+    # detached node stays down after the primary is back until something re-attaches
+    # it. Not detaching means the first session after the restart simply works.
     backend_hostname0 = '{{ include "pg.fullname" . }}-0.{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
     backend_weight0 = 1
-    backend_flag0 = 'ALWAYS_PRIMARY'
+    backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'
     backend_application_name0 = 'primary'
 
     {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}

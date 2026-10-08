@@ -663,15 +663,18 @@ pgpool:
     interval: 3
     count: 5
 
-  # Detach latency for an unreachable RO backend is ~maxRetries x (timeout + retryDelay)
-  # (#361); the RW backend is never detached. Full reasoning in the pg chart.
+  # Only the health check detaches the RO backend (#361); worst case
+  # period + timeout + maxRetries x (timeout + retryDelay), ~22s here, which must stay
+  # inside the pgpool liveness budget. The RW backend is never detached. Full reasoning
+  # in the pg chart.
   healthCheck:
-    period: 10
-    timeout: 10
-    maxRetries: 3
-    retryDelay: 2
+    period: 5
+    timeout: 5
+    maxRetries: 2
+    retryDelay: 1
 
-  # Re-attaches a detached backend once pg_isready answers again (#361).
+  # Re-attaches a detached backend once pg_isready answers again (#361). Part of the
+  # default pgpool command; pgpool.command with this enabled fails the render.
   reattach:
     enabled: true
     interval: 10
