@@ -86,6 +86,11 @@ tests:
       - matchRegex:
           path: spec.template.spec.initContainers[0].command[2]
           pattern: /usr/local/etc/\.pcppass\n\s*chmod 0600 /usr/local/etc/\.pcppass
+      # pcp.conf and .pcppass must hash/carry the SAME normalised password, or a trailing
+      # newline in the Secret breaks the loop's PCP auth silently; an embedded one is refused.
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: PCP_PASS=\$\(printf '%s' "\$PCP_ADMIN_PASSWORD"\)[\s\S]*contains a newline[\s\S]*printf '%s' "\$PCP_PASS" \| md5sum[\s\S]*PCP_PASS_ESC=\$\(printf '%s' "\$PCP_PASS"
   - it: both probes pin SELECT 1 to the primary (#361)
     template: templates/pgpool-deployment.yaml
     set:

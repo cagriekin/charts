@@ -29,7 +29,11 @@
   re-attaches with `pcp_attach_node` any backend reported `down` once it answers `pg_isready`,
   using a 0600 `.pcppass` the init container writes beside `pcp.conf`. It is part of the default
   `pgpool.command`; setting `pgpool.command` with it enabled fails the render. PCP failures are
-  logged once per episode rather than swallowed.
+  logged once per episode rather than swallowed. It re-attaches a node detached by hand with
+  `pcp_detach_node` too (membership is the agent's; disable the loop for PgPool-level manual
+  control). The admin password is normalised once for `pcp.conf` and `.pcppass` (a trailing
+  newline from an `echo`-written Secret no longer breaks PCP auth); a newline inside it fails
+  the init container with the fix named.
 
 ## 2.3.0 - 2026-10-05
 

@@ -102,12 +102,25 @@ spec:
               # emits), NOT sha256, so sha256 made every pcp_* command fail.
               # Hashing here from the admin Secret keeps the credential out of
               # the ConfigMap. busybox md5sum of the raw password matches pg_md5.
-              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_ADMIN_PASSWORD" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # One normalised copy feeds BOTH pcp.conf and .pcppass (#361 review): a
+              # Secret written with `echo` carries a trailing newline, and hashing it
+              # into pcp.conf while $(...) stripped it from .pcppass left the re-attach
+              # loop unable to authenticate -- silently, until the first detach. $(...)
+              # drops trailing newlines from both. A newline INSIDE the password cannot
+              # be expressed in the line-based .pcppass (or typed to any pcp_* tool), so
+              # that one is refused with the fix rather than shipped half-working.
+              PCP_PASS=$(printf '%s' "$PCP_ADMIN_PASSWORD")
+              nl='
+              '
+              case "$PCP_PASS" in *"$nl"*)
+                echo "pgpool admin password contains a newline, which the PCP tools cannot carry; remove it from the admin Secret (pgpool.admin / pgpool.admin.existingSecret)" >&2; exit 1;;
+              esac
+              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_PASS" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
               # .pcppass for the re-attach loop in the pgpool container (#361): the pcp_*
               # tools read it through PCPPASSFILE, 0600 like libpq's pgpass. It lives in
               # the emptyDir beside pcp.conf, so the PCP password never enters the pgpool
               # container's environment. Same escaping as pgpass: \ -> \\, : -> \:
-              PCP_PASS_ESC=$(printf '%s' "$PCP_ADMIN_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              PCP_PASS_ESC=$(printf '%s' "$PCP_PASS" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               PCP_USER_ESC=$(printf '%s' "$PCP_ADMIN_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               printf '127.0.0.1:9898:%s:%s\n' "$PCP_USER_ESC" "$PCP_PASS_ESC" > /usr/local/etc/.pcppass
               chmod 0600 /usr/local/etc/.pcppass
@@ -232,7 +245,12 @@ spec:
               # backend_application_name against pg_stat_replication and the agent names
               # standbys by pod, which the -readonly Service backend can never equal. So:
               # every interval, each backend pgpool reports "down" that answers pg_isready
-              # again is re-attached with pcp_attach_node. A background sibling of pgpool,
+              # again is re-attached with pcp_attach_node. That includes a node an operator
+              # detached by hand with pcp_detach_node: under this chart membership is the
+              # agent's (pg-role labels and the Services), not pgpool's, so to keep a
+              # standby out of the read pool make it unready or scale it away, and to run
+              # pgpool-level manual control set pgpool.reattach.enabled=false first
+              # (#361 review). A background sibling of pgpool,
               # not a sidecar: it needs pgpool's own PCP port, credentials and tools, and
               # nothing else. It stays alive for the pod's life, so pgpool (PID 1 after
               # the exec) never has to reap it. pgpool.command replaces this whole block;

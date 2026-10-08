@@ -673,7 +673,8 @@ pgpool:
     maxRetries: 2
     retryDelay: 1
 
-  # Re-attaches a detached backend once pg_isready answers again (#361). Part of the
+  # Re-attaches a detached backend once pg_isready answers again (#361) -- a manual
+  # pcp_detach_node included; disable this for pgpool-level manual control. Part of the
   # default pgpool command; pgpool.command with this enabled fails the render.
   reattach:
     enabled: true

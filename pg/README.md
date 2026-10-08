@@ -3223,7 +3223,7 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 i
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
 
-PGPool-II has failover disabled by design (the agent owns it and re-points the Services), so backends are not detached on a primary change. If a backend is stuck detached, reattach it with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
+PGPool-II has failover disabled by design on the RW backend (the agent owns it and re-points the Services), so a primary change never detaches it. The RO backend is detached by the health check when the `-readonly` Service stops answering and re-attached by the loop in the pgpool container once it answers again (`pgpool.reattach`, #361), so a backend that stays `down` with a healthy Service is the loop reporting a problem: look for `[reattach]` lines in the pgpool log. The loop also re-attaches a node you detached by hand with `pcp_detach_node`: under this chart membership is the agent's (`pg-role` labels and the Services), so take a standby out of the read pool by making it unready or scaling it away, and set `pgpool.reattach.enabled=false` first if you want PgPool-level manual control. With the loop off, re-attach with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
 
 ### Recovering After Failover
 
