@@ -78,8 +78,10 @@ The chart's `ENVIRONMENT.md` lists the full set. Since 2.2.0 the agent also requ
 `POSTGRES_DB`, so **image 2.2.0 needs the pg/pgvector chart 2.5.0 or newer**; on an older chart the
 agent refuses to start. On the primary it provisions those two non-superuser roles over the local
 socket, marking them with `COMMENT ON ROLE ... IS 'managed by the pg chart'`. It refuses to start
-if one is named like the superuser, the replication user or the monitoring user, and it will not
-take over a same-named role that lacks the mark.
+if one is named like the superuser, the replication user or the monitoring user. A same-named role
+that lacks the mark does not stop the agent: it logs the error once, leaves that role untouched
+and unprovisioned for the life of the process, and keeps running. Rename the chart value, or hand
+the role over with `COMMENT ON ROLE <name> IS 'managed by the pg chart'` and restart the pod.
 
 ### init mode
 

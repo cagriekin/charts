@@ -1209,11 +1209,21 @@ spec:
                         IF r.kind = 'pgpool-check' THEN
                           EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', r.name);
                         ELSIF current_setting('myvars.db') = 'postgres' THEN
+                          IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+                                     WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = r.name)
+                                       AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+                            EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', r.name);
+                          END IF;
                           EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_setting('myvars.db'), r.name);
                           IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
                             EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', r.name);
                           END IF;
                         ELSE
+                          IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+                                     WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = r.name)
+                                       AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+                            EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', r.name);
+                          END IF;
                           EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('myvars.db'), r.name);
                         END IF;
                       END LOOP;

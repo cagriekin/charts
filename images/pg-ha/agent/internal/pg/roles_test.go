@@ -51,6 +51,7 @@ func TestEnsureRoleSQL(t *testing.T) {
 		"ELSIF v_kind = 'app' AND v_db = 'postgres' THEN",
 		"GRANT CONNECT ON DATABASE %I TO %I",
 		"GRANT USAGE, CREATE ON SCHEMA public TO %I",
+		"REVOKE pg_monitor, pg_use_reserved_connections FROM %I",
 		"RAISE EXCEPTION 'unknown managed role kind %'",
 		"v_marker TEXT := 'managed by the pg chart';",
 		"COMMENT ON ROLE %I IS %L",

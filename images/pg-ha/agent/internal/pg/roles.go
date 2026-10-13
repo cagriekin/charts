@@ -37,7 +37,9 @@ type ManagedRole struct {
 // to what the chart declares: LOGIN, no superuser or other elevated attribute, the password
 // from the Secret, and the kind's privileges. A same-named role WITHOUT the mark belongs to
 // someone else: converting it would silently demote it and reset its password, so the run
-// stops instead and says how to rename the value or hand the role over. The password travels exactly as rehashSQL's does (see there): a SCRAM
+// stops instead and says how to rename the value or hand the role over. The app branch
+// revokes the check role's memberships: a marked role renamed from pgpool.checkUser to
+// postgresql.app would otherwise keep pg_monitor and the reserved-connection slots. The password travels exactly as rehashSQL's does (see there): a SCRAM
 // verifier computed in Go, passed through the environment, hoisted into a session GUC after
 // statement logging is lowered, and quoted with format(%I, %L). VERBOSITY terse keeps the
 // dynamic statement -- verifier included -- out of psql's CONTEXT lines on failure.
@@ -69,11 +71,21 @@ BEGIN
   IF v_kind = 'pgpool-check' THEN
     EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
   ELSIF v_kind = 'app' AND v_db = 'postgres' THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+               WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
+                 AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+      EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', v_name);
+    END IF;
     EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', v_db, v_name);
     IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
       EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', v_name);
     END IF;
   ELSIF v_kind = 'app' THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+               WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
+                 AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+      EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', v_name);
+    END IF;
     EXECUTE format('ALTER DATABASE %I OWNER TO %I', v_db, v_name);
   ELSE
     RAISE EXCEPTION 'unknown managed role kind %', v_kind;

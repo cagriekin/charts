@@ -275,4 +275,4 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
-          pattern: "ELSIF current_setting\\('myvars\\.db'\\) = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
+          pattern: "ELSIF current_setting\\('myvars\\.db'\\) = 'postgres' THEN[\\s\\S]*?REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE[\\s\\S]*?REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
