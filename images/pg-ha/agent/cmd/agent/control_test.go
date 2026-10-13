@@ -321,7 +321,7 @@ func TestPublishSnapshotMapsObservationAndDecision(t *testing.T) {
 	a := &agent{
 		cfg:    &config.Config{PodName: "pg-0", PGMajor: "18", PGDATA: t.TempDir()},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prober: pg.NewProber(),
+		prober: pg.NewProber(pg.NewConnCache()),
 	}
 	obs := reconcile.Observation{
 		HoldLease:        true,
@@ -371,7 +371,7 @@ func TestPublishSnapshotSkipsReplayProbeWhenNotRecovering(t *testing.T) {
 	a := &agent{
 		cfg:    &config.Config{PodName: "pg-0", PGDATA: t.TempDir()},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prober: &pg.Prober{Exec: ex},
+		prober: execProber(ex),
 	}
 	a.publishSnapshot(context.Background(), reconcile.Observation{
 		Local: reconcile.LocalState{Running: true, InRecovery: false},
@@ -767,7 +767,7 @@ func TestRunIntentRestartPinsANonHolderReadOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a.prober = pg.NewProber()
+	a.prober = pg.NewProber(pg.NewConnCache())
 	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentRestart}); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -791,7 +791,7 @@ func TestRunIntentRestartPinsTheHolderReadOnlyOnAnUnreadableControlFile(t *testi
 	a := newIntentAgent(t, pm)
 	a.dcs = &fakeDCS{leader: true}
 	a.pgControlDataBin = "/nonexistent/pg_controldata"
-	a.prober = pg.NewProber()
+	a.prober = pg.NewProber(pg.NewConnCache())
 	for _, f := range []string{"PG_VERSION", "postgresql.conf"} {
 		if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, f), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)

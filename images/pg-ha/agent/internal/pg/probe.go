@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
 
@@ -29,10 +31,11 @@ type OSExec struct{}
 // psql writes its diagnostics to STDERR, and cmd.Output() puts them in
 // exec.ExitError.Stderr -- but ExitError.Error() renders only "exit status N", so an
 // unwrapped error carries none of them. Every caller that inspects the message therefore
-// saw nothing to inspect: IsDuplicateSlot could never match a real create/create race
-// (verified: stdout empty, err.Error() == "exit status 1", the ERROR text only in
-// ExitError.Stderr), and every probe failure logged an opaque "exit status 1" instead of
-// the reason PostgreSQL gave. Fold stderr into the error so both work.
+// saw nothing to inspect: the mechanism layer's duplicate-slot check could never match a
+// real create/create race (verified: stdout empty, err.Error() == "exit status 1", the
+// ERROR text only in ExitError.Stderr), and every command failure logged an opaque
+// "exit status 1" instead of the reason PostgreSQL gave. Fold stderr into the error so
+// both work.
 //
 // Stdout is returned separately and unchanged: callers parse it as query output, so
 // diagnostics must not be mixed into it the way CombinedOutput would.
@@ -114,34 +117,33 @@ type Prober struct {
 	// Exec runs the external commands the agent still needs a process for (the bootstrap
 	// entrypoint, pg_ctl). It is no longer how SQL reaches a node.
 	Exec Exec
-	// SQL is the transport every probe goes through. The agent sets a ConnCache -- one
-	// persistent connection per node (#364). nil, as the unit tests leave it, means
-	// ExecQuerier over Exec: the original psql-per-query transport, whose fakes answer by
-	// inspecting the psql argument list.
-	SQL     Querier
+	// SQL is the transport every probe goes through. Required. The agent sets a
+	// ConnCache -- one persistent connection per node (#364); the unit tests set an
+	// ExecQuerier over a fake Exec, whose fakes answer by inspecting the psql argument list.
+	SQL Querier
+	// Timeout is the per-probe deadline. Required (positive).
 	Timeout time.Duration
 }
 
-// NewProber returns the agent's prober: persistent connections, 10s per-probe deadline.
-func NewProber() *Prober {
-	return &Prober{Exec: OSExec{}, SQL: NewConnCache(), Timeout: 10 * time.Second}
+// NewProber returns the agent's prober: SQL over sql, 10s per-probe deadline. The caller
+// owns sql (the agent closes its ConnCache on shutdown).
+func NewProber(sql Querier) *Prober {
+	return &Prober{Exec: OSExec{}, SQL: sql, Timeout: 10 * time.Second}
 }
 
 // psql runs sql against ci under the per-probe deadline and returns `psql -tA` shaped
 // text (see Querier). The name is historical: until #364 this really was a psql process
 // per call, and every parser below still consumes that output shape.
 func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, error) {
-	to := p.Timeout
-	if to <= 0 {
-		to = 10 * time.Second // a zero Timeout would make the deadline expire immediately
+	if p.SQL == nil {
+		return "", errors.New("prober: SQL querier is not set")
 	}
-	ctx, cancel := context.WithTimeout(ctx, to)
+	if p.Timeout <= 0 {
+		return "", fmt.Errorf("prober: Timeout must be positive, got %s", p.Timeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
-	q := p.SQL
-	if q == nil {
-		q = ExecQuerier{Exec: p.Exec, Timeout: to}
-	}
-	return q.QueryText(ctx, ci, sql)
+	return p.SQL.QueryText(ctx, ci, sql)
 }
 
 // InRecovery reports pg_is_in_recovery(). reachable is false when the node could
@@ -601,13 +603,13 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	//
 	// The collision is RAISEd with a message of our OWN, not left to PostgreSQL's (#298
 	// review, round 2). Scoping the guard alone did not surface anything: the create then
-	// runs and pg_create_physical_replication_slot fails with the very phrase
-	// `replication slot "..." already exists`, which IsDuplicateSlot matches -- so the
-	// error was swallowed and this returned nil exactly as before, leaving the silent
-	// per-tick no-op the scoping was meant to end. A distinct message (deliberately
-	// WITHOUT the words "already exists") makes the squatter fatal while a genuine
-	// physical/physical race still raises PostgreSQL's own phrase and is still treated as
-	// success below -- which is the one case that IS success.
+	// runs and pg_create_physical_replication_slot fails with duplicate_object (42710),
+	// which IsDuplicateSlot treats as a lost race -- so the error was swallowed and this
+	// returned nil exactly as before, leaving the silent per-tick no-op the scoping was
+	// meant to end. RAISE EXCEPTION (P0001, with a message deliberately WITHOUT the words
+	// "already exists") makes the squatter fatal while a genuine physical/physical race
+	// still raises PostgreSQL's own duplicate_object and is still treated as success
+	// below -- which is the one case that IS success.
 	// An INVALIDATED slot is recycled, not accepted (#298 review). wal_status = 'lost'
 	// means PostgreSQL destroyed the reservation because the slot passed
 	// max_slot_wal_keep_size (4GB in this image), and such a slot can never be acquired
@@ -623,7 +625,7 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	// one, which is the whole point of an idempotent ensure.
 	//
 	// Guarded on NOT active, so this can only ever remove a reservation nothing holds.
-	out, err := p.psql(ctx, ci, fmt.Sprintf(
+	_, err := p.psql(ctx, ci, fmt.Sprintf(
 		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
 			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
@@ -634,7 +636,7 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');", name))
-	if err != nil && IsDuplicateSlot(out, err) {
+	if IsDuplicateSlot(err) {
 		return nil
 	}
 	return err
@@ -643,18 +645,17 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 // IsDuplicateSlot reports whether a failed slot create lost a create/create race, i.e. the
 // slot now exists -- which is the outcome the caller wanted (#289).
 //
-// Matched on message text because psql surfaces the server error only as combined output
-// plus a non-zero exit status; there is no SQLSTATE to read through this transport. Kept
-// narrow (the literal phrase PostgreSQL uses for duplicate_object on a slot) so it cannot
-// swallow an unrelated failure, and exported so the mechanism layer can apply the same
-// judgement to its own clone-time create without duplicating the string.
-func IsDuplicateSlot(out string, err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(out + " " + err.Error())
-	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
+// Matched on SQLSTATE 42710 (duplicate_object), which pg_create_physical_replication_slot
+// raises for an existing name and which does not depend on the server's message wording
+// or lc_messages. The squatter RAISE in CreatePhysicalSlot is a plain RAISE EXCEPTION
+// (P0001), so it is not swallowed; neither is any error that did not come from the
+// server (connection loss, deadline), which carries no SQLSTATE at all (#364).
+func IsDuplicateSlot(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDuplicateObject
 }
+
+const sqlstateDuplicateObject = "42710"
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
 //

@@ -147,6 +147,8 @@ type agent struct {
 	mech   mechanism.Mechanism
 	sup    *process.Supervisor
 	prober *pg.Prober
+	// conns is the prober's transport, held here so shutdown can terminate the sessions.
+	conns  *pg.ConnCache
 	metr   *observe.Metrics
 	health *selfHealthTracker
 	// Major-versioned locations of the server binaries this image bundles, derived
@@ -362,6 +364,7 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		return nil, err
 	}
 	mech := newMechanism(cfg, pgBindir)
+	conns := pg.NewConnCache()
 	return &agent{
 		cfg:    cfg,
 		log:    log,
@@ -369,7 +372,8 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		kube:   kube,
 		mech:   mech,
 		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
-		prober: pg.NewProber(),
+		prober: pg.NewProber(conns),
+		conns:  conns,
 		metr:   observe.New(),
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
@@ -597,6 +601,12 @@ func (a *agent) run() {
 			if c, ok := a.dcs.(io.Closer); ok {
 				_ = c.Close()
 			}
+			// Last, after the demote and the lease release, which may still probe.
+			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := a.conns.Close(cctx); err != nil {
+				a.log.Warn("shutdown: some SQL sessions could not be closed cleanly", "err", err)
+			}
+			ccancel()
 			return
 		case <-ticker.C:
 			a.tick(ctx)

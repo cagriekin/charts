@@ -2,7 +2,9 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,13 +34,12 @@ type ExecQuerier struct {
 }
 
 func (q ExecQuerier) QueryText(ctx context.Context, ci ConnInfo, sql string) (string, error) {
-	to := q.Timeout
-	if to <= 0 {
-		to = 10 * time.Second
+	if q.Timeout <= 0 {
+		return "", fmt.Errorf("ExecQuerier: Timeout must be positive, got %s", q.Timeout)
 	}
 	env := []string{
 		"PGPASSWORD=" + ci.Password,
-		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(to.Seconds())),
+		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(q.Timeout.Seconds())),
 	}
 	// --no-psqlrc: every caller parses psql's OUTPUT SHAPE, and a startup file can change
 	// all of it (`\pset fieldsep`, `\pset null`, a banner) while psql still exits 0 (#298).
@@ -76,66 +77,137 @@ func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
 // an open socket instead of a process start, a TCP connect, an authentication exchange
 // and a backend fork (#364).
 //
-// Liveness is the caller's deadline, never the socket's: every query runs under the
-// per-probe timeout, pgconn cancels and closes the connection when that deadline passes,
-// and any error drops the cached connection. A stale socket therefore cannot hide a dead
-// peer behind the timeout the old transport already had (PGCONNECT_TIMEOUT), and a peer
-// that merely restarted between ticks costs nothing: a query that fails on a REUSED
-// connection is retried once on a fresh dial within the same call, so one tick's view
-// is what a fresh psql would have seen.
+// Liveness is bounded twice. The caller's deadline bounds every query: pgconn cancels
+// and closes the connection when it passes, so a stale socket cannot hide a dead peer
+// behind more than the timeout the old transport already had (PGCONNECT_TIMEOUT). And
+// TCP_USER_TIMEOUT (tcpUserTimeout) bounds a socket whose peer has VANISHED -- a pod
+// recreated on a new IP while the old IP silently drops packets: the kernel fails the
+// socket once sent data has gone unacknowledged that long, well inside the probe
+// deadline, so the query that fails on the REUSED connection is retried once on a fresh
+// dial within the same call and the tick sees what a fresh psql would have seen. A slow
+// query is not affected: the server still acknowledges what was sent.
+//
+// A server-side ERROR keeps the connection (the session is still usable); a FATAL or a
+// transport error drops it. Entries idle longer than idleTTL -- a scaled-down ordinal, an
+// upstream the agent no longer probes -- are closed and forgotten on the next query.
 //
 // Connections are dialled from the same libpq environment psql used -- PGSSLMODE,
 // PGSSLROOTCERT, PGPASSFILE (the agent's own .pgpass) and friends are honoured by
 // pgconn's config parser -- with host, port, user, database and connect_timeout set
-// explicitly and the password from ConnInfo when it carries one. Sessions identify as
+// explicitly and the password from ConnInfo when it carries one. The password is set on
+// the parsed config, never written into the connection string, so a parse error (which
+// pgx quotes with only partial password redaction) cannot leak it. Sessions identify as
 // application_name=pg-ha-agent in pg_stat_activity.
 type ConnCache struct {
-	dial func(ctx context.Context, dsn string) (sqlConn, error)
+	// dial opens a connection for dsn, authenticating with password when it is not
+	// empty (the libpq environment and .pgpass otherwise).
+	dial    func(ctx context.Context, dsn, password string) (sqlConn, error)
+	idleTTL time.Duration
+	now     func() time.Time
 
-	mu      sync.Mutex
-	entries map[string]*cacheEntry
+	mu       sync.Mutex
+	entries  map[string]*cacheEntry
+	isClosed bool
 }
+
+// connIdleTTL is how long an unused entry is kept. Every reconcile tick probes every
+// current member, so only nodes the agent stopped probing reach it; a reconcile interval
+// longer than this just costs one dial per tick.
+const connIdleTTL = 5 * time.Minute
+
+// tcpUserTimeout is how long sent data may go unacknowledged before the kernel fails the
+// socket. Short enough that a vanished peer fails, and the redial runs, well inside the
+// 10s probe deadline; long enough for many retransmissions on a congested but live path.
+const tcpUserTimeout = 3 * time.Second
 
 // cacheEntry serialises use of one connection: pgconn connections are not safe for
 // concurrent use, and the control API can probe the same node the reconcile loop is
-// probing. Holding the entry lock for the whole query keeps the two in order.
+// probing. Holding the entry lock for the whole query keeps the two in order. The lock is
+// a one-slot channel rather than a sync.Mutex so a waiter gives up at its own deadline
+// instead of queueing past it behind a query hung on a dead peer.
 type cacheEntry struct {
-	mu   sync.Mutex
+	sem  chan struct{}
 	conn sqlConn
+	// lastUsed is guarded by ConnCache.mu, not by sem, so the idle sweep can read it
+	// without waiting on a query.
+	lastUsed time.Time
 }
+
+func (e *cacheEntry) lock(ctx context.Context) error {
+	select {
+	case e.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *cacheEntry) unlock() { <-e.sem }
 
 // NewConnCache returns a cache that dials real PostgreSQL connections.
 func NewConnCache() *ConnCache {
-	return &ConnCache{dial: func(ctx context.Context, dsn string) (sqlConn, error) {
-		cfg, err := pgconn.ParseConfig(dsn)
-		if err != nil {
-			return nil, err
-		}
-		c, err := pgconn.ConnectConfig(ctx, cfg)
-		if err != nil {
-			return nil, err
-		}
-		return pgConn{c: c}, nil
-	}}
+	dialer := &net.Dialer{
+		// Keepalives catch a dead socket that sits idle between ticks; TCP_USER_TIMEOUT
+		// also caps how long the kernel keeps probing it.
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: 15 * time.Second, Interval: 5 * time.Second, Count: 3},
+		Control:         setTCPUserTimeout(tcpUserTimeout),
+	}
+	return &ConnCache{
+		dial: func(ctx context.Context, dsn, password string) (sqlConn, error) {
+			cfg, err := pgconn.ParseConfig(dsn)
+			if err != nil {
+				return nil, err
+			}
+			// A custom DialFunc, not a tcp_user_timeout keyword: pgconn does not know that
+			// keyword and would send it to the server as a run-time parameter.
+			cfg.DialFunc = dialer.DialContext
+			if password != "" {
+				cfg.Password = password
+			}
+			c, err := pgconn.ConnectConfig(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
+			return pgConn{c: c}, nil
+		},
+		idleTTL: connIdleTTL,
+		now:     time.Now,
+	}
 }
 
 // QueryText implements Querier. The deadline is the caller's (Prober sets it from its
 // Timeout); connect_timeout mirrors it so a dial never outlives the probe either.
 func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (string, error) {
+	if c.dial == nil || c.now == nil || c.idleTTL <= 0 {
+		return "", errors.New("connection cache is not initialised (use NewConnCache)")
+	}
 	key := ci.Host + ":" + strconv.Itoa(ci.Port) + ":" + ci.User + ":" + ci.DB
 	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return "", errors.New("connection cache is closed")
+	}
 	if c.entries == nil {
 		c.entries = map[string]*cacheEntry{}
 	}
+	now := c.now()
+	evicted := c.evictIdleLocked(now, key)
 	e := c.entries[key]
 	if e == nil {
-		e = &cacheEntry{}
+		e = &cacheEntry{sem: make(chan struct{}, 1)}
 		c.entries[key] = e
 	}
+	e.lastUsed = now
 	c.mu.Unlock()
+	for _, old := range evicted {
+		c.drop(ctx, old)
+		old.unlock()
+	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	if err := e.lock(ctx); err != nil {
+		return "", err
+	}
+	defer e.unlock()
 	reused := e.conn != nil && !e.conn.closed()
 	if !reused {
 		if err := c.redial(ctx, e, ci); err != nil {
@@ -144,6 +216,14 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 	}
 	rows, err := e.conn.exec(ctx, sql)
 	if err != nil {
+		// A server-side ERROR (permission denied, a RAISE, a duplicate slot) leaves the
+		// session usable and would recur on a fresh dial: keep the connection and do not
+		// retry. A FATAL (e.g. admin shutdown on a restarted peer) closes it, so it falls
+		// through to the drop-and-redial path below.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && !e.conn.closed() {
+			return "", err
+		}
 		c.drop(ctx, e)
 		if !reused || ctx.Err() != nil {
 			return "", err
@@ -173,12 +253,33 @@ func (c *ConnCache) redial(ctx context.Context, e *cacheEntry, ci ConnInfo) erro
 	if secs < 1 {
 		secs = 1
 	}
-	conn, err := c.dial(ctx, connString(ci, secs))
+	conn, err := c.dial(ctx, connString(ci, secs), ci.Password)
 	if err != nil {
 		return err
 	}
 	e.conn = conn
 	return nil
+}
+
+// evictIdleLocked removes every entry other than keep that has been unused for idleTTL
+// and is not in use, and returns them still locked so the caller can close their
+// connections after releasing c.mu. An entry whose lock is held is skipped, never
+// waited on: it is in use, so it will be swept on a later call once it goes idle.
+// Called with c.mu held.
+func (c *ConnCache) evictIdleLocked(now time.Time, keep string) []*cacheEntry {
+	var out []*cacheEntry
+	for k, e := range c.entries {
+		if k == keep || now.Sub(e.lastUsed) < c.idleTTL {
+			continue
+		}
+		select {
+		case e.sem <- struct{}{}:
+			delete(c.entries, k)
+			out = append(out, e)
+		default:
+		}
+	}
+	return out
 }
 
 func (c *ConnCache) drop(ctx context.Context, e *cacheEntry) {
@@ -188,18 +289,34 @@ func (c *ConnCache) drop(ctx context.Context, e *cacheEntry) {
 	}
 }
 
-// Close drops every cached connection (shutdown).
-func (c *ConnCache) Close(ctx context.Context) {
+// Close terminates every cached connection cleanly (shutdown), so the nodes see a
+// Terminate message instead of logging an unexpected EOF for each agent session. The
+// cache refuses further queries once Close starts. The cache lock is released before
+// waiting on any entry, and each wait is bounded by ctx: an entry still held by a query
+// hung on a dead peer is reported, not waited out, and its socket goes with the process.
+func (c *ConnCache) Close(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, e := range c.entries {
-		e.mu.Lock()
-		c.drop(ctx, e)
-		e.mu.Unlock()
+	c.isClosed = true
+	entries := make(map[string]*cacheEntry, len(c.entries))
+	for k, e := range c.entries {
+		entries[k] = e
 	}
+	c.mu.Unlock()
+
+	var errs []error
+	for key, e := range entries {
+		if err := e.lock(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("close %s: %w", key, err))
+			continue
+		}
+		c.drop(ctx, e)
+		e.unlock()
+	}
+	return errors.Join(errs...)
 }
 
-// connString builds the libpq keyword/value string for ci. Values are quoted the way
+// connString builds the libpq keyword/value string for ci, without the password (see
+// ConnCache: it is set on the parsed config instead). Values are quoted the way
 // libpq and pgconn expect (backslash-escaped, single-quoted), so a database or user name
 // with a space or quote cannot inject keywords -- the conninfo-injection class the agent
 // guards the Lease holder name against (#298) applies here too.
@@ -211,9 +328,6 @@ func connString(ci ConnInfo, connectTimeoutSecs int) string {
 		"dbname=" + quoteConnValue(ci.DB),
 		"connect_timeout=" + strconv.Itoa(connectTimeoutSecs),
 		"application_name=pg-ha-agent",
-	}
-	if ci.Password != "" {
-		parts = append(parts, "password="+quoteConnValue(ci.Password))
 	}
 	return strings.Join(parts, " ")
 }

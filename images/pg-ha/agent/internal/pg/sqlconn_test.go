@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // fakeSQLConn scripts one connection: each exec pops the next reply.
@@ -45,20 +47,33 @@ func row(cells ...string) [][]byte {
 }
 
 // cacheWith returns a cache whose dial hands out the given connections in order and
-// records every DSN it was asked for.
+// records every DSN it was asked for. Idle eviction is effectively off (one hour on the
+// real clock); the eviction tests set their own clock.
 func cacheWith(conns ...*fakeSQLConn) (*ConnCache, *[]string) {
-	dsns := &[]string{}
-	i := 0
-	c := &ConnCache{dial: func(_ context.Context, dsn string) (sqlConn, error) {
-		*dsns = append(*dsns, dsn)
-		if i >= len(conns) {
-			return nil, errors.New("fake: no more connections")
-		}
-		conn := conns[i]
-		i++
-		return conn, nil
-	}}
+	c, dsns, _ := cacheWithPasswords(conns...)
 	return c, dsns
+}
+
+// cacheWithPasswords is cacheWith that also records the password handed to each dial.
+func cacheWithPasswords(conns ...*fakeSQLConn) (*ConnCache, *[]string, *[]string) {
+	dsns := &[]string{}
+	passwords := &[]string{}
+	i := 0
+	c := &ConnCache{
+		dial: func(_ context.Context, dsn, password string) (sqlConn, error) {
+			*dsns = append(*dsns, dsn)
+			*passwords = append(*passwords, password)
+			if i >= len(conns) {
+				return nil, errors.New("fake: no more connections")
+			}
+			conn := conns[i]
+			i++
+			return conn, nil
+		},
+		idleTTL: time.Hour,
+		now:     time.Now,
+	}
+	return c, dsns, passwords
 }
 
 var ci = ConnInfo{Host: "pg-1.pg-headless", Port: 5432, User: "repmgr", DB: "repmgr", Password: "s3cret"}
@@ -149,13 +164,40 @@ func TestConnCacheDialHonoursTheCallerDeadline(t *testing.T) {
 // connString quotes every value: a name with a space or quote cannot inject keywords.
 func TestConnStringQuotesValues(t *testing.T) {
 	got := connString(ConnInfo{Host: "h", Port: 5432, User: "it's me", DB: "my db", Password: `p\ss'wd`}, 7)
-	for _, want := range []string{`host='h'`, "port=5432", `user='it\'s me'`, `dbname='my db'`, "connect_timeout=7", "application_name=pg-ha-agent", `password='p\\ss\'wd'`} {
+	for _, want := range []string{`host='h'`, "port=5432", `user='it\'s me'`, `dbname='my db'`, "connect_timeout=7", "application_name=pg-ha-agent"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("%s lacks %s", got, want)
 		}
 	}
-	if strings.Contains(connString(ConnInfo{Host: "h", User: "u", DB: "d"}, 1), "password=") {
-		t.Error("an empty password must leave the keyword out so PGPASSFILE applies")
+}
+
+// The password never enters the connection string, whose parse errors pgx redacts only
+// partly; it reaches dial separately and is set on the parsed config.
+func TestConnCacheKeepsThePasswordOutOfTheDSN(t *testing.T) {
+	c, dsns, passwords := cacheWithPasswords(&fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}})
+	withQuote := ci
+	withQuote.Password = `a\'b c`
+	if _, err := c.QueryText(context.Background(), withQuote, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains((*dsns)[0], "password") || strings.Contains((*dsns)[0], "b c") {
+		t.Errorf("the DSN carries the password: %s", (*dsns)[0])
+	}
+	if (*passwords)[0] != withQuote.Password {
+		t.Errorf("dial got password %q, want %q", (*passwords)[0], withQuote.Password)
+	}
+}
+
+// pgconn.ParseConfig errors quote the connection string; with the password kept out of
+// it, nothing secret can appear in one.
+func TestNewConnCacheParseErrorCannotLeakThePassword(t *testing.T) {
+	const secret = `a\'b c-SECRET`
+	_, err := NewConnCache().dial(context.Background(), "host='h' sslmode='bogus'", secret)
+	if err == nil {
+		t.Fatal("want a parse error for an invalid sslmode")
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("parse error leaks the password: %v", err)
 	}
 }
 
@@ -175,5 +217,191 @@ func TestFormatRowsMatchesPsql(t *testing.T) {
 		if got := formatRows(c.rows); got != c.want {
 			t.Errorf("formatRows = %q, want %q", got, c.want)
 		}
+	}
+}
+
+// A server ERROR on a healthy reused connection is the node's answer: the session stays
+// open and cached, and the statement is not re-run on a fresh dial.
+func TestConnCacheKeepsTheConnectionOnAServerError(t *testing.T) {
+	conn := &fakeSQLConn{replies: []fakeReply{
+		{rows: [][][]byte{row("t")}},
+		{err: &pgconn.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied"}},
+		{rows: [][][]byte{row("f")}},
+	}}
+	c, dsns := cacheWith(conn, &fakeSQLConn{})
+	if got, _ := c.QueryText(context.Background(), ci, "q"); got != "t" {
+		t.Fatalf("first probe: %q", got)
+	}
+	if _, err := c.QueryText(context.Background(), ci, "q"); err == nil {
+		t.Fatal("want the server error")
+	}
+	if got, err := c.QueryText(context.Background(), ci, "q"); err != nil || got != "f" {
+		t.Fatalf("third probe on the same connection: %q err=%v", got, err)
+	}
+	if len(*dsns) != 1 || conn.closes != 0 || conn.execs != 3 {
+		t.Errorf("want one dial, no close, three execs: dials=%d closes=%d execs=%d", len(*dsns), conn.closes, conn.execs)
+	}
+}
+
+// A waiter behind a query hung on the same node gives up at its own deadline.
+func TestConnCacheWaiterHonoursItsDeadline(t *testing.T) {
+	c, _ := cacheWith(&fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}})
+	if _, err := c.QueryText(context.Background(), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+	var e *cacheEntry
+	for _, v := range c.entries {
+		e = v
+	}
+	e.sem <- struct{}{}
+	defer e.unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := c.QueryText(ctx, ci, "q"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want DeadlineExceeded while the entry is held, got %v", err)
+	}
+}
+
+// Shutdown terminates every idle cached connection and refuses further queries.
+func TestConnCacheCloseTerminatesConnectionsAndRefusesUse(t *testing.T) {
+	a := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	b := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	c, _ := cacheWith(a, b)
+	other := ci
+	other.Host = "pg-2.pg-headless"
+	for _, n := range []ConnInfo{ci, other} {
+		if _, err := c.QueryText(context.Background(), n, "SELECT 1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if a.closes != 1 || b.closes != 1 {
+		t.Errorf("want each connection closed once, got %d and %d", a.closes, b.closes)
+	}
+	if _, err := c.QueryText(context.Background(), ci, "SELECT 1"); err == nil {
+		t.Error("a query after Close was accepted")
+	}
+}
+
+// An entry held by a hung query must not stall shutdown past its deadline, and must not
+// hold the cache lock while waiting.
+func TestConnCacheCloseHonoursItsDeadline(t *testing.T) {
+	conn := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	c, _ := cacheWith(conn)
+	if _, err := c.QueryText(context.Background(), ci, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	e := c.entries[ci.Host+":5432:repmgr:repmgr"]
+	if err := e.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.Close(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("want a deadline error naming the held entry, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited past its deadline on a held entry")
+	}
+	if conn.closes != 0 {
+		t.Error("a connection still in use was closed underneath its query")
+	}
+}
+
+// A node the agent stopped probing (a scaled-down ordinal, a departed upstream) is closed
+// and forgotten once idle past idleTTL; nodes still probed are untouched.
+func TestConnCacheEvictsIdleEntries(t *testing.T) {
+	gone := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	live := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {rows: [][][]byte{row("t")}}, {rows: [][][]byte{row("t")}}}}
+	c, _ := cacheWith(gone, live)
+	clock := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return clock }
+	c.idleTTL = time.Minute
+	departed := ci
+	departed.Host = "pg-2.pg-headless"
+	if _, err := c.QueryText(context.Background(), departed, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.QueryText(context.Background(), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+
+	clock = clock.Add(30 * time.Second)
+	if _, err := c.QueryText(context.Background(), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if gone.closes != 0 || len(c.entries) != 2 {
+		t.Fatalf("an entry idle less than idleTTL was evicted: closes=%d entries=%d", gone.closes, len(c.entries))
+	}
+
+	clock = clock.Add(31 * time.Second)
+	if _, err := c.QueryText(context.Background(), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if gone.closes != 1 {
+		t.Errorf("the idle entry's connection was not closed: closes=%d", gone.closes)
+	}
+	if _, ok := c.entries[departed.Host+":5432:repmgr:repmgr"]; ok {
+		t.Error("the idle entry is still cached")
+	}
+	if _, ok := c.entries[ci.Host+":5432:repmgr:repmgr"]; !ok {
+		t.Error("the entry in use was evicted")
+	}
+}
+
+// An idle entry whose lock is held (a query hung past idleTTL) is skipped, not waited on.
+func TestConnCacheEvictionSkipsAnEntryInUse(t *testing.T) {
+	held := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	other := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	c, _ := cacheWith(held, other)
+	clock := time.Unix(1_700_000_000, 0)
+	c.now = func() time.Time { return clock }
+	c.idleTTL = time.Minute
+	if _, err := c.QueryText(context.Background(), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+	e := c.entries[ci.Host+":5432:repmgr:repmgr"]
+	if err := e.lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer e.unlock()
+
+	clock = clock.Add(2 * time.Minute)
+	elsewhere := ci
+	elsewhere.Host = "pg-2.pg-headless"
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.QueryText(context.Background(), elsewhere, "q")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the sweep waited on an entry in use")
+	}
+	if held.closes != 0 {
+		t.Error("a connection in use was closed by the sweep")
+	}
+	if _, ok := c.entries[ci.Host+":5432:repmgr:repmgr"]; !ok {
+		t.Error("an entry in use was removed")
+	}
+}
+
+// A ConnCache not built by NewConnCache fails instead of running without a dialer,
+// clock or idle bound.
+func TestConnCacheRequiresInitialisation(t *testing.T) {
+	if _, err := (&ConnCache{}).QueryText(context.Background(), ci, "q"); err == nil {
+		t.Error("a zero ConnCache ran a query")
 	}
 }

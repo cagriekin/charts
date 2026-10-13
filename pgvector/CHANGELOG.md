@@ -8,9 +8,12 @@
   be a fresh `psql` process, and `psql` on the image's PATH is Debian's Perl wrapper, so each of
   the six to nine probes per tick paid a Perl start, a psql start, a TCP connect, authentication
   and a backend fork -- measured at ~0.6 CPU core per *idle* pod on slow vCPUs, an idle tax that
-  scales with tenant count. The agent now keeps one connection per node across ticks (re-dialled
-  on any error, every query under the per-probe deadline, one in-call retry on a fresh dial when a
-  reused socket fails so a peer that restarted between ticks costs nothing). Failover and fencing
+  scales with tenant count. The agent now keeps one connection per node across ticks (every query
+  under the per-probe deadline; re-dialled on a connection failure, kept on an ordinary SQL error;
+  one in-call retry on a fresh dial when a reused socket fails, with `TCP_USER_TIMEOUT` failing a
+  socket to a vanished peer within 3s so that retry still fits the deadline; connections idle for
+  5 minutes, such as to a scaled-down ordinal, are closed; sessions are terminated cleanly on
+  shutdown). Failover and fencing
   timings are unchanged; the sessions appear as `application_name = pg-ha-agent` in
   `pg_stat_activity`, one from each agent on every node. `ha.image.tag` and the etcd bootstrap
   image move to `2.2.0-pg18`. **The pods roll once.**

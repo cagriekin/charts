@@ -625,9 +625,12 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 	return nil
 }
 
-// isDuplicateSlot mirrors pg.IsDuplicateSlot. Duplicated for the same reason
-// validSlotName is: mechanism deliberately does not import internal/pg (that dependency
-// runs the other way). Kept narrow so it cannot swallow an unrelated failure.
+// isDuplicateSlot is the psql-transport counterpart of pg.IsDuplicateSlot. The clone-time
+// create runs through a psql process, which surfaces the server error only as text (no
+// SQLSTATE), so it matches the literal phrase PostgreSQL uses for duplicate_object on a
+// slot. Kept here rather than imported because mechanism deliberately does not import
+// internal/pg (that dependency runs the other way). Kept narrow so it cannot swallow an
+// unrelated failure.
 func isDuplicateSlot(out string, err error) bool {
 	if err == nil {
 		return false
