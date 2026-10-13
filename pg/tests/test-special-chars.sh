@@ -26,11 +26,17 @@ kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply
 # (Init:CreateContainerConfigError), so `helm --wait` sat for its full timeout and the suite died
 # before its first assertion. It gets the special-character password too, which is the point of
 # the suite: the monitoring credential goes through the same substitution as the others.
+# app-password and pgpool-check-password are required keys of the BYO secret since 2.5.0, for
+# the same reason, and carry the special-character password too: they travel through the
+# agent's role provisioning (a SCRAM verifier), the pool_passwd splice and the
+# wait-check-role login.
 kubectl create secret generic pg-special-creds -n "${NAMESPACE}" \
   --from-literal=username=testuser \
   --from-literal=password="${SPECIAL_PASSWORD}" \
   --from-literal=database=testdb \
   --from-literal=monitoring-password="${SPECIAL_PASSWORD}" \
+  --from-literal=app-password="${SPECIAL_PASSWORD}" \
+  --from-literal=pgpool-check-password="${SPECIAL_PASSWORD}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
@@ -59,6 +65,15 @@ via_pgpool=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
   env PGPASSWORD="${SPECIAL_PASSWORD}" psql -h "${pgpool_svc}" -p 9999 \
   -U testuser -d testdb -t -A -c "SELECT 1" 2>/dev/null)
 assert_eq "query through pgpool with special-char password" "1" "${via_pgpool}"
+
+# The application role (postgresql.app) with the same password, through pgpool: the agent
+# provisioned it from APP_PASSWORD and pgpool accepts it via its own pool_passwd entry. Reaching
+# this point at all also means pgpool's wait-check-role init container logged in as the check
+# role with the special-character password.
+via_pgpool_app=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
+  env PGPASSWORD="${SPECIAL_PASSWORD}" psql -h "${pgpool_svc}" -p 9999 \
+  -U app_user -d testdb -t -A -c "SELECT current_user" 2>/dev/null)
+assert_eq "application role logs in through pgpool with special-char password" "app_user" "${via_pgpool_app}"
 
 # Exporter scrape: validates the percent-encoded DSN file and the
 # quote-doubled postgres_exporter.yml
