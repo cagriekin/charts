@@ -11,10 +11,14 @@
   converted** (demoted to `NOSUPERUSER`, password reset). Rename the value if you already use the
   name. A name that collides with `postgresql.username`, `ha.username`, the monitoring user or a
   `postgresql.roles[]` entry is refused at render time.
-- **`app_user` becomes the owner of `postgresql.database`.** Objects already in that database keep
-  their current owner, so give `app_user` access to them (`GRANT`, or `REASSIGN OWNED BY` the
-  superuser) before you point applications at it. Until you do, applications keep working as
-  `postgresql.username`. Nothing forces them to switch.
+- **`app_user` becomes the owner of `postgresql.database`, unless that is `postgres` (the
+  default).** The maintenance database keeps its owner: whoever owns it could drop it or set
+  per-database settings that every superuser session there inherits. On `postgres`, `app_user`
+  gets `CONNECT` and `USAGE, CREATE` on schema `public` instead. Either way, objects already
+  in the database keep their current owner, so give `app_user` access to them (`GRANT`, or
+  `REASSIGN OWNED BY` the superuser when it owns the database) before you point applications at
+  it. Until you do, applications keep working as `postgresql.username`. Nothing forces them to
+  switch.
 - **With `postgresql.existingSecret`, the Secret needs two new keys**: `app-password` and
   `pgpool-check-password`, or set `postgresql.existingSecret.appPasswordKey` /
   `pgpoolCheckPasswordKey`. Generated Secrets get both keys automatically.
@@ -33,7 +37,8 @@
   (every agent holds one session to every node; standalone keeps PostgreSQL's 3), and
   `reserved_connections` to `2 x pgpool.replicaCount + 1`, for pgpool's checks. Applications get
   the rest. The postgresql ConfigMap therefore renders on every install.
-- **`postgresql.app`: a non-superuser application role** that owns `postgresql.database`. All
+- **`postgresql.app`: a non-superuser application role** that owns `postgresql.database` (on
+  `postgres`, the default, it gets `CONNECT` and `USAGE, CREATE` on schema `public` instead). All
   superusers share one emergency pool (`superuser_reserved_connections`), so an application
   logged in as the superuser can use up the slots the agent needs. Point applications at
   `app_user` through pgpool, which now accepts it, or directly. The password is in the release

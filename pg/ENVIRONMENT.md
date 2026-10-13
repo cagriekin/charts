@@ -15,7 +15,7 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `PGDATA` | string | yes | `/var/lib/postgresql/data/pgdata` | postgres / entrypoint |
 | `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool, agent (required: superuser for role provisioning over the local socket) |
 | `POSTGRES_PASSWORD` | string | yes | secret (`password`) | entrypoint |
-| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint, agent (required: database for role provisioning; the application role owns it) |
+| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint, agent (required: database for role provisioning; the application role owns it, unless it is `postgres`) |
 | `APP_USER` | string | yes | `postgresql.app.username` (`app_user`) | agent (provisions the non-superuser application role on the primary), standalone postStart (same) |
 | `APP_PASSWORD` | string | yes | secret (`app-password`, or `postgresql.existingSecret.appPasswordKey`) | agent, standalone postStart |
 | `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` (`pgpool_check`) | agent (provisions pgpool's check role: `pg_monitor`, `pg_use_reserved_connections`), standalone postStart (same) |

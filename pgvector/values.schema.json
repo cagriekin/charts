@@ -296,7 +296,7 @@
         },
         "app": {
           "type": "object",
-          "description": "Application role: a non-superuser LOGIN that owns postgresql.database, provisioned by the chart.",
+          "description": "Application role: a non-superuser LOGIN provisioned by the chart. Owns postgresql.database, except the maintenance database \"postgres\", where it gets CONNECT and USAGE, CREATE on schema public.",
           "required": [
             "username"
           ],

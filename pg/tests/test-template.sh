@@ -1807,6 +1807,20 @@ assert_not_contains "#298: ...in the same awk pass, not a pre-pass that can drop
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
+# The standalone postStart hook provisions the managed roles with its own copy of the SQL the
+# agent runs in HA mode (pg.EnsureRole, images/pg-ha/agent/internal/pg/roles.go): the image and
+# the chart cannot share one file. Every dynamic statement must appear in both, in both
+# directions, so the two definitions of a managed role cannot drift apart.
+roles_go="$(cd "${SCRIPT_DIR}/../.." && pwd)/images/pg-ha/agent/internal/pg/roles.go"
+standalone_hook=$(helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --show-only templates/statefulset.yaml 2>&1)
+agent_formats=$(grep -o "format('[^']*'" "${roles_go}" | sort -u)
+hook_formats=$(grep -o "format('[^']*'" <<< "${standalone_hook}" | sort -u)
+assert_gt "managed roles: roles.go has dynamic statements to compare" "$(grep -c . <<< "${agent_formats}")" "5"
+assert_eq "managed roles: the standalone hook runs exactly the agent's role statements" "${agent_formats}" "${hook_formats}"
+assert_contains "managed roles: the hook guards the public-schema grant like the agent" "${standalone_hook}" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
+assert_contains "managed roles: roles.go guards the public-schema grant" "$(cat "${roles_go}")" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
+
 # Test: with no postgresql.configuration the ConfigMap still renders and is wired in, since it
 # carries reserved-connections.conf. The include_dir strip that #107 needed when conf.d could
 # disappear is gone with that possibility: setup-config only ever appends.

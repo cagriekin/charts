@@ -253,11 +253,6 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
-{{- /* The two chart-managed non-superuser roles. Both are always provisioned (by the agent
-       on the primary in HA mode, by the postStart hook in standalone), so their names are
-       required and restricted to plain lower-case identifiers: they travel through psql
-       variables, pgpool.conf and pool_passwd, and a plain identifier needs no quoting in
-       any of them. */ -}}
 {{- /* Backend TLS (pgpool -> PostgreSQL) via libpq env (#110), shared by the pgpool
        container and its wait-check-role init container so the wait connects exactly as
        pgpool's checks will. Under PostgreSQL mTLS, backendClientCert supplies the client
@@ -279,6 +274,11 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end -}}
 
+{{- /* The two chart-managed non-superuser roles. Both are always provisioned (by the agent
+       on the primary in HA mode, by the postStart hook in standalone), so their names are
+       required and restricted to plain lower-case identifiers: they travel through psql
+       variables, pgpool.conf and pool_passwd, and a plain identifier needs no quoting in
+       any of them. */ -}}
 {{- define "pg.appUsername" -}}
 {{- $u := required "postgresql.app.username is required: the chart always provisions the application role" (.Values.postgresql.app).username | toString -}}
 {{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
@@ -398,10 +398,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- $o := $d.owner | toString -}}
     {{- if not (regexMatch $idRe $o) }}{{- fail (printf "postgresql.databases[%s].owner: invalid role name %q" $n $o) }}{{- end -}}
     {{- if and (not (has $o $roleNames)) (ne $o $.Values.postgresql.username) (ne $o (include "pg.appUsername" $)) }}{{- fail (printf "postgresql.databases[%s].owner %q must be declared in postgresql.roles[], or be the primary user or the application role (postgresql.app.username)" $n $o) }}{{- end -}}
-    {{- /* The chart gives postgresql.database to the application role on every primary start;
-           a different owner here would be re-applied by the roles Job on every upgrade, and the
+    {{- /* The chart gives postgresql.database to the application role on every primary start
+           (except the maintenance database "postgres", whose ownership it leaves alone); a
+           different owner here would be re-applied by the roles Job on every upgrade, and the
            two would flip ownership back and forth. */ -}}
-    {{- if and (eq $n ($.Values.postgresql.database | toString)) (ne $o (include "pg.appUsername" $)) }}{{- fail (printf "postgresql.databases[%s].owner is %q, but %q is postgresql.database, which the chart assigns to the application role %q. Drop the owner from this entry or set it to %q." $n $o $n (include "pg.appUsername" $) (include "pg.appUsername" $)) }}{{- end -}}
+    {{- if and (eq $n ($.Values.postgresql.database | toString)) (ne $n "postgres") (ne $o (include "pg.appUsername" $)) }}{{- fail (printf "postgresql.databases[%s].owner is %q, but %q is postgresql.database, which the chart assigns to the application role %q. Drop the owner from this entry or set it to %q." $n $o $n (include "pg.appUsername" $) (include "pg.appUsername" $)) }}{{- end -}}
   {{- end -}}
   {{- range $e := ($d.extensions | default list) -}}
     {{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_-]*$" ($e | toString)) }}{{- fail (printf "postgresql.databases[%s].extensions: invalid extension name %q" $n $e) }}{{- end -}}

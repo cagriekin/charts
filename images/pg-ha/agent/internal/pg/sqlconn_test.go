@@ -89,7 +89,7 @@ func TestConnCacheReusesTheConnectionAcrossProbes(t *testing.T) {
 	conn := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {rows: [][][]byte{row("0/3000060")}}}}
 	c, dsns := cacheWith(conn)
 	for _, want := range []string{"t", "0/3000060"} {
-		got, err := c.QueryText(probeCtx(t), ci, "SELECT 1")
+		got, err := c.QueryText(probeCtx(t), ci, QueryRead, "SELECT 1")
 		if err != nil || got != want {
 			t.Fatalf("got %q err=%v, want %q", got, err, want)
 		}
@@ -105,10 +105,10 @@ func TestConnCacheRetriesOnceOnAStaleConnection(t *testing.T) {
 	stale := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {err: errors.New("unexpected EOF")}}}
 	fresh := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("f")}}}}
 	c, dsns := cacheWith(stale, fresh)
-	if got, _ := c.QueryText(probeCtx(t), ci, "q"); got != "t" {
+	if got, _ := c.QueryText(probeCtx(t), ci, QueryRead, "q"); got != "t" {
 		t.Fatalf("first probe: %q", got)
 	}
-	got, err := c.QueryText(probeCtx(t), ci, "q")
+	got, err := c.QueryText(probeCtx(t), ci, QueryRead, "q")
 	if err != nil || got != "f" {
 		t.Fatalf("after the stale failure want the fresh answer, got %q err=%v", got, err)
 	}
@@ -122,7 +122,7 @@ func TestConnCacheRetriesOnceOnAStaleConnection(t *testing.T) {
 func TestConnCacheDoesNotRetryAFreshDial(t *testing.T) {
 	fresh := &fakeSQLConn{replies: []fakeReply{{err: errors.New("connection refused")}}}
 	c, dsns := cacheWith(fresh, &fakeSQLConn{})
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err == nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err == nil {
 		t.Fatal("want the error")
 	}
 	if len(*dsns) != 1 || fresh.closes != 1 {
@@ -135,11 +135,11 @@ func TestConnCacheRedialsAClosedConnection(t *testing.T) {
 	first := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
 	second := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
 	c, dsns := cacheWith(first, second)
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	first.isClosed = true
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	if len(*dsns) != 2 || second.execs != 1 {
@@ -154,7 +154,7 @@ func TestConnCacheDialHonoursTheCallerDeadline(t *testing.T) {
 	c, dsns := cacheWith(stale, &fakeSQLConn{})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if _, err := c.QueryText(ctx, ci, "q"); err != nil {
+	if _, err := c.QueryText(ctx, ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains((*dsns)[0], "connect_timeout=3") && !strings.Contains((*dsns)[0], "connect_timeout=2") {
@@ -163,7 +163,7 @@ func TestConnCacheDialHonoursTheCallerDeadline(t *testing.T) {
 	expired, ecancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer ecancel()
 	time.Sleep(time.Millisecond)
-	if _, err := c.QueryText(expired, ci, "q"); err == nil {
+	if _, err := c.QueryText(expired, ci, QueryRead, "q"); err == nil {
 		t.Fatal("want the deadline error")
 	}
 	if len(*dsns) != 1 {
@@ -187,7 +187,7 @@ func TestConnCacheKeepsThePasswordOutOfTheDSN(t *testing.T) {
 	c, dsns, passwords := cacheWithPasswords(&fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}})
 	withQuote := ci
 	withQuote.Password = `a\'b c`
-	if _, err := c.QueryText(probeCtx(t), withQuote, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), withQuote, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains((*dsns)[0], "password") || strings.Contains((*dsns)[0], "b c") {
@@ -239,13 +239,13 @@ func TestConnCacheKeepsTheConnectionOnAServerError(t *testing.T) {
 		{rows: [][][]byte{row("f")}},
 	}}
 	c, dsns := cacheWith(conn, &fakeSQLConn{})
-	if got, _ := c.QueryText(probeCtx(t), ci, "q"); got != "t" {
+	if got, _ := c.QueryText(probeCtx(t), ci, QueryRead, "q"); got != "t" {
 		t.Fatalf("first probe: %q", got)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err == nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err == nil {
 		t.Fatal("want the server error")
 	}
-	if got, err := c.QueryText(probeCtx(t), ci, "q"); err != nil || got != "f" {
+	if got, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil || got != "f" {
 		t.Fatalf("third probe on the same connection: %q err=%v", got, err)
 	}
 	if len(*dsns) != 1 || conn.closes != 0 || conn.execs != 3 {
@@ -256,7 +256,7 @@ func TestConnCacheKeepsTheConnectionOnAServerError(t *testing.T) {
 // A waiter behind a query hung on the same node gives up at its own deadline.
 func TestConnCacheWaiterHonoursItsDeadline(t *testing.T) {
 	c, _ := cacheWith(&fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}})
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	var e *cacheEntry
@@ -267,7 +267,7 @@ func TestConnCacheWaiterHonoursItsDeadline(t *testing.T) {
 	defer e.unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := c.QueryText(ctx, ci, "q"); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := c.QueryText(ctx, ci, QueryRead, "q"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want DeadlineExceeded while the entry is held, got %v", err)
 	}
 }
@@ -280,7 +280,7 @@ func TestConnCacheCloseTerminatesConnectionsAndRefusesUse(t *testing.T) {
 	other := ci
 	other.Host = "pg-2.pg-headless"
 	for _, n := range []ConnInfo{ci, other} {
-		if _, err := c.QueryText(probeCtx(t), n, "SELECT 1"); err != nil {
+		if _, err := c.QueryText(probeCtx(t), n, QueryRead, "SELECT 1"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -290,7 +290,7 @@ func TestConnCacheCloseTerminatesConnectionsAndRefusesUse(t *testing.T) {
 	if a.closes != 1 || b.closes != 1 {
 		t.Errorf("want each connection closed once, got %d and %d", a.closes, b.closes)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, "SELECT 1"); err == nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "SELECT 1"); err == nil {
 		t.Error("a query after Close was accepted")
 	}
 }
@@ -300,7 +300,7 @@ func TestConnCacheCloseTerminatesConnectionsAndRefusesUse(t *testing.T) {
 func TestConnCacheCloseHonoursItsDeadline(t *testing.T) {
 	conn := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
 	c, _ := cacheWith(conn)
-	if _, err := c.QueryText(probeCtx(t), ci, "SELECT 1"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
 	e := c.entries[ci.Host+":5432:repmgr:repmgr"]
@@ -337,15 +337,15 @@ func TestConnCacheEvictsIdleEntries(t *testing.T) {
 	c.idleTTL = time.Minute
 	departed := ci
 	departed.Host = "pg-2.pg-headless"
-	if _, err := c.QueryText(probeCtx(t), departed, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), departed, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 
 	clock = clock.Add(30 * time.Second)
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	if gone.closes != 0 || len(c.entries) != 2 {
@@ -353,7 +353,7 @@ func TestConnCacheEvictsIdleEntries(t *testing.T) {
 	}
 
 	clock = clock.Add(31 * time.Second)
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	c.evicting.Wait() // the close runs in the background
@@ -376,7 +376,7 @@ func TestConnCacheEvictionSkipsAnEntryInUse(t *testing.T) {
 	clock := time.Unix(1_700_000_000, 0)
 	c.now = func() time.Time { return clock }
 	c.idleTTL = time.Minute
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	e := c.entries[ci.Host+":5432:repmgr:repmgr"]
@@ -390,7 +390,7 @@ func TestConnCacheEvictionSkipsAnEntryInUse(t *testing.T) {
 	elsewhere.Host = "pg-2.pg-headless"
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.QueryText(probeCtx(t), elsewhere, "q")
+		_, err := c.QueryText(probeCtx(t), elsewhere, QueryRead, "q")
 		done <- err
 	}()
 	select {
@@ -412,7 +412,7 @@ func TestConnCacheEvictionSkipsAnEntryInUse(t *testing.T) {
 // A ConnCache not built by NewConnCache fails instead of running without a dialer,
 // clock or idle bound.
 func TestConnCacheRequiresInitialisation(t *testing.T) {
-	if _, err := (&ConnCache{}).QueryText(context.Background(), ci, "q"); err == nil {
+	if _, err := (&ConnCache{}).QueryText(context.Background(), ci, QueryRead, "q"); err == nil {
 		t.Error("a zero ConnCache ran a query")
 	}
 }
@@ -426,13 +426,13 @@ func TestConnCacheKeepsTheFreshConnectionOnAServerErrorAfterRetry(t *testing.T) 
 		{rows: [][][]byte{row("f")}},
 	}}
 	c, dsns := cacheWith(stale, fresh)
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); !IsDuplicateSlot(err) {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); !IsDuplicateSlot(err) {
 		t.Fatalf("want the server error from the retry, got %v", err)
 	}
-	if got, err := c.QueryText(probeCtx(t), ci, "q"); err != nil || got != "f" {
+	if got, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil || got != "f" {
 		t.Fatalf("next probe on the fresh connection: %q err=%v", got, err)
 	}
 	if fresh.closes != 0 || len(*dsns) != 2 {
@@ -445,7 +445,7 @@ func TestConnCacheKeepsTheFreshConnectionOnAServerErrorAfterRetry(t *testing.T) 
 func TestConnCacheQueryWaitingThroughCloseDoesNotDial(t *testing.T) {
 	conn := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
 	c, dsns := cacheWith(conn)
-	if _, err := c.QueryText(probeCtx(t), ci, "SELECT 1"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "SELECT 1"); err != nil {
 		t.Fatal(err)
 	}
 	e := c.entries[ci.Host+":5432:repmgr:repmgr"]
@@ -454,7 +454,7 @@ func TestConnCacheQueryWaitingThroughCloseDoesNotDial(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.QueryText(probeCtx(t), ci, "SELECT 1")
+		_, err := c.QueryText(probeCtx(t), ci, QueryRead, "SELECT 1")
 		done <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -483,7 +483,7 @@ func TestConnCacheQueryWaitingThroughCloseDoesNotDial(t *testing.T) {
 
 func TestConnCacheRequiresADeadline(t *testing.T) {
 	c, dsns := cacheWith(&fakeSQLConn{})
-	if _, err := c.QueryText(context.Background(), ci, "q"); err == nil {
+	if _, err := c.QueryText(context.Background(), ci, QueryRead, "q"); err == nil {
 		t.Fatal("a query without a deadline was accepted")
 	}
 	if len(*dsns) != 0 {
@@ -510,16 +510,16 @@ func TestConnCacheEvictionCloseDoesNotBlockTheProbe(t *testing.T) {
 	}
 	departed := ci
 	departed.Host = "pg-2.pg-headless"
-	if _, err := c.QueryText(probeCtx(t), departed, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), departed, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
 	clock = clock.Add(2 * time.Minute)
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.QueryText(probeCtx(t), ci, "q")
+		_, err := c.QueryText(probeCtx(t), ci, QueryRead, "q")
 		done <- err
 	}()
 	select {
@@ -547,4 +547,28 @@ type stallingCloseConn struct {
 func (s *stallingCloseConn) close(ctx context.Context) {
 	<-s.release
 	s.fakeSQLConn.close(ctx)
+}
+
+// A write whose reused socket fails is NOT re-sent: the server may already have run it with
+// the reply lost, and a second run would change the answer (a dropped slot reads as nothing
+// to drop) or repeat work. The stale connection is still dropped, so the next call dials.
+func TestConnCacheDoesNotRetryAWriteOnAStaleConnection(t *testing.T) {
+	stale := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {err: errors.New("unexpected EOF")}}}
+	fresh := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
+	c, dsns := cacheWith(stale, fresh)
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err == nil {
+		t.Fatal("a write on a failed reused socket must return the error, not retry")
+	}
+	if stale.closes != 1 || len(*dsns) != 1 || fresh.execs != 0 {
+		t.Errorf("want the stale conn dropped and no second dial: closes=%d dials=%d freshExecs=%d", stale.closes, len(*dsns), fresh.execs)
+	}
+	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err != nil {
+		t.Fatalf("the next call must dial fresh and succeed: %v", err)
+	}
+	if len(*dsns) != 2 {
+		t.Errorf("want the next call to dial: dials=%d", len(*dsns))
+	}
 }

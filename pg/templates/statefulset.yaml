@@ -1161,7 +1161,8 @@ spec:
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- /* Chart-managed non-superuser roles (postgresql.app, pgpool.checkUser):
                                standalone has no agent, so this hook provisions them on every start,
-                               the same definition pg.EnsureRole asserts in HA mode -- created if
+                               the same definition pg.EnsureRole asserts in HA mode (test-template.sh
+                               checks the two stay identical) -- created if
                                absent, then LOGIN without any elevated attribute, the password from
                                the Secret, and the kind's privileges. Passwords reach psql only
                                through the environment (\getenv), statement logging is lowered
@@ -1199,6 +1200,11 @@ spec:
                         EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', r.name, r.pw);
                         IF r.kind = 'pgpool-check' THEN
                           EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', r.name);
+                        ELSIF current_setting('myvars.db') = 'postgres' THEN
+                          EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_setting('myvars.db'), r.name);
+                          IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
+                            EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', r.name);
+                          END IF;
                         ELSE
                           EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('myvars.db'), r.name);
                         END IF;

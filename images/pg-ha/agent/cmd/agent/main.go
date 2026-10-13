@@ -317,9 +317,11 @@ type agent struct {
 	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
 	// flips true on success, so a transient failure retries the next primary tick.
 	rehashedManagedUsers atomic.Bool
-	// managedRolesDone latches once ensureManagedRolesOnce has converged (or hit a
-	// permanent error) in this process.
-	managedRolesDone atomic.Bool
+	// managedRoleDone latches, per managed role (app, pgpool check), once
+	// ensureManagedRolesOnce has provisioned it or hit a permanent error in this process.
+	managedRoleDone [2]atomic.Bool
+	// roleExec runs the managed-role provisioning psql (pg.OSExec in production).
+	roleExec pg.StdinExec
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -380,15 +382,16 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		return nil, err
 	}
 	return &agent{
-		cfg:    cfg,
-		log:    log,
-		dcs:    d,
-		kube:   kube,
-		mech:   mech,
-		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
-		prober: prober,
-		conns:  conns,
-		metr:   observe.New(),
+		cfg:      cfg,
+		log:      log,
+		dcs:      d,
+		kube:     kube,
+		mech:     mech,
+		sup:      process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
+		prober:   prober,
+		roleExec: pg.OSExec{},
+		conns:    conns,
+		metr:     observe.New(),
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
 		health:             &selfHealthTracker{grace: cfg.LeaseDuration},
@@ -2814,41 +2817,37 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 
 // ensureManagedRolesOnce provisions the chart's non-superuser login roles -- the
 // application role and pgpool's check role -- on this node once it is serving read-write.
-// Standbys get them by replication. Runs at most once per process, latching on success so
-// a transient failure retries on the next primary tick, and on a permanent failure (a
-// password the agent cannot hash) so it is reported once instead of every tick. Outside
+// Standbys get them by replication. Each role runs at most once per process, latching on
+// success so a transient failure retries on the next primary tick, and on a permanent
+// failure (a password the agent cannot hash) so it is reported once instead of every tick.
+// The latch is per role, so one role's retries never repeat the other. Outside
 // opMu and the fence budget for the same reason as the re-hash above.
 //
 // pgpool's init container waits until the check role can log in, so until this converges
 // a new pgpool pod stays in Init -- that, and the log line here, are where a failure shows.
 func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
-	if a.managedRolesDone.Load() {
-		return
-	}
 	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	ok, permanent := true, false
-	for _, r := range []pg.ManagedRole{
+	for i, r := range []pg.ManagedRole{
 		{Name: a.cfg.AppUser, Password: a.cfg.AppPassword, Kind: pg.RoleApp},
 		{Name: a.cfg.PgpoolCheckUser, Password: a.cfg.PgpoolCheckPassword, Kind: pg.RolePgpoolCheck},
 	} {
-		err := pg.EnsureRole(rctx, pg.OSExec{}, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
+		// Latched per role: one role's transient failure must not re-run (and re-log) a role
+		// that already converged or failed permanently.
+		if a.managedRoleDone[i].Load() {
+			continue
+		}
+		err := pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
 		switch {
 		case err == nil:
+			a.managedRoleDone[i].Store(true)
+			a.log.Info("managed role provisioned", "role", r.Name, "kind", r.Kind)
 		case pg.IsPermanentRoleError(err):
+			a.managedRoleDone[i].Store(true)
 			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)
-			permanent = true
 		default:
 			a.log.Warn("managed role provisioning failed (retries next primary tick)", "role", r.Name, "err", err)
-			ok = false
 		}
-	}
-	if !ok {
-		return
-	}
-	a.managedRolesDone.Store(true)
-	if !permanent {
-		a.log.Info("managed roles provisioned", "app", a.cfg.AppUser, "pgpoolCheck", a.cfg.PgpoolCheckUser)
 	}
 }
 

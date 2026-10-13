@@ -521,7 +521,7 @@ func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
 // errQuerier fails every query with err, the way ConnCache surfaces a server error.
 type errQuerier struct{ err error }
 
-func (q errQuerier) QueryText(context.Context, ConnInfo, string) (string, error) {
+func (q errQuerier) QueryText(context.Context, ConnInfo, QueryKind, string) (string, error) {
 	return "", q.err
 }
 
@@ -1021,5 +1021,42 @@ func TestNewProberRequiresATransport(t *testing.T) {
 	p, err := NewProber(NewConnCache())
 	if err != nil || p.SQL == nil || p.Timeout != 10*time.Second {
 		t.Errorf("NewProber(NewConnCache()) = %+v, %v", p, err)
+	}
+}
+
+// kindRecorder records the QueryKind of every query.
+type kindRecorder struct{ kinds []QueryKind }
+
+func (k *kindRecorder) QueryText(_ context.Context, _ ConnInfo, kind QueryKind, _ string) (string, error) {
+	k.kinds = append(k.kinds, kind)
+	return "", nil
+}
+
+// Every statement that changes server state is sent as a write, so the transport never
+// re-sends it after a lost reply; probes are reads.
+func TestProberClassifiesWrites(t *testing.T) {
+	ctx := context.Background()
+	for name, c := range map[string]struct {
+		run  func(p *Prober)
+		want []QueryKind
+	}{
+		"Restartpoint":                {func(p *Prober) { _ = p.Restartpoint(ctx, ConnInfo{}) }, []QueryKind{QueryWrite}},
+		"CreatePhysicalSlot":          {func(p *Prober) { _ = p.CreatePhysicalSlot(ctx, ConnInfo{}, "pg_ha_slot_1") }, []QueryKind{QueryWrite}},
+		"DropPhysicalSlotIfInactive":  {func(p *Prober) { _, _ = p.DropPhysicalSlotIfInactive(ctx, ConnInfo{}, "pg_ha_slot_1") }, []QueryKind{QueryWrite}},
+		"SetSynchronizedStandbySlots": {func(p *Prober) { _ = p.SetSynchronizedStandbySlots(ctx, ConnInfo{}, []string{"pg_ha_slot_1"}) }, []QueryKind{QueryWrite, QueryWrite}},
+		"InRecovery":                  {func(p *Prober) { _, _, _ = p.InRecovery(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"PhysicalSlots":               {func(p *Prober) { _, _ = p.PhysicalSlots(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+	} {
+		k := &kindRecorder{}
+		c.run(&Prober{SQL: k, Timeout: time.Second})
+		if len(k.kinds) != len(c.want) {
+			t.Errorf("%s: kinds = %v, want %v", name, k.kinds, c.want)
+			continue
+		}
+		for i := range c.want {
+			if k.kinds[i] != c.want[i] {
+				t.Errorf("%s: kinds = %v, want %v", name, k.kinds, c.want)
+			}
+		}
 	}
 }

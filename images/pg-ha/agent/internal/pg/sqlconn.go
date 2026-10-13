@@ -19,8 +19,21 @@ import (
 // Every parser in this package was written against that shape, so the transport
 // underneath can change without touching a single parser (#364).
 type Querier interface {
-	QueryText(ctx context.Context, ci ConnInfo, sql string) (string, error)
+	QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error)
 }
+
+// QueryKind says whether a statement may be sent twice. ConnCache retries a query whose
+// reused socket failed on a fresh connection; for a read that is always safe, but a write
+// may already have run on the server when the reply was lost, and running it again changes
+// what the caller sees (a slot already dropped reads as "nothing to drop") or repeats work
+// (CHECKPOINT, ALTER SYSTEM). Writes therefore fail on the stale socket and the next tick
+// runs them on a fresh connection, after re-reading state.
+type QueryKind int
+
+const (
+	QueryRead QueryKind = iota
+	QueryWrite
+)
 
 // ExecQuerier is the original transport: a fresh `psql` process per query. It stays for
 // the unit tests, whose fakes answer by inspecting the psql argument list, and as the
@@ -33,7 +46,7 @@ type ExecQuerier struct {
 	Timeout time.Duration
 }
 
-func (q ExecQuerier) QueryText(ctx context.Context, ci ConnInfo, sql string) (string, error) {
+func (q ExecQuerier) QueryText(ctx context.Context, ci ConnInfo, _ QueryKind, sql string) (string, error) {
 	if q.Timeout <= 0 {
 		return "", fmt.Errorf("ExecQuerier: Timeout must be positive, got %s", q.Timeout)
 	}
@@ -83,9 +96,10 @@ func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
 // TCP_USER_TIMEOUT (tcpUserTimeout) bounds a socket whose peer has VANISHED -- a pod
 // recreated on a new IP while the old IP silently drops packets: the kernel fails the
 // socket once sent data has gone unacknowledged that long, well inside the probe
-// deadline, so the query that fails on the REUSED connection is retried once on a fresh
-// dial within the same call and the tick sees what a fresh psql would have seen. A slow
-// query is not affected: the server still acknowledges what was sent.
+// deadline, so a READ that fails on the REUSED connection is retried once on a fresh dial
+// within the same call and the tick sees what a fresh psql would have seen (a write is
+// not re-sent; see QueryKind). A slow query is not affected: the server still
+// acknowledges what was sent.
 //
 // A server-side ERROR keeps the connection (the session is still usable); a FATAL or a
 // transport error drops it. Entries idle longer than idleTTL -- a scaled-down ordinal, an
@@ -187,7 +201,7 @@ func NewConnCache() *ConnCache {
 
 // QueryText implements Querier. The deadline is the caller's (Prober sets it from its
 // Timeout); connect_timeout mirrors it so a dial never outlives the probe either.
-func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (string, error) {
+func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error) {
 	if c.dial == nil || c.now == nil || c.idleTTL <= 0 {
 		return "", errors.New("connection cache is not initialised (use NewConnCache)")
 	}
@@ -212,9 +226,11 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 		c.entries[key] = e
 	}
 	e.lastUsed = now
+	// Added under c.mu, which Close takes to set isClosed before it waits: an Add after
+	// the unlock could land after Close's Wait returned and leak a close past shutdown.
+	c.evicting.Add(len(evicted))
 	c.mu.Unlock()
 	for _, old := range evicted {
-		c.evicting.Add(1)
 		go func(old *cacheEntry) {
 			defer c.evicting.Done()
 			cctx, cancel := context.WithTimeout(context.Background(), evictCloseTimeout)
@@ -236,9 +252,10 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 	if closed {
 		return "", errors.New("connection cache is closed")
 	}
-	// A reused socket that fails may only mean the peer restarted since the last tick, so
-	// it gets one fresh dial inside the same deadline: the probe then reports what a fresh
-	// connection sees rather than a stale one's error. A fresh dial is never retried.
+	// A reused socket that fails may only mean the peer restarted since the last tick, so a
+	// READ gets one fresh dial inside the same deadline: the probe then reports what a fresh
+	// connection sees rather than a stale one's error. A fresh dial is never retried, and
+	// neither is a write (see QueryKind).
 	for {
 		reused := e.conn != nil && !e.conn.closed()
 		if !reused {
@@ -254,7 +271,7 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 			return "", err
 		}
 		c.drop(ctx, e)
-		if !reused || ctx.Err() != nil {
+		if !reused || kind != QueryRead || ctx.Err() != nil {
 			return "", err
 		}
 	}

@@ -4354,14 +4354,14 @@ func TestUpstreamHost(t *testing.T) {
 // saturatingQuerier refuses every connection the way a node at max_connections does.
 type saturatingQuerier struct{}
 
-func (saturatingQuerier) QueryText(context.Context, pg.ConnInfo, string) (string, error) {
+func (saturatingQuerier) QueryText(context.Context, pg.ConnInfo, pg.QueryKind, string) (string, error) {
 	return "", &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
 }
 
 // refusingQuerier fails every connection the way a dead node does.
 type refusingQuerier struct{}
 
-func (refusingQuerier) QueryText(context.Context, pg.ConnInfo, string) (string, error) {
+func (refusingQuerier) QueryText(context.Context, pg.ConnInfo, pg.QueryKind, string) (string, error) {
 	return "", errors.New("dial tcp: connect: connection refused")
 }
 
@@ -4452,5 +4452,74 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 	}
 	if !a.trackPeerSaturation("pg-1", true, t0.Add(2*grace)) {
 		t.Error("a new saturation episode must start a fresh grace")
+	}
+}
+
+// roleRunExec fails provisioning for the roles named in fail and counts runs per role.
+type roleRunExec struct {
+	fail map[string]bool
+	runs map[string]int
+}
+
+func (r *roleRunExec) RunStdin(_ context.Context, _ []string, _, _ string, args ...string) error {
+	role := ""
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "r="); ok {
+			role = v
+		}
+	}
+	r.runs[role]++
+	if r.fail[role] {
+		return errors.New("psql: transient failure")
+	}
+	return nil
+}
+
+// A role that converged is not re-run while the other keeps failing, and a permanent
+// failure (a password needing SASLprep) is latched instead of retried every tick.
+func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
+	ex := &roleRunExec{fail: map[string]bool{"pgpool_check": true}, runs: map[string]int{}}
+	a := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pw",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		roleExec: ex,
+	}
+	for i := 0; i < 3; i++ {
+		a.ensureManagedRolesOnce(context.Background())
+	}
+	if ex.runs["app_user"] != 1 {
+		t.Errorf("the converged app role ran %d times, want 1", ex.runs["app_user"])
+	}
+	if ex.runs["pgpool_check"] != 3 {
+		t.Errorf("the failing check role ran %d times, want a retry every call (3)", ex.runs["pgpool_check"])
+	}
+	ex.fail["pgpool_check"] = false
+	a.ensureManagedRolesOnce(context.Background())
+	a.ensureManagedRolesOnce(context.Background())
+	if ex.runs["pgpool_check"] != 4 {
+		t.Errorf("the check role ran %d times, want it latched after converging (4)", ex.runs["pgpool_check"])
+	}
+
+	perm := &roleRunExec{fail: map[string]bool{}, runs: map[string]int{}}
+	b := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pässwörd ",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		roleExec: perm,
+	}
+	b.ensureManagedRolesOnce(context.Background())
+	b.ensureManagedRolesOnce(context.Background())
+	if !b.managedRoleDone[0].Load() {
+		t.Error("a permanent failure must latch the role")
+	}
+	if perm.runs["app_user"] != 0 {
+		t.Errorf("a password needing SASLprep never reaches psql, ran %d times", perm.runs["app_user"])
 	}
 }

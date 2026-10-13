@@ -146,7 +146,7 @@ func NewProber(sql Querier) (*Prober, error) {
 // psql runs sql against ci under the per-probe deadline and returns `psql -tA` shaped
 // text (see Querier). The name is historical: until #364 this really was a psql process
 // per call, and every parser below still consumes that output shape.
-func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, error) {
+func (p *Prober) psql(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error) {
 	if p.SQL == nil {
 		return "", errors.New("prober: SQL querier is not set")
 	}
@@ -155,13 +155,13 @@ func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
-	return p.SQL.QueryText(ctx, ci, sql)
+	return p.SQL.QueryText(ctx, ci, kind, sql)
 }
 
 // InRecovery reports pg_is_in_recovery(). reachable is false when the node could
 // not be queried or returned anything other than the expected 't'/'f'.
 func (p *Prober) InRecovery(ctx context.Context, ci ConnInfo) (inRecovery, reachable bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT pg_is_in_recovery();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT pg_is_in_recovery();")
 	if err != nil {
 		return false, false, err
 	}
@@ -180,7 +180,7 @@ func (p *Prober) InRecovery(ctx context.Context, ci ConnInfo) (inRecovery, reach
 // reflects a fast promotion immediately, NOT pg_control_checkpoint() which lags.
 // pg_current_wal_lsn() is primary-only; ok is false on a standby or unreadable node.
 func (p *Prober) PrimaryWALPosition(ctx context.Context, ci ConnInfo) (tl Timeline, lsn LSN, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();")
 	if err != nil {
 		return 0, LSN{}, false, err
 	}
@@ -203,7 +203,7 @@ func (p *Prober) PrimaryWALPosition(ctx context.Context, ci ConnInfo) (tl Timeli
 // the cold-boot election) has a NULL receive LSN but a real replay LSN, so the
 // GREATEST (with NULLs coalesced) reports its true end-of-WAL.
 func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0'));")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0'));")
 	if err != nil {
 		return LSN{}, false, err
 	}
@@ -258,7 +258,7 @@ func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, 
 // superusers and pg_read_all_stats members; the agent connects as REPMGR_USER, which the
 // bootstrap creates WITH SUPERUSER.
 func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT GREATEST("+
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT GREATEST("+
 		"(SELECT timeline_id FROM pg_control_checkpoint()), "+
 		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), "+
 		"COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
@@ -280,7 +280,7 @@ func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline,
 // follow (which would error "slot already active" and re-run every tick). The host
 // is sender_host, derived from primary_conninfo -- the upstream's registered FQDN.
 func (p *Prober) StreamingUpstream(ctx context.Context, ci ConnInfo) (host string, streaming bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT sender_host, status FROM pg_stat_wal_receiver;")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT sender_host, status FROM pg_stat_wal_receiver;")
 	if err != nil {
 		return "", false, err
 	}
@@ -301,7 +301,7 @@ func (p *Prober) StreamingUpstream(ctx context.Context, ci ConnInfo) (host strin
 // a shared headless Service, a leftover, or a DR-restored cluster). ok is false when
 // the peer is unreachable or returns an unparseable value.
 func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT system_identifier FROM pg_control_system();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT system_identifier FROM pg_control_system();")
 	if err != nil {
 		return 0, false, err
 	}
@@ -347,7 +347,7 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // until something forced a checkpoint. Making the durable value current while the node is still
 // streaming is what closes that window.
 func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
-	_, err := p.psql(ctx, ci, "CHECKPOINT;")
+	_, err := p.psql(ctx, ci, QueryWrite, "CHECKPOINT;")
 	return err
 }
 
@@ -371,7 +371,7 @@ func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
 func (p *Prober) RecoveryTimelines(ctx context.Context, ci ConnInfo) (durable, streamed Timeline, ok bool, err error) {
 	const durableExpr = "GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), " +
 		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0))"
-	out, err := p.psql(ctx, ci, "SELECT "+durableExpr+", "+
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT "+durableExpr+", "+
 		"GREATEST("+durableExpr+", COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
 	if err != nil {
 		return 0, 0, false, err
@@ -439,7 +439,7 @@ func (r ReplicaRow) Streaming() bool { return r.State == "streaming" }
 // disconnects, which is exactly the failover moment when a promotion decision is being made.
 // Absence here means "not streaming right now", never "this node does not exist".
 func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]ReplicaRow, error) {
-	out, err := p.psql(ctx, ci,
+	out, err := p.psql(ctx, ci, QueryRead,
 		"SELECT r.application_name, COALESCE(s.slot_name, ''), r.state "+
 			"FROM pg_stat_replication r "+
 			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid AND s.slot_type = 'physical' "+
@@ -546,7 +546,7 @@ func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 // GREATEST(..., 0) additionally clamps the negative a post-rewind restart_lsn ahead of the
 // local end-of-WAL produces, which slotMetrics' max would otherwise carry silently.
 func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
-	out, err := p.psql(ctx, ci,
+	out, err := p.psql(ctx, ci, QueryRead,
 		"SELECT slot_name, active, GREATEST(COALESCE(pg_wal_lsn_diff("+
 			"CASE WHEN pg_is_in_recovery() THEN GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0')) ELSE pg_current_wal_lsn() END, "+
 			"restart_lsn), 0), 0)::bigint, "+
@@ -637,7 +637,7 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	// one, which is the whole point of an idempotent ensure.
 	//
 	// Guarded on NOT active, so this can only ever remove a reservation nothing holds.
-	_, err := p.psql(ctx, ci, fmt.Sprintf(
+	_, err := p.psql(ctx, ci, QueryWrite, fmt.Sprintf(
 		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
 			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
@@ -705,7 +705,7 @@ func (p *Prober) DropPhysicalSlotIfInactive(ctx context.Context, ci ConnInfo, na
 	if err := validSlotName(name); err != nil {
 		return false, err
 	}
-	out, err := p.psql(ctx, ci, fmt.Sprintf(
+	out, err := p.psql(ctx, ci, QueryWrite, fmt.Sprintf(
 		"WITH victim AS (SELECT slot_name FROM pg_replication_slots "+
 			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active) "+
 			"SELECT v.slot_name FROM victim v, pg_drop_replication_slot(v.slot_name);", name))
@@ -794,10 +794,10 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 		}
 	}
 	alter := fmt.Sprintf("ALTER SYSTEM SET synchronized_standby_slots = '%s';", strings.Join(slots, ","))
-	if _, err := p.psql(ctx, ci, alter); err != nil {
+	if _, err := p.psql(ctx, ci, QueryWrite, alter); err != nil {
 		return fmt.Errorf("alter system: %w", err)
 	}
-	if _, err := p.psql(ctx, ci, "SELECT pg_reload_conf();"); err != nil {
+	if _, err := p.psql(ctx, ci, QueryWrite, "SELECT pg_reload_conf();"); err != nil {
 		return fmt.Errorf("reload after alter system: %w", err)
 	}
 	return nil
@@ -816,7 +816,7 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 // readiness/alerting path, and "the query did not work" must not be indistinguishable from
 // "TLS is off" -- the caller retries the former and escalates the latter.
 func (p *Prober) SSLActive(ctx context.Context, ci ConnInfo) (bool, error) {
-	out, err := p.psql(ctx, ci, "SHOW ssl;")
+	out, err := p.psql(ctx, ci, QueryRead, "SHOW ssl;")
 	if err != nil {
 		return false, err
 	}

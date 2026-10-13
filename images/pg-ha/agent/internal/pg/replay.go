@@ -55,7 +55,7 @@ func (p *Prober) ReplayProgress(ctx context.Context, ci ConnInfo) (ReplayProgres
 	// ::text rather than a to_char format: this value is passed through to the API
 	// response for a human to read, and PostgreSQL's own rendering already carries
 	// the session time zone offset.
-	out, err := p.psql(ctx, ci, "SELECT pg_is_in_recovery(), "+
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT pg_is_in_recovery(), "+
 		"COALESCE(pg_last_wal_receive_lsn()::text, ''), "+
 		"COALESCE(pg_last_wal_replay_lsn()::text, ''), "+
 		"COALESCE(pg_last_xact_replay_timestamp()::text, '');")

@@ -122,7 +122,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username (a superuser; the chart's own tooling logs in as it) | `postgres` |
-| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` (see the pg chart README, "Application role and connection reserves") | `app_user` |
+| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` except `postgres` (see the pg chart README, "Application role and connection reserves") | `app_user` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |

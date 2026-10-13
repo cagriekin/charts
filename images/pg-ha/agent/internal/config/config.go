@@ -387,8 +387,6 @@ func Load(get func(string) string) (*Config, error) {
 	if c.DCSBackend != "" && c.DCSBackend != "kubernetes" && c.DCSBackend != "etcd" {
 		l.invalid = append(l.invalid, fmt.Sprintf("DCS_BACKEND=%q (want kubernetes|etcd)", c.DCSBackend))
 	}
-	// POD_CIDR is interpolated raw into pg_hba.conf; a malformed value would corrupt
-	// the whole file and fail Postgres start. Validate the CIDR form up front.
 	// The agent ALTERs the managed roles to NOSUPERUSER on every primary start, so one that
 	// named the superuser, the replication user or the monitoring user would strip that
 	// role's privileges. The chart refuses these collisions at render time; this catches a
@@ -414,6 +412,8 @@ func Load(get func(string) string) (*Config, error) {
 	if c.AppUser != "" && c.AppUser == c.PgpoolCheckUser {
 		l.invalid = append(l.invalid, fmt.Sprintf("APP_USER and PGPOOL_CHECK_USER are both %q: the two roles get different privileges and must be distinct", c.AppUser))
 	}
+	// POD_CIDR is interpolated raw into pg_hba.conf; a malformed value would corrupt
+	// the whole file and fail Postgres start. Validate the CIDR form up front.
 	if c.PgHbaPeerCIDR != "" {
 		if _, _, err := net.ParseCIDR(c.PgHbaPeerCIDR); err != nil {
 			l.invalid = append(l.invalid, fmt.Sprintf("POD_CIDR=%q is not a valid CIDR: %v", c.PgHbaPeerCIDR, err))

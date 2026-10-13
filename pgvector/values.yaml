@@ -66,7 +66,9 @@ postgresql:
   # a superuser too. Superusers share one emergency pool, superuser_reserved_connections,
   # so an application connecting as the superuser can exhaust the very slots that keep
   # the agent able to observe and manage a node at max_connections. Point applications at
-  # this role instead: a plain LOGIN that owns postgresql.database, created and kept in
+  # this role instead: a plain LOGIN that owns postgresql.database (on "postgres", the
+  # maintenance database, it gets CONNECT and USAGE, CREATE on schema public instead, since
+  # that database's owner could drop it or set GUCs superuser sessions inherit), created and kept in
   # sync by the chart (the agent on the primary in HA mode, the postStart hook in
   # standalone), password in the release Secret under "app-password". Existing
   # applications keep working on postgresql.username until they switch.

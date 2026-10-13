@@ -13,6 +13,9 @@ const (
 	// RoleApp is the application role (postgresql.app.username): a plain login that owns
 	// the chart's database, so applications stop sharing the superuser -- and with it the
 	// superuser_reserved_connections pool the agent and the chart's own tooling rely on.
+	// The maintenance database "postgres" (the chart default) is the exception: its owner
+	// could drop it or set per-database GUCs every superuser session there inherits, so
+	// there the role gets CONNECT and USAGE, CREATE on schema public instead.
 	RoleApp RoleKind = "app"
 	// RolePgpoolCheck is pgpool's health/streaming-check role (pgpool.checkUser.username):
 	// pg_monitor for the replication-delay queries, and pg_use_reserved_connections so its
@@ -58,6 +61,11 @@ BEGIN
   EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', v_name, v_secret);
   IF v_kind = 'pgpool-check' THEN
     EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
+  ELSIF v_kind = 'app' AND v_db = 'postgres' THEN
+    EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', v_db, v_name);
+    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
+      EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', v_name);
+    END IF;
   ELSIF v_kind = 'app' THEN
     EXECUTE format('ALTER DATABASE %I OWNER TO %I', v_db, v_name);
   ELSE

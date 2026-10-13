@@ -48,6 +48,9 @@ func TestEnsureRoleSQL(t *testing.T) {
 		"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L",
 		"GRANT pg_monitor, pg_use_reserved_connections TO %I",
 		"ALTER DATABASE %I OWNER TO %I",
+		"ELSIF v_kind = 'app' AND v_db = 'postgres' THEN",
+		"GRANT CONNECT ON DATABASE %I TO %I",
+		"GRANT USAGE, CREATE ON SCHEMA public TO %I",
 		"RAISE EXCEPTION 'unknown managed role kind %'",
 	} {
 		if !strings.Contains(ensureRoleSQL, want) {

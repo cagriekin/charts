@@ -107,7 +107,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username (a superuser; the chart's own tooling logs in as it) | `postgres` |
-| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` -- see [Application role and connection reserves](#application-role-and-connection-reserves) | `app_user` |
+| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` (except `postgres`) -- see [Application role and connection reserves](#application-role-and-connection-reserves) | `app_user` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |
@@ -1765,11 +1765,14 @@ provisions two non-superuser `LOGIN` roles, re-asserting their definition on eve
 start: no elevated attribute, the password from the release Secret. In HA mode the agent does
 this on the primary; standalone does it in the postStart hook.
 
-- **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. Point
-  applications at it, through pgpool or directly; the password is the Secret's `app-password`
-  key. Objects created earlier by `postgresql.username` keep their owner, so grant access (or
-  `REASSIGN OWNED`) before switching. Applications still using `postgresql.username` keep
-  working, just without the isolation.
+- **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. The exception
+  is `postgres`, the default and the maintenance database: its owner could drop it or set
+  per-database settings that every superuser session there inherits. So on `postgres` the role
+  gets `CONNECT` and `USAGE, CREATE` on schema `public` instead, and the database keeps its
+  owner. Point applications at it, through pgpool or directly; the password is the Secret's
+  `app-password` key. Objects created earlier by `postgresql.username` keep their owner, so
+  grant access (or `REASSIGN OWNED`) before switching. Applications still using
+  `postgresql.username` keep working, just without the isolation.
 - **`pgpool.checkUser.username` (default `pgpool_check`)** is what pgpool's health and
   streaming checks log in as. It holds `pg_monitor` and `pg_use_reserved_connections`, so on a
   full node the checks still get a slot and pgpool does not detach the node. A new pgpool pod

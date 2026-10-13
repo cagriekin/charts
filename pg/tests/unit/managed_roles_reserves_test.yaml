@@ -208,3 +208,34 @@ tests:
       - matchRegex:
           path: data["pool_passwd"]
           pattern: '__CHECK_USER__:TEXT__CHECK_PASSWORD__\n__APP_USER__:TEXT__APP_PASSWORD__'
+
+  # --- postgresql.database ownership: the maintenance database keeps its owner ---
+  - it: a databases[] entry may keep postgres owned by the superuser (the chart leaves it alone)
+    template: templates/databases-roles-job.yaml
+    set:
+      postgresql.databases:
+        - name: postgres
+          owner: postgres
+    asserts:
+      - notFailedTemplate: {}
+
+  - it: a databases[] entry giving a non-default postgresql.database another owner is refused
+    template: templates/databases-roles-job.yaml
+    set:
+      postgresql.database: appdb
+      postgresql.databases:
+        - name: appdb
+          owner: postgres
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.databases\[appdb\]\.owner is "postgres", but "appdb" is postgresql\.database, which the chart assigns to the application role "app_user"'
+
+  - it: the standalone hook grants instead of transferring ownership of postgres
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: "ELSIF current_setting\\('myvars\\.db'\\) = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
