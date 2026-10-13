@@ -181,6 +181,10 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 	if c.dial == nil || c.now == nil || c.idleTTL <= 0 {
 		return "", errors.New("connection cache is not initialised (use NewConnCache)")
 	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return "", errors.New("connection cache: query context has no deadline")
+	}
 	key := ci.Host + ":" + strconv.Itoa(ci.Port) + ":" + ci.User + ":" + ci.DB
 	c.mu.Lock()
 	if c.isClosed {
@@ -208,20 +212,23 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 		return "", err
 	}
 	defer e.unlock()
+	// Close may have swept this entry while we waited for it; dialling now would open a
+	// session Close never sees.
+	c.mu.Lock()
+	closed := c.isClosed
+	c.mu.Unlock()
+	if closed {
+		return "", errors.New("connection cache is closed")
+	}
 	reused := e.conn != nil && !e.conn.closed()
 	if !reused {
-		if err := c.redial(ctx, e, ci); err != nil {
+		if err := c.redial(ctx, deadline, e, ci); err != nil {
 			return "", err
 		}
 	}
 	rows, err := e.conn.exec(ctx, sql)
 	if err != nil {
-		// A server-side ERROR (permission denied, a RAISE, a duplicate slot) leaves the
-		// session usable and would recur on a fresh dial: keep the connection and do not
-		// retry. A FATAL (e.g. admin shutdown on a restarted peer) closes it, so it falls
-		// through to the drop-and-redial path below.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && !e.conn.closed() {
+		if c.keepOnServerError(err, e) {
 			return "", err
 		}
 		c.drop(ctx, e)
@@ -231,25 +238,31 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 		// A reused socket failed: the peer may simply have restarted since the last tick.
 		// One fresh dial inside the same deadline, so this probe reports what a fresh
 		// connection sees rather than a stale one's error.
-		if rerr := c.redial(ctx, e, ci); rerr != nil {
+		if rerr := c.redial(ctx, deadline, e, ci); rerr != nil {
 			return "", rerr
 		}
 		if rows, err = e.conn.exec(ctx, sql); err != nil {
-			c.drop(ctx, e)
+			if !c.keepOnServerError(err, e) {
+				c.drop(ctx, e)
+			}
 			return "", err
 		}
 	}
 	return formatRows(rows), nil
 }
 
-func (c *ConnCache) redial(ctx context.Context, e *cacheEntry, ci ConnInfo) error {
-	to := 10 * time.Second
-	if dl, ok := ctx.Deadline(); ok {
-		if rem := time.Until(dl); rem < to {
-			to = rem
-		}
-	}
-	secs := int(to.Seconds())
+// keepOnServerError reports whether err is a server-side ERROR (permission denied, a
+// RAISE, a duplicate slot) that left the session usable: such an error would recur on a
+// fresh dial, so the connection is kept and the statement not retried. A FATAL (e.g.
+// admin shutdown on a restarted peer) closes the session, so it is not kept.
+func (c *ConnCache) keepOnServerError(err error, e *cacheEntry) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && !e.conn.closed()
+}
+
+func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+	secs := int(time.Until(deadline).Seconds())
+	// connect_timeout=0 means "wait forever" to libpq and pgconn; ctx still bounds the dial.
 	if secs < 1 {
 		secs = 1
 	}
