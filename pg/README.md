@@ -1763,7 +1763,11 @@ PostgreSQL 16+ (`reserved_connections` is new in 16).
 The reserves only isolate the agent if applications are not superusers. The chart therefore
 provisions two non-superuser `LOGIN` roles, re-asserting their definition on every primary
 start: no elevated attribute, the password from the release Secret. In HA mode the agent does
-this on the primary; standalone does it in the postStart hook.
+this on the primary; standalone does it in the postStart hook. Roles the chart creates are marked
+with `COMMENT ON ROLE ... IS 'managed by the pg chart'`. A same-named role without that mark is
+never converted: provisioning stops with an error naming it (logged by the agent; a failed
+postStart, and so a container restart, in standalone). Rename the chart value, or hand the role
+over by giving it the mark.
 
 - **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. The exception
   is `postgres`, the default and the maintenance database: its owner could drop it or set

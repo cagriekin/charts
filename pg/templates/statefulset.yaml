@@ -1163,7 +1163,9 @@ spec:
                                standalone has no agent, so this hook provisions them on every start,
                                the same definition pg.EnsureRole asserts in HA mode (test-template.sh
                                checks the two stay identical) -- created if
-                               absent, then LOGIN without any elevated attribute, the password from
+                               absent and marked with COMMENT ON ROLE, refused if a same-named role
+                               without that mark exists (converting it would silently demote someone
+                               else's role), then LOGIN without any elevated attribute, the password from
                                the Secret, and the kind's privileges. Passwords reach psql only
                                through the environment (\getenv), statement logging is lowered
                                before they are sent, and VERBOSITY terse keeps the dynamic ALTER
@@ -1189,6 +1191,7 @@ spec:
                     DO $$
                     DECLARE
                       r RECORD;
+                      v_marker TEXT := 'managed by the pg chart';
                     BEGIN
                       FOR r IN SELECT * FROM (VALUES
                           (current_setting('myvars.app'), current_setting('myvars.app_pw'), 'app'),
@@ -1196,6 +1199,9 @@ spec:
                       LOOP
                         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name) THEN
                           EXECUTE format('CREATE ROLE %I', r.name);
+                          EXECUTE format('COMMENT ON ROLE %I IS %L', r.name, v_marker);
+                        ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = r.name), 'pg_authid') IS DISTINCT FROM v_marker THEN
+                          RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(r.name), quote_ident(r.name), quote_literal(v_marker);
                         END IF;
                         EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', r.name, r.pw);
                         IF r.kind = 'pgpool-check' THEN

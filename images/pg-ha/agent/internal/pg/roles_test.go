@@ -52,6 +52,10 @@ func TestEnsureRoleSQL(t *testing.T) {
 		"GRANT CONNECT ON DATABASE %I TO %I",
 		"GRANT USAGE, CREATE ON SCHEMA public TO %I",
 		"RAISE EXCEPTION 'unknown managed role kind %'",
+		"v_marker TEXT := 'managed by the pg chart';",
+		"COMMENT ON ROLE %I IS %L",
+		"shobj_description((SELECT oid FROM pg_roles WHERE rolname = v_name), 'pg_authid') IS DISTINCT FROM v_marker",
+		notManagedPhrase,
 	} {
 		if !strings.Contains(ensureRoleSQL, want) {
 			t.Errorf("SQL missing %q", want)
@@ -94,5 +98,15 @@ func TestEnsureRolePermanentAndTransientErrors(t *testing.T) {
 	err = EnsureRole(context.Background(), &fakeStdinExec{err: errors.New("psql: connection refused")}, "postgres", "db", ManagedRole{Name: "app", Password: "pw", Kind: RoleApp})
 	if err == nil || IsPermanentRoleError(err) {
 		t.Errorf("a psql failure must be a retryable error, got %v", err)
+	}
+}
+
+// A same-named role the chart did not create is refused by the SQL; EnsureRole reports it
+// as permanent so the agent logs it once instead of retrying every tick.
+func TestEnsureRoleNotManagedIsPermanent(t *testing.T) {
+	f := &fakeStdinExec{err: errors.New(`psql: exit status 3: ERROR:  role app_user already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE app_user IS 'managed by the pg chart'`)}
+	err := EnsureRole(context.Background(), f, "postgres", "db", ManagedRole{Name: "app_user", Password: "pw", Kind: RoleApp})
+	if !errors.Is(err, ErrRoleNotManaged) || !IsPermanentRoleError(err) {
+		t.Errorf("want a permanent ErrRoleNotManaged, got %v", err)
 	}
 }

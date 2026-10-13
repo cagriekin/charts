@@ -2842,6 +2842,9 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		case err == nil:
 			a.managedRoleDone[i].Store(true)
 			a.log.Info("managed role provisioned", "role", r.Name, "kind", r.Kind)
+		case errors.Is(err, pg.ErrRoleNotManaged):
+			a.managedRoleDone[i].Store(true)
+			a.log.Error("managed role not provisioned: a role of that name already exists and was not created by the chart; rename the chart value, or hand the role over with COMMENT ON ROLE <name> IS 'managed by the pg chart' and restart the agent", "role", r.Name, "err", err)
 		case pg.IsPermanentRoleError(err):
 			a.managedRoleDone[i].Store(true)
 			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)

@@ -4,12 +4,27 @@
 
 ### Upgrade notes
 
+- **With `postgresql.existingSecret`, add two keys to that Secret before upgrading**:
+  `app-password` and `pgpool-check-password` (or point `postgresql.existingSecret.appPasswordKey`
+  / `pgpoolCheckPasswordKey` at existing keys). Helm cannot see that Secret, so the render passes
+  without them. The first PostgreSQL pod the rollout replaces then stays in
+  `CreateContainerConfigError` (`couldn't find key app-password in Secret ...`) and the rollout
+  stalls; in HA the other pods keep serving. The new pgpool pod fails the same way while the old
+  ones keep serving. Generated Secrets get both keys automatically.
+- **pg-ha image 2.2.0 requires chart 2.5.0 or newer.** The agent now requires `APP_USER`,
+  `APP_PASSWORD`, `PGPOOL_CHECK_USER`, `PGPOOL_CHECK_PASSWORD`, `POSTGRES_USER` and `POSTGRES_DB`,
+  which only this chart supplies. Setting `ha.image.tag` to 2.2.0 on an older chart crash-loops
+  every pod; upgrade the chart instead, which pins the tag.
 - **Two new roles are created on upgrade: `app_user` (`postgresql.app.username`) and
-  `pgpool_check` (`pgpool.checkUser.username`).** Both are plain `LOGIN` roles, and the chart
-  re-asserts their definition on every primary start: no superuser or other elevated attribute,
-  the password from the release Secret. **A role that already exists under one of these names is
-  converted** (demoted to `NOSUPERUSER`, password reset). Rename the value if you already use the
-  name. A name that collides with `postgresql.username`, `ha.username`, the monitoring user or a
+  `pgpool_check` (`pgpool.checkUser.username`).** Both are plain `LOGIN` roles, marked with
+  `COMMENT ON ROLE ... IS 'managed by the pg chart'`, and the chart re-asserts their definition on
+  every primary start: no superuser or other elevated attribute, the password from the release
+  Secret. **A role that already exists under one of these names without that mark is left
+  untouched, and provisioning stops**: in HA the agent logs the error once and new pgpool pods
+  wait; in standalone the postStart hook fails, so the PostgreSQL container restarts until it is
+  resolved. Rename the chart value, or hand the role over with
+  `COMMENT ON ROLE <name> IS 'managed by the pg chart'` (it is then converted). A name that
+  collides with `postgresql.username`, `ha.username`, the monitoring user or a
   `postgresql.roles[]` entry is refused at render time.
 - **`app_user` becomes the owner of `postgresql.database`, unless that is `postgres` (the
   default).** The maintenance database keeps its owner: whoever owns it could drop it or set
@@ -18,13 +33,15 @@
   in the database keep their current owner, so give `app_user` access to them (`GRANT`, or
   `REASSIGN OWNED BY` the superuser when it owns the database) before you point applications at
   it. Until you do, applications keep working as `postgresql.username`. Nothing forces them to
-  switch.
-- **With `postgresql.existingSecret`, the Secret needs two new keys**: `app-password` and
-  `pgpool-check-password`, or set `postgresql.existingSecret.appPasswordKey` /
-  `pgpoolCheckPasswordKey`. Generated Secrets get both keys automatically.
+  switch. A `postgresql.databases[]` entry that gives a non-`postgres` `postgresql.database`
+  another owner is refused at render time.
 - **PostgreSQL 16 or newer is required** when `postgresql.majorVersion` is set (both images ship
   18). `postgresql.configuration.superuser_reserved_connections` and `reserved_connections` are
   now refused. The chart owns both, and `max_connections` must exceed their sum.
+- **Non-superuser roles get fewer slots.** The reserves grow from PostgreSQL's 3 to one per node
+  plus 3, plus `2 x pgpool.replicaCount + 1` with pgpool: 9 on a 3-node cluster with pgpool, so
+  non-superuser logins get 91 of the default 100 `max_connections` instead of 97. Raise
+  `max_connections` if a cluster already runs near the limit.
 - **The pods roll once** (new configuration, environment and image), and so does pgpool. Each new
   pgpool pod waits in its `wait-check-role` init container until the agent on the primary (or the
   standalone postStart hook) has created `pgpool_check`. The old pgpool pods keep serving until

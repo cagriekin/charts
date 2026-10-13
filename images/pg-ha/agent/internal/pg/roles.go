@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // RoleKind selects the privileges EnsureRole grants a chart-managed login role.
@@ -31,10 +32,12 @@ type ManagedRole struct {
 	Kind     RoleKind
 }
 
-// ensureRoleSQL creates the role if absent and then asserts its whole definition on every
-// run, so a role an operator pre-created or altered converges to what the chart declares:
-// LOGIN, no superuser or other elevated attribute, the password from the Secret, and the
-// kind's privileges. The password travels exactly as rehashSQL's does (see there): a SCRAM
+// ensureRoleSQL creates the role if absent, marking it with COMMENT ON ROLE, and then
+// asserts its whole definition on every run, so a chart role an operator altered converges
+// to what the chart declares: LOGIN, no superuser or other elevated attribute, the password
+// from the Secret, and the kind's privileges. A same-named role WITHOUT the mark belongs to
+// someone else: converting it would silently demote it and reset its password, so the run
+// stops instead and says how to rename the value or hand the role over. The password travels exactly as rehashSQL's does (see there): a SCRAM
 // verifier computed in Go, passed through the environment, hoisted into a session GUC after
 // statement logging is lowered, and quoted with format(%I, %L). VERBOSITY terse keeps the
 // dynamic statement -- verifier included -- out of psql's CONTEXT lines on failure.
@@ -54,9 +57,13 @@ DECLARE
   v_secret TEXT := current_setting('myvars.role_secret');
   v_kind TEXT := current_setting('myvars.role_kind');
   v_db TEXT := current_setting('myvars.role_db');
+  v_marker TEXT := 'managed by the pg chart';
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_name) THEN
     EXECUTE format('CREATE ROLE %I', v_name);
+    EXECUTE format('COMMENT ON ROLE %I IS %L', v_name, v_marker);
+  ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = v_name), 'pg_authid') IS DISTINCT FROM v_marker THEN
+    RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(v_name), quote_ident(v_name), quote_literal(v_marker);
   END IF;
   EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', v_name, v_secret);
   IF v_kind = 'pgpool-check' THEN
@@ -98,10 +105,23 @@ func EnsureRole(ctx context.Context, ex StdinExec, superUser, db string, r Manag
 		"-v", "k="+string(r.Kind),
 		"-v", "d="+db,
 		"--no-psqlrc"); err != nil {
+		if strings.Contains(err.Error(), notManagedPhrase) {
+			return fmt.Errorf("ensure role %s: %w: %v", r.Name, ErrRoleNotManaged, err)
+		}
 		return fmt.Errorf("ensure role %s: %w", r.Name, err)
 	}
 	return nil
 }
 
+// ErrRoleNotManaged reports a same-named role the chart did not create (no marker
+// comment). No retry fixes it: an operator has to rename the value or hand the role over.
+var ErrRoleNotManaged = errors.New("role exists and is not managed by the pg chart")
+
+// notManagedPhrase is the text ensureRoleSQL's RAISE carries; psql reports the server
+// error only as text, so EnsureRole recognises the refusal by it.
+const notManagedPhrase = "is not managed by the pg chart"
+
 // IsPermanentRoleError reports whether EnsureRole failed in a way no retry can fix.
-func IsPermanentRoleError(err error) bool { return errors.Is(err, ErrNeedsSASLprep) }
+func IsPermanentRoleError(err error) bool {
+	return errors.Is(err, ErrNeedsSASLprep) || errors.Is(err, ErrRoleNotManaged)
+}

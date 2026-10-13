@@ -4523,3 +4523,35 @@ func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
 		t.Errorf("a password needing SASLprep never reaches psql, ran %d times", perm.runs["app_user"])
 	}
 }
+
+// notManagedExec refuses provisioning the way ensureRoleSQL does for a same-named role the
+// chart did not create.
+type notManagedExec struct{ runs int }
+
+func (n *notManagedExec) RunStdin(context.Context, []string, string, string, ...string) error {
+	n.runs++
+	return errors.New(`psql: exit status 3: ERROR:  role app_user already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE app_user IS 'managed by the pg chart'`)
+}
+
+// A foreign same-named role is reported once and latched, never retried every tick.
+func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
+	ex := &notManagedExec{}
+	a := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pw",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		roleExec: ex,
+	}
+	for i := 0; i < 3; i++ {
+		a.ensureManagedRolesOnce(context.Background())
+	}
+	if ex.runs != 2 {
+		t.Errorf("want one attempt per role, then latched; got %d runs", ex.runs)
+	}
+	if !a.managedRoleDone[0].Load() || !a.managedRoleDone[1].Load() {
+		t.Error("a foreign role must latch its slot")
+	}
+}
