@@ -12,7 +12,7 @@ tests:
           path: data["reserved-connections.conf"]
           pattern: 'superuser_reserved_connections = 6\n\s*reserved_connections = 0'
 
-  - it: HA with pgpool reserves 2 per pgpool replica plus 1 for the check role
+  - it: HA with pgpool reserves pgpool.reservedConnections for the check role
     template: templates/postgresql-configmap.yaml
     set:
       pgpool.enabled: true
@@ -21,6 +21,26 @@ tests:
       - matchRegex:
           path: data["reserved-connections.conf"]
           pattern: 'superuser_reserved_connections = 5\n\s*reserved_connections = 7'
+
+  - it: pgpool replicas beyond what reservedConnections covers are refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 4
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=4 needs at least 9'
+
+  - it: raising reservedConnections admits more pgpool replicas
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 4
+      pgpool.reservedConnections: 9
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'reserved_connections = 9'
 
   - it: standalone keeps PostgreSQL's 3 superuser slots
     template: templates/postgresql-configmap.yaml
@@ -31,7 +51,24 @@ tests:
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
-          pattern: 'superuser_reserved_connections = 3\n\s*reserved_connections = 3'
+          pattern: 'superuser_reserved_connections = 3\n\s*reserved_connections = 7'
+
+  - it: a non-positive saturationGrace is refused
+    template: templates/statefulset.yaml
+    set:
+      ha.agent.saturationGrace: 0s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ha\.agent\.saturationGrace is "0s": it must be a positive duration'
+
+  - it: the agent receives SATURATION_GRACE
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SATURATION_GRACE
+            value: 2m
 
   # --- reserve guards ---
   - it: superuser_reserved_connections in postgresql.configuration is refused
@@ -53,16 +90,16 @@ tests:
   - it: a max_connections the reserves would exhaust is refused
     template: templates/statefulset.yaml
     set:
-      postgresql.configuration.max_connections: "8"
+      postgresql.configuration.max_connections: "12"
       pgpool.enabled: true
     asserts:
       - failedTemplate:
-          errorPattern: 'max_connections is 8, but the chart reserves 5 superuser slots .* and 3 for pgpool''s checks'
+          errorPattern: 'max_connections is 12, but the chart reserves 5 superuser slots .* and 7 for pgpool''s checks'
 
   - it: a max_connections just above the reserves renders
     template: templates/statefulset.yaml
     set:
-      postgresql.configuration.max_connections: "9"
+      postgresql.configuration.max_connections: "13"
       pgpool.enabled: true
     asserts:
       - notFailedTemplate: {}

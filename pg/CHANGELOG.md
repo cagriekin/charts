@@ -37,10 +37,12 @@
   another owner is refused at render time.
 - **PostgreSQL 16 or newer is required** when `postgresql.majorVersion` is set (both images ship
   18). `postgresql.configuration.superuser_reserved_connections` and `reserved_connections` are
-  now refused. The chart owns both, and `max_connections` must exceed their sum.
+  now refused. The chart owns both, and `max_connections` must exceed their sum. With pgpool,
+  `pgpool.reservedConnections` (default 7) must be at least `2 x pgpool.replicaCount + 1`, so more
+  than 3 pgpool replicas need it raised.
 - **Non-superuser roles get fewer slots.** The reserves grow from PostgreSQL's 3 to one per node
-  plus 3, plus `2 x pgpool.replicaCount + 1` with pgpool: 9 on a 3-node cluster with pgpool, so
-  non-superuser logins get 91 of the default 100 `max_connections` instead of 97. Raise
+  plus 3, plus `pgpool.reservedConnections` (7) with pgpool: 13 on a 3-node cluster with pgpool,
+  so non-superuser logins get 87 of the default 100 `max_connections` instead of 97. Raise
   `max_connections` if a cluster already runs near the limit.
 - **The pods roll once** (new configuration, environment and image), and so does pgpool. Each new
   pgpool pod waits in its `wait-check-role` init container until the agent on the primary (or the
@@ -52,8 +54,11 @@
 - **Connection reserves, so a full node stays observable.** A chart-owned
   `reserved-connections.conf` sets `superuser_reserved_connections` to one slot per node plus 3
   (every agent holds one session to every node; standalone keeps PostgreSQL's 3), and
-  `reserved_connections` to `2 x pgpool.replicaCount + 1`, for pgpool's checks. Applications get
-  the rest. The postgresql ConfigMap therefore renders on every install.
+  `reserved_connections` to `pgpool.reservedConnections` (default 7, at least
+  `2 x pgpool.replicaCount + 1`), for pgpool's checks. That is a value of its own because the
+  setting needs a PostgreSQL restart: deriving it from `pgpool.replicaCount` would roll every
+  database pod on a pgpool scale. Applications get the rest. The postgresql ConfigMap therefore
+  renders on every install.
 - **`postgresql.app`: a non-superuser application role** that owns `postgresql.database` (on
   `postgres`, the default, it gets `CONNECT` and `USAGE, CREATE` on schema `public` instead). All
   superusers share one emergency pool (`superuser_reserved_connections`), so an application
@@ -65,8 +70,11 @@
   `reserved_connections`. When application sessions fill a node, its health check still passes
   and pgpool does not detach it.
 - **The agent treats `too many clients` (SQLSTATE 53300) as proof that a node is alive.** A full
-  primary is never stepped down by self-health: before, a primary whose connections ran out for
-  `LeaseDuration` was SIGQUIT'd and failed over as if wedged. A lease-holding standby waits up to
+  primary is not stepped down by self-health for up to `ha.agent.saturationGrace` (default 2m):
+  before, a primary whose connections ran out for `LeaseDuration` was SIGQUIT'd and failed over as
+  if wedged. The grace is bounded because a primary whose slots are all held by sessions stuck on
+  hung storage refuses connections the same way; past it, the node counts as not running again
+  and the ordinary self-health step-down applies. A lease-holding standby waits up to
   `2 x LeaseDuration` before promoting past a full peer whose position it cannot read, unless that
   peer's fresh gossip shows it is not ahead. New gauges: `pg_ha_agent_local_saturated`,
   `pg_ha_agent_peers_saturated`.

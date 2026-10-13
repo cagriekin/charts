@@ -652,6 +652,7 @@ per tick that cost over half a CPU core per *idle* pod on slow vCPUs.
 | `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `ha.agent.saturationGrace` | How long a primary refusing the agent with "too many clients" still counts as alive for self-health; past it, the step-down applies again | `2m` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
 | `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Accept the loss per incident with `pg-ha/accept-failover-lag=<pod>` on the marker. Needs the pg-ha image at 2.1.0 or later (render-enforced). See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
@@ -1560,7 +1561,8 @@ in its status.
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances (also sizes `reserved_connections`: 2 per instance + 1) | `1` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2`, render-enforced) | `1` |
+| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x replicaCount + 1`. Changing it restarts the PostgreSQL pods | `7` |
 | `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
@@ -1752,7 +1754,7 @@ The chart splits connections into three pools:
 | Pool | Who | Size |
 |------|-----|------|
 | `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one session to every node). Standalone: 3 |
-| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `2 x pgpool.replicaCount + 1` with pgpool, else 0 |
+| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x pgpool.replicaCount + 1`) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
 | the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
 
 Both reserves live in a chart-owned `reserved-connections.conf`. Setting them in
@@ -1784,8 +1786,10 @@ over by giving it the mark.
 
 When a node does refuse the agent with `too many clients` (SQLSTATE 53300):
 
-- **The agent counts it as alive.** A full primary is not stepped down by self-health, and the
-  agent waits instead of acting on it.
+- **The agent counts it as alive, for a while.** A full primary is not stepped down by
+  self-health for up to `ha.agent.saturationGrace` (2m), and the agent waits instead of acting
+  on it. Past the grace it counts as not running again: a primary whose slots are all held by
+  sessions stuck on hung storage refuses connections the same way, and must still fail over.
 - **A lease-holding standby holds off.** It waits up to `2 x LeaseDuration` before promoting
   past a full peer whose WAL position it cannot read, unless that peer's fresh gossip shows it
   is not ahead.

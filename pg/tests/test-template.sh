@@ -1827,6 +1827,13 @@ for needle in "v_marker TEXT := 'managed by the pg chart';" \
   assert_contains "managed roles: the hook carries: ${needle:0:60}" "${standalone_hook}" "${needle}"
 done
 
+# reserved_connections needs a PostgreSQL restart, so it is pgpool.reservedConnections, not a
+# function of pgpool.replicaCount: scaling pgpool within it must not change the PostgreSQL
+# pods' config checksum (and so must not roll the database).
+cks_pgpool1=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+cks_pgpool3=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=3 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+assert_eq "reserves: scaling pgpool 1 -> 3 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool3}"
+
 # Test: with no postgresql.configuration the ConfigMap still renders and is wired in, since it
 # carries reserved-connections.conf. The include_dir strip that #107 needed when conf.d could
 # disappear is gone with that possibility: setup-config only ever appends.

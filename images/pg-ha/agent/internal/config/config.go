@@ -41,6 +41,9 @@ type Config struct {
 	RenewDeadline     time.Duration
 	RetryPeriod       time.Duration
 	ReconcileInterval time.Duration
+	// SaturationGrace bounds how long a local too_many_connections refusal counts as proof
+	// the primary is alive for self-health (SATURATION_GRACE, ha.agent.saturationGrace).
+	SaturationGrace time.Duration
 
 	HeadlessService string // for building peer FQDNs <pod>.<headless>
 	NodeCount       int    // total pods (replicaCount+1) for peer enumeration
@@ -276,6 +279,7 @@ func Load(get func(string) string) (*Config, error) {
 		RenewDeadline:     l.dur("RENEW_DEADLINE"),
 		RetryPeriod:       l.dur("RETRY_PERIOD"),
 		ReconcileInterval: l.dur("RECONCILE_INTERVAL"),
+		SaturationGrace:   l.dur("SATURATION_GRACE"),
 		HeadlessService:   l.str("HEADLESS_SERVICE"),
 		NodeCount:         l.intv("REPMGR_NODE_COUNT"),
 		MasterService:     l.str("MASTER_SERVICE"),

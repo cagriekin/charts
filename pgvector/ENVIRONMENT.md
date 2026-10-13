@@ -47,6 +47,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `RENEW_DEADLINE` | duration | yes | `ha.agent.renewDeadline` (10s) | agent |
 | `RETRY_PERIOD` | duration | yes | `ha.agent.retryPeriod` (2s) | agent |
 | `RECONCILE_INTERVAL` | duration | yes | `ha.agent.reconcileInterval` (5s) | agent (tick) |
+| `SATURATION_GRACE` | duration | yes | `ha.agent.saturationGrace` (2m) | agent (how long a local "too many clients" refusal counts as alive for self-health) |
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
 | `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |

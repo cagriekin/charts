@@ -406,6 +406,13 @@ ha:
     renewDeadline: 10s
     retryPeriod: 2s
     reconcileInterval: 5s
+    # How long a primary that refuses the agent's connections with "too many clients"
+    # (max_connections exhausted) still counts as alive for the self-health step-down. The
+    # refusal proves the postmaster is up, so a connection storm does not turn into a
+    # failover; but a primary whose slots are all held by sessions stuck on hung storage
+    # refuses the same way, so past this grace it counts as not running again and
+    # self-health may step it down (after its own leaseDuration grace).
+    saturationGrace: 2m
     # Cascading replication (#29). Off by default: every standby streams from the
     # primary. When true, a standby may follow another standby (a chain by pod ordinal
     # toward the primary) to offload the primary's WAL senders on larger clusters. The
@@ -662,13 +669,21 @@ pgpool:
 
   # Role pgpool's health and streaming-replication checks log in as. A plain LOGIN with
   # pg_monitor and pg_use_reserved_connections, so the checks draw from
-  # reserved_connections -- sized by the chart to 2 x pgpool.replicaCount + 1 -- rather
+  # reserved_connections (pgpool.reservedConnections below) rather
   # than competing with application sessions: a node that is merely full must not fail
   # its health check and be detached. Created by the chart like postgresql.app; the
   # password lives in the release Secret under "pgpool-check-password". A new pgpool pod
   # waits in Init until this role can log in.
   checkUser:
     username: pgpool_check
+
+  # reserved_connections on every PostgreSQL node: slots only roles with
+  # pg_use_reserved_connections (the check role above) may use. Each pgpool replica runs
+  # a health check and a streaming check, so it must be at least 2 x replicaCount + 1
+  # (render-enforced). A value of its own rather than derived from replicaCount: the
+  # setting needs a PostgreSQL restart, so tying it to replicaCount would roll every
+  # database pod on a pgpool scale. 7 covers up to 3 pgpool replicas.
+  reservedConnections: 7
 
   # Startup command override for the pgpool container. Empty uses the chart default,
   # which reaps SysV shmem/semaphores orphaned by a prior OOM-killed pgpool

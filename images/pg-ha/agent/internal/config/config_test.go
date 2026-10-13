@@ -17,6 +17,7 @@ func fullEnv() map[string]string {
 		"RENEW_DEADLINE":        "10s",
 		"RETRY_PERIOD":          "2s",
 		"RECONCILE_INTERVAL":    "5s",
+		"SATURATION_GRACE":      "2m",
 		"HEADLESS_SERVICE":      "pg-headless",
 		"REPMGR_NODE_COUNT":     "3",
 		"MASTER_SERVICE":        "pg",

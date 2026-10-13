@@ -881,6 +881,8 @@ spec:
               value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "retryPeriod" "2s") | quote }}
             - name: RECONCILE_INTERVAL
               value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval" "5s") | quote }}
+            - name: SATURATION_GRACE
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "saturationGrace" "2m") | quote }}
 {{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and

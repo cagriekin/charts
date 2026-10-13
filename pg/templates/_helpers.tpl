@@ -279,20 +279,21 @@ annotation consumers -- #128.)
        required and restricted to plain lower-case identifiers: they travel through psql
        variables, pgpool.conf and pool_passwd, and a plain identifier needs no quoting in
        any of them. */ -}}
-{{- define "pg.appUsername" -}}
-{{- $u := required "postgresql.app.username is required: the chart always provisions the application role" (.Values.postgresql.app).username | toString -}}
+{{- define "pg.managedRoleUsername" -}}
+{{- $path := index . 0 -}}
+{{- $u := required (printf "%s is required: the chart always provisions %s" $path (index . 2)) (index . 1) | toString -}}
 {{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
-{{- fail (printf "postgresql.app.username is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $u) -}}
+{{- fail (printf "%s is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $path $u) -}}
 {{- end -}}
 {{- $u -}}
 {{- end -}}
 
-{{- define "pg.pgpoolCheckUsername" -}}
-{{- $u := required "pgpool.checkUser.username is required: the chart always provisions pgpool's check role" (.Values.pgpool.checkUser).username | toString -}}
-{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
-{{- fail (printf "pgpool.checkUser.username is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $u) -}}
+{{- define "pg.appUsername" -}}
+{{- include "pg.managedRoleUsername" (list "postgresql.app.username" (.Values.postgresql.app).username "the application role") -}}
 {{- end -}}
-{{- $u -}}
+
+{{- define "pg.pgpoolCheckUsername" -}}
+{{- include "pg.managedRoleUsername" (list "pgpool.checkUser.username" (.Values.pgpool.checkUser).username "pgpool's check role") -}}
 {{- end -}}
 
 {{- /* Name of the Secret holding the shared S3 access/secret key for pgBackRest
@@ -1117,8 +1118,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            chart's superuser tooling (backups, hook Jobs) and an operator's psql.
            Standalone has no agent: PostgreSQL's own 3.
          - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
-           i.e. pgpool's check role. Each pgpool replica runs a health check and a
-           streaming check, so 2 per replica, plus 1. 0 without pgpool.
+           i.e. pgpool's check role: pgpool.reservedConnections, at least 2 per pgpool
+           replica (a health check and a streaming check) plus 1. 0 without pgpool.
          - the rest: everyone else, applications included.
        Chart-owned: setting either in postgresql.configuration is refused, so there is one
        source of truth and the sizing cannot silently drift from the topology. */ -}}
@@ -1132,7 +1133,12 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 
 {{- define "pg.reservedConnections" -}}
 {{- if .Values.pgpool.enabled -}}
-{{- add (mul .Values.pgpool.replicaCount 2) 1 -}}
+{{- $want := add (mul .Values.pgpool.replicaCount 2) 1 -}}
+{{- $have := required "pgpool.reservedConnections is required when pgpool.enabled: it sets reserved_connections for pgpool's check role" .Values.pgpool.reservedConnections | int -}}
+{{- if lt $have $want -}}
+{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (a health check and a streaming check per replica, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own." $have (int .Values.pgpool.replicaCount) $want) -}}
+{{- end -}}
+{{- $have -}}
 {{- else -}}
 0
 {{- end -}}
@@ -1168,7 +1174,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- $res := atoi (include "pg.reservedConnections" .) -}}
 {{- $max := atoi (include "pg.maxConnections" .) -}}
 {{- if ge (add $su $res) $max -}}
-{{- fail (printf "max_connections is %d, but the chart reserves %d superuser slots (superuser_reserved_connections: one per node plus 3) and %d for pgpool's checks (reserved_connections: 2 x pgpool.replicaCount + 1), leaving no slot for applications. Raise postgresql.configuration.max_connections above %d." $max $su $res (add $su $res)) -}}
+{{- fail (printf "max_connections is %d, but the chart reserves %d superuser slots (superuser_reserved_connections: one per node plus 3) and %d for pgpool's checks (reserved_connections: pgpool.reservedConnections), leaving no slot for applications. Raise postgresql.configuration.max_connections above %d." $max $su $res (add $su $res)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1884,7 +1890,8 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
       (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration"     "15s")))
       (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline"     "10s")))
       (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod"       "2s")))
-      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s"))) -}}
+      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s")))
+      (list "saturationGrace"   (include "pg.haAgentDuration" (list $agent "saturationGrace"   "2m"))) -}}
 {{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
        time.ParseDuration rejects `15`, `20 s`, `15S` and ``, so the agent would refuse to start
        and every pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
@@ -1892,6 +1899,10 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- if eq (include "pg.durationMs" (index $entry 1)) "" -}}
 {{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit, no spaces, and lower-case units, e.g. \"15s\", \"500ms\", \"1m30s\". Note the units are case-SENSITIVE (\"15S\" is an error) and an empty value is not a duration either. The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
 {{- end -}}
+{{- end -}}
+{{- $sgRaw := index (index $durations 4) 1 -}}
+{{- if le (float64 (include "pg.durationMs" $sgRaw)) 0.0 -}}
+{{- fail (printf "ha.agent.saturationGrace is %q: it must be a positive duration. It bounds how long a primary refusing connections at max_connections still counts as alive; the agent refuses a non-positive value at startup." $sgRaw) -}}
 {{- end -}}
 {{- $ldRaw := index (index $durations 0) 1 -}}
 {{- $rdRaw := index (index $durations 1) 1 -}}

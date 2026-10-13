@@ -744,7 +744,9 @@ func saturatedPeerBlockingPromote(o Observation) string {
 		if !p.SaturatedWait {
 			continue
 		}
-		if p.Gossip && !peerAhead(*p, o.Local) {
+		// Only a KNOWN position settles it: gossip without an LSN (the saturated node's own
+		// agent is often just as blind) is not evidence that the peer is behind.
+		if p.Gossip && p.LSNOK && o.Local.LSNOK && !peerAhead(*p, o.Local) {
 			continue
 		}
 		return p.Name

@@ -695,6 +695,12 @@ func TestDecideSaturation(t *testing.T) {
 			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x200), true)}}, Wait},
 		{"saturated peer whose gossip is behind -> promote",
 			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x80), true)}}, Promote},
+		{"saturated peer whose gossip carries no LSN, inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(func() PeerState {
+				p := gossipPeer("pg-2", 5, 5, 0x80)
+				p.LSNOK = false
+				return p
+			}(), true)}}, Wait},
 		{"saturated peer past its grace -> promote",
 			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, false)}}, Promote},
 		{"reachable peer ahead still wins the handoff over a saturated one",

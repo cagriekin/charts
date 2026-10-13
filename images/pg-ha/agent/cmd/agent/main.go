@@ -171,6 +171,12 @@ type agent struct {
 	// localSaturated latches the local saturation state so the log records transitions,
 	// not every tick.
 	localSaturated bool
+	// localSaturatedSince is when the current local saturation episode began; zero when
+	// the local node is not saturated. Bounds how long saturation counts as alive.
+	localSaturatedSince time.Time
+	// localSaturationExpired latches the one log line for an episode that outlived
+	// cfg.SaturationGrace.
+	localSaturationExpired bool
 	// rewindFailures counts CONSECUTIVE non-divergence pg_rewind failures against
 	// rewindFailureTarget, so a persistently unrewindable node still recovers (#298 review).
 	// Classification is fail-safe -- anything that is not provably divergence is retried
@@ -1010,7 +1016,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// so a standby cloned from a restored primary correctly reports none of its own.
 		RestoredAt: a.localRestoredAt(),
 	}
-	a.trackLocalSaturation(ls.Saturated)
+	a.trackLocalSaturation(ls.Saturated, time.Now())
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
 	// to a stopped node (without this a fenced primary-state node has no timeline,
@@ -1021,7 +1027,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		} else {
 			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 			ls.InRecovery = cd.InRecovery
-			ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK // checkpoint LSN: position for gossip ranking while stopped
+			// The checkpoint LSN stands in for a STOPPED node's position. A saturated node is
+			// running and its real position is past the last checkpoint, so gossiping that
+			// stale value would let a promoting holder read it as "not ahead" and promote past
+			// a standby that holds more WAL (saturatedPeerBlockingPromote). Leave it unknown.
+			if !ls.Saturated {
+				ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK
+			}
 		}
 	}
 	// The Lease holderIdentity is DCS state a namespace writer can forge, and it flows
@@ -1257,11 +1269,14 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// fire an unwanted ReleaseLease failover the moment pause is lifted. On resume a
 	// still-stopped node is then treated as a startup, not a regression.
 	shouldServe := o.HoldLease && !o.Paused && o.Local.HasData && !o.Local.InRecovery
-	// A too_many_connections refusal counts as running here: it proves the postmaster is
-	// alive and forking backends, and the step-down this tracker drives (SIGQUIT the
-	// primary, release the Lease) is for a frozen node. Treating a full primary as wedged
-	// would turn a connection storm into a write outage plus a failover.
-	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running || o.Local.Saturated, time.Now())
+	// A too_many_connections refusal counts as running here, within SaturationGrace: it
+	// proves the postmaster is alive and forking backends, and the step-down this tracker
+	// drives (SIGQUIT the primary, release the Lease) is for a frozen node. Treating a full
+	// primary as wedged would turn a connection storm into a write outage plus a failover;
+	// the bound keeps a primary whose slots are all held by sessions stuck on hung storage
+	// from holding the Lease forever (see localSaturationAlive).
+	now = time.Now()
+	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running || a.localSaturationAlive(now), now)
 	// PeersPending: the holder waits (does not promote/resume) only during a true
 	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)
 	// records peers ever SQL-reachable; once all have been seen, the wait never
@@ -1287,16 +1302,40 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	return o
 }
 
-// trackLocalSaturation publishes the local saturation gauge and logs transitions.
-func (a *agent) trackLocalSaturation(saturated bool) {
+// trackLocalSaturation publishes the local saturation gauge, records when the episode
+// began, and logs transitions.
+func (a *agent) trackLocalSaturation(saturated bool, now time.Time) {
 	a.metr.SetLocalSaturated(saturated)
 	switch {
 	case saturated && !a.localSaturated:
-		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) but unobservable until a slot frees")
+		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) for up to the saturation grace, but unobservable until a slot frees", "grace", a.cfg.SaturationGrace)
+		a.localSaturatedSince = now
 	case !saturated && a.localSaturated:
 		a.log.Info("local postgres accepts the agent's connections again")
+		a.localSaturatedSince = time.Time{}
+		a.localSaturationExpired = false
 	}
 	a.localSaturated = saturated
+}
+
+// localSaturationAlive reports whether the local saturation episode still counts as
+// proof of life: only within cfg.SaturationGrace of its start. A primary whose storage
+// hangs fills every slot with stuck sessions and then refuses each new connection at
+// once, so without the bound it would read as alive forever, keep the Lease, and never
+// fail over. Past the grace it counts as not running and the ordinary self-health
+// step-down applies (after its own LeaseDuration grace).
+func (a *agent) localSaturationAlive(now time.Time) bool {
+	if !a.localSaturated {
+		return false
+	}
+	if now.Sub(a.localSaturatedSince) < a.cfg.SaturationGrace {
+		return true
+	}
+	if !a.localSaturationExpired {
+		a.log.Warn("local postgres has refused the agent's connections for longer than the saturation grace; no longer treating it as alive, so self-health may step it down", "grace", a.cfg.SaturationGrace, "since", a.localSaturatedSince)
+		a.localSaturationExpired = true
+	}
+	return false
 }
 
 // trackPeerSaturation records a peer's saturation episode and reports whether it is still
@@ -2845,7 +2884,7 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		case errors.Is(err, pg.ErrRoleNotManaged):
 			a.managedRoleDone[i].Store(true)
 			a.log.Error("managed role not provisioned: a role of that name already exists and was not created by the chart; rename the chart value, or hand the role over with COMMENT ON ROLE <name> IS 'managed by the pg chart' and restart the agent", "role", r.Name, "err", err)
-		case pg.IsPermanentRoleError(err):
+		case errors.Is(err, pg.ErrNeedsSASLprep):
 			a.managedRoleDone[i].Store(true)
 			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)
 		default:

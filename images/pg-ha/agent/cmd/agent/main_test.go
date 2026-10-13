@@ -4375,7 +4375,7 @@ func saturationTestAgent(t *testing.T, q pg.Querier) *agent {
 		cfg: &config.Config{
 			PGDATA: pgdata, HeadlessService: "h", PodName: "pg-0", NodeCount: 3,
 			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RenewDeadline: 2 * time.Second,
-			LeaseDuration: 15 * time.Second,
+			LeaseDuration: 15 * time.Second, SaturationGrace: time.Minute,
 		},
 		base:               "pg",
 		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -4553,5 +4553,48 @@ func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
 	}
 	if !a.managedRoleDone[0].Load() || !a.managedRoleDone[1].Load() {
 		t.Error("a foreign role must latch its slot")
+	}
+}
+
+// Saturation counts as alive only within SaturationGrace. A primary whose slots are all
+// held by sessions stuck on hung storage refuses every new connection at once; past the
+// grace it must become eligible for the self-health step-down again, or it would hold the
+// Lease forever.
+func TestObserveSaturationPastTheGraceIsNotAlive(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	a.cfg.SaturationGrace = time.Nanosecond
+	var o reconcile.Observation
+	for i := 0; i < 3; i++ {
+		o = a.observe(context.Background())
+	}
+	if !o.Local.Saturated {
+		t.Fatal("the local node must still read as saturated")
+	}
+	if !o.LocalStuck {
+		t.Error("a primary saturated past the grace must trip self-health")
+	}
+	if !a.localSaturationExpired {
+		t.Error("the expiry must be latched (logged once)")
+	}
+}
+
+// The grace is per episode: a node that answers again and later saturates starts a fresh one.
+func TestLocalSaturationGraceIsPerEpisode(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, t0)
+	if !a.localSaturationAlive(t0.Add(30 * time.Second)) {
+		t.Error("inside the grace a saturated node counts as alive")
+	}
+	if a.localSaturationAlive(t0.Add(2 * time.Minute)) {
+		t.Error("past the grace it must not")
+	}
+	a.trackLocalSaturation(false, t0.Add(3*time.Minute))
+	a.trackLocalSaturation(true, t0.Add(4*time.Minute))
+	if !a.localSaturationAlive(t0.Add(4*time.Minute + 30*time.Second)) {
+		t.Error("a new episode must start a fresh grace")
+	}
+	if a.localSaturationExpired {
+		t.Error("the expiry latch must reset when the node answers again")
 	}
 }
