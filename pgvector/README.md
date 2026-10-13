@@ -319,7 +319,7 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2`, render-enforced) | `1` |
-| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x replicaCount + 1`. Changing it restarts the PostgreSQL pods | `7` |
+| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x replicaCount + 1`, or `3 x replicaCount + 1` with `pgpool.metrics.enabled` (the exporter logs in as the check role). Changing it restarts the PostgreSQL pods | `7` |
 | `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |

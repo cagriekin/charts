@@ -173,3 +173,19 @@ tests:
       - equal:
           path: spec.template.spec.initContainers[0].env[?(@.name=="APP_PASSWORD")].valueFrom.secretKeyRef.key
           value: app-password
+
+  # The metrics exporter logs in as the check role: its session makes pgpool open backend
+  # connections, which on a full node must come from reserved_connections, not the superuser
+  # reserve the agent needs.
+  - it: the pgpool exporter logs in as the check role, not the superuser
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].env[?(@.name=="POSTGRES_USERNAME")].value
+          value: pgpool_check
+      - equal:
+          path: spec.template.spec.containers[1].env[?(@.name=="POSTGRES_PASSWORD")].valueFrom.secretKeyRef.key
+          value: pgpool-check-password

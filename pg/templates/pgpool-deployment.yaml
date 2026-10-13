@@ -426,16 +426,21 @@ spec:
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           env:
+            {{- /* The exporter logs in as pgpool's check role, not the superuser. It only runs
+                   pgpool's own SHOW POOL_* commands, but its session still makes pgpool open a
+                   backend connection to every backend; as the superuser that connection came
+                   out of superuser_reserved_connections on a full node, the agent's slots. As
+                   the check role it comes out of reserved_connections, which counts it
+                   (pg.reservedConnections), and pgpool metrics keep working while a node is
+                   full. pgpool2_exporter caps its pool at one connection (SetMaxOpenConns(1),
+                   also on reconnect), so it is one session per pgpool replica. */}}
             - name: POSTGRES_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
+              value: {{ include "pg.pgpoolCheckUsername" . | quote }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
+                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
             - name: POSTGRES_DATABASE
               valueFrom:
                 secretKeyRef:

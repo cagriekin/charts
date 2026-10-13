@@ -147,6 +147,7 @@ the HA table above).
 | `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`) | init-config (`pool_passwd`) |
 | `APP_USER` / `APP_PASSWORD` | string | yes | `postgresql.app.username` / secret (`app-password`) | init-config (`pool_passwd`, so pgpool accepts the application role) |
 | `PGPASSWORD` | string | yes | secret (`pgpool-check-password`) | wait-check-role (psql login as the check role before pgpool starts) |
+| `POSTGRES_USERNAME` / `POSTGRES_PASSWORD` | string | yes | `pgpool.checkUser.username` / secret (`pgpool-check-password`) | pgpool-exporter sidecar (when `pgpool.metrics.enabled`), which logs in to pgpool as the check role |
 
 ## metrics / exporters
 

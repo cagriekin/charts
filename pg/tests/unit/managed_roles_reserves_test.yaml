@@ -31,6 +31,27 @@ tests:
       - failedTemplate:
           errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=4 needs at least 9'
 
+  - it: with metrics the exporter counts, so 3 replicas need 10 reserved connections
+    template: templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+      pgpool.replicaCount: 3
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=3 needs at least 10 \(per replica a health check and a streaming check and the metrics exporter, plus 1\)'
+
+  - it: with metrics the default covers 2 pgpool replicas
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+      pgpool.replicaCount: 2
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'reserved_connections = 7'
+
   - it: raising reservedConnections admits more pgpool replicas
     template: templates/postgresql-configmap.yaml
     set:

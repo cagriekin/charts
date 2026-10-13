@@ -528,7 +528,7 @@
         "reservedConnections": {
           "type": "integer",
           "minimum": 1,
-          "description": "reserved_connections for pgpool's check role on every PostgreSQL node; at least 2 x pgpool.replicaCount + 1 (render-enforced). Changing it restarts PostgreSQL pods."
+          "description": "reserved_connections for pgpool's check role on every PostgreSQL node; at least 2 x pgpool.replicaCount + 1, or 3 x with pgpool.metrics.enabled (render-enforced). Changing it restarts PostgreSQL pods."
         }
       }
     },

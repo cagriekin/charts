@@ -679,10 +679,12 @@ pgpool:
 
   # reserved_connections on every PostgreSQL node: slots only roles with
   # pg_use_reserved_connections (the check role above) may use. Each pgpool replica runs
-  # a health check and a streaming check, so it must be at least 2 x replicaCount + 1
+  # a health check and a streaming check -- and, with pgpool.metrics, the exporter, which
+  # logs in as the check role too -- so it must be at least 2 x replicaCount + 1, or
+  # 3 x replicaCount + 1 with metrics
   # (render-enforced). A value of its own rather than derived from replicaCount: the
   # setting needs a PostgreSQL restart, so tying it to replicaCount would roll every
-  # database pod on a pgpool scale. 7 covers up to 3 pgpool replicas.
+  # database pod on a pgpool scale. 7 covers up to 3 pgpool replicas, or 2 with metrics.
   reservedConnections: 7
 
   # Startup command override for the pgpool container. Empty uses the chart default,

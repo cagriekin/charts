@@ -1119,7 +1119,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            Standalone has no agent: PostgreSQL's own 3.
          - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
            i.e. pgpool's check role: pgpool.reservedConnections, at least 2 per pgpool
-           replica (a health check and a streaming check) plus 1. 0 without pgpool.
+           replica (a health check and a streaming check; 3 with pgpool.metrics, whose
+           exporter logs in as the check role) plus 1. 0 without pgpool.
          - the rest: everyone else, applications included.
        Chart-owned: setting either in postgresql.configuration is refused, so there is one
        source of truth and the sizing cannot silently drift from the topology. */ -}}
@@ -1133,10 +1134,15 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 
 {{- define "pg.reservedConnections" -}}
 {{- if .Values.pgpool.enabled -}}
-{{- $want := add (mul .Values.pgpool.replicaCount 2) 1 -}}
+{{- /* Per pgpool replica: a health check and a streaming check, plus the metrics exporter's
+       one session when pgpool.metrics is on (it logs in as the check role too). +1 covers a
+       reconnect, whose old backend connection stays cached in another pgpool child until
+       connection_life_time. */ -}}
+{{- $perReplica := ternary 3 2 .Values.pgpool.metrics.enabled -}}
+{{- $want := add (mul .Values.pgpool.replicaCount $perReplica) 1 -}}
 {{- $have := required "pgpool.reservedConnections is required when pgpool.enabled: it sets reserved_connections for pgpool's check role" .Values.pgpool.reservedConnections | int -}}
 {{- if lt $have $want -}}
-{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (a health check and a streaming check per replica, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own." $have (int .Values.pgpool.replicaCount) $want) -}}
+{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (per replica a health check and a streaming check%s, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own." $have (int .Values.pgpool.replicaCount) $want (ternary " and the metrics exporter" "" (eq $perReplica 3))) -}}
 {{- end -}}
 {{- $have -}}
 {{- else -}}

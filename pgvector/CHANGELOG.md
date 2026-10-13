@@ -38,8 +38,9 @@
 - **PostgreSQL 16 or newer is required** when `postgresql.majorVersion` is set (both images ship
   18). `postgresql.configuration.superuser_reserved_connections` and `reserved_connections` are
   now refused. The chart owns both, and `max_connections` must exceed their sum. With pgpool,
-  `pgpool.reservedConnections` (default 7) must be at least `2 x pgpool.replicaCount + 1`, so more
-  than 3 pgpool replicas need it raised.
+  `pgpool.reservedConnections` (default 7) must be at least `2 x pgpool.replicaCount + 1`, or
+  `3 x pgpool.replicaCount + 1` with `pgpool.metrics.enabled`, so more than 3 pgpool replicas (2
+  with metrics) need it raised.
 - **Non-superuser roles get fewer slots.** The reserves grow from PostgreSQL's 3 to one per node
   plus 3, plus `pgpool.reservedConnections` (7) with pgpool: 13 on a 3-node cluster with pgpool,
   so non-superuser logins get 87 of the default 100 `max_connections` instead of 97. Raise
@@ -55,7 +56,8 @@
   `reserved-connections.conf` sets `superuser_reserved_connections` to one slot per node plus 3
   (every agent holds one session to every node; standalone keeps PostgreSQL's 3), and
   `reserved_connections` to `pgpool.reservedConnections` (default 7, at least
-  `2 x pgpool.replicaCount + 1`), for pgpool's checks. That is a value of its own because the
+  `2 x pgpool.replicaCount + 1`, `3 x` with metrics), for pgpool's checks and exporter. That is a
+  value of its own because the
   setting needs a PostgreSQL restart: deriving it from `pgpool.replicaCount` would roll every
   database pod on a pgpool scale. Applications get the rest. The postgresql ConfigMap therefore
   renders on every install.
@@ -88,7 +90,10 @@
   `superuser_reserved_connections` slots from the agent. Now readiness requires node 0 (the
   primary, the write path) to be up or waiting, and liveness fails only when PCP stops answering
   or every backend is marked down (the #122 wedge). A detached read backend still never makes
-  pgpool unready (#361). Unlike before, an unreachable primary that pgpool still lists as up no
+  pgpool unready (#361). The pgpool metrics exporter logs in as `pgpool_check` instead of the
+  superuser for the same reason: its one session (pgpool2_exporter caps its pool at one
+  connection) makes pgpool connect to every backend, and those connections now come from
+  `reserved_connections`, so pgpool metrics keep working on a full node. Unlike before, an unreachable primary that pgpool still lists as up no
   longer makes pgpool unready: sessions fail with pgpool's error instead of being refused by an
   empty Service.
 
