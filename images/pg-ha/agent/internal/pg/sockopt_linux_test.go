@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,7 +15,7 @@ func TestSetTCPUserTimeoutAppliesToTheSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	d := net.Dialer{Control: setTCPUserTimeout(3 * time.Second)}
+	d := net.Dialer{Control: setTCPUserTimeout(tcpUserTimeout)}
 	conn, err := d.DialContext(context.Background(), "tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +35,7 @@ func TestSetTCPUserTimeoutAppliesToTheSocket(t *testing.T) {
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
-	if got != 3000 {
-		t.Errorf("TCP_USER_TIMEOUT = %dms, want 3000", got)
+	if want := int(tcpUserTimeout.Milliseconds()); got != want {
+		t.Errorf("TCP_USER_TIMEOUT = %dms, want %d", got, want)
 	}
 }

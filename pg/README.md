@@ -106,7 +106,8 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. With `ha.enabled` the server runs from the HA image and follows `ha.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` HA image tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
-| `postgresql.username` | Database username | `postgres` |
+| `postgresql.username` | Database username (a superuser; the chart's own tooling logs in as it) | `postgres` |
+| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` -- see [Application role and connection reserves](#application-role-and-connection-reserves) | `app_user` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |
@@ -635,8 +636,11 @@ over TCP, on **one persistent connection per node** that it keeps across ticks a
 the connection fails (pg-ha image 2.2.0, #364). Each query runs under the agent's per-probe
 deadline, so a dead peer is still noticed within that deadline rather than hidden behind a stale
 socket, and a peer that restarted between ticks -- including one that came back on a new pod IP,
-which `TCP_USER_TIMEOUT` detects within 3s -- is re-dialled inside the same probe. Connections
-idle for 5 minutes (a scaled-down ordinal) are closed. The sessions show as
+which `TCP_USER_TIMEOUT` detects within 5s -- is re-dialled inside the same probe. Connections
+idle for 5 minutes (a scaled-down ordinal) are closed. An open session is not affected when the
+node reaches `max_connections`; a refused *new* connection ("too many clients") is read as proof
+the node is alive -- see [Application role and connection reserves](#application-role-and-connection-reserves).
+The sessions show as
 `application_name = pg-ha-agent` in `pg_stat_activity`: expect one from each agent on every
 node, so a 3-node cluster holds three such sessions per node. Before 2.2.0 every probe was a
 fresh `psql` process, which in this image resolves to Debian's Perl wrapper; at six to nine probes
@@ -1556,7 +1560,8 @@ in its status.
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (also sizes `reserved_connections`: 2 per instance + 1) | `1` |
+| `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
 | `pgpool.maxPool` | Max cached connections per process | `4` |
@@ -1642,12 +1647,15 @@ in its status.
 | `postgresql.existingSecret.databaseKey` | Database key in secret | `database` |
 | `postgresql.existingSecret.repmgrPasswordKey` | Repmgr password key in secret | `repmgr-password` |
 | `postgresql.existingSecret.monitoringPasswordKey` | Monitoring-user password key in secret (required when `prometheusExporter.monitoringUser.enabled`) | `monitoring-password` |
+| `postgresql.existingSecret.appPasswordKey` | Application-role (`postgresql.app`) password key in secret | `app-password` |
+| `postgresql.existingSecret.pgpoolCheckPasswordKey` | pgpool check-role (`pgpool.checkUser`) password key in secret | `pgpool-check-password` |
 
 When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-generated with:
 - `username`: Base64 encoded value from `postgresql.username`
 - `password`: Random 32 character alphanumeric string
 - `database`: Base64 encoded value from `postgresql.database`
 - `repmgr-password`: Random 32 character alphanumeric string (when `ha.enabled` is true — the key keeps its 1.x name; see `ha.username`)
+- `app-password`, `pgpool-check-password`: Random 32 character alphanumeric strings, kept across upgrades
 
 ### Service Parameters
 
@@ -1730,6 +1738,52 @@ When enabled, NetworkPolicies restrict traffic:
 > For clients in another namespace, add a `namespaceSelector` (alone, or combined with
 > `podSelector` in the same `from` entry) — `podSelector` matches the policy's own
 > namespace only.
+
+## Application role and connection reserves
+
+PostgreSQL refuses a **new** connection once `max_connections` is used up. Superusers get a
+small emergency pool, `superuser_reserved_connections`, but every superuser shares it. The HA
+agent and the chart's own tooling log in as superusers, and so does `postgresql.username`. So
+an application connecting as `postgresql.username` can use up the very slots the agent needs to
+reconnect to a full node.
+
+The chart splits connections into three pools:
+
+| Pool | Who | Size |
+|------|-----|------|
+| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one session to every node). Standalone: 3 |
+| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `2 x pgpool.replicaCount + 1` with pgpool, else 0 |
+| the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
+
+Both reserves live in a chart-owned `reserved-connections.conf`. Setting them in
+`postgresql.configuration` is refused, and so is a `max_connections` that leaves no room for
+applications. Raise `max_connections` (default 100) to grow the application pool. Requires
+PostgreSQL 16+ (`reserved_connections` is new in 16).
+
+The reserves only isolate the agent if applications are not superusers. The chart therefore
+provisions two non-superuser `LOGIN` roles, re-asserting their definition on every primary
+start: no elevated attribute, the password from the release Secret. In HA mode the agent does
+this on the primary; standalone does it in the postStart hook.
+
+- **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. Point
+  applications at it, through pgpool or directly; the password is the Secret's `app-password`
+  key. Objects created earlier by `postgresql.username` keep their owner, so grant access (or
+  `REASSIGN OWNED`) before switching. Applications still using `postgresql.username` keep
+  working, just without the isolation.
+- **`pgpool.checkUser.username` (default `pgpool_check`)** is what pgpool's health and
+  streaming checks log in as. It holds `pg_monitor` and `pg_use_reserved_connections`, so on a
+  full node the checks still get a slot and pgpool does not detach the node. A new pgpool pod
+  waits in its `wait-check-role` init container until the role can log in.
+
+When a node does refuse the agent with `too many clients` (SQLSTATE 53300):
+
+- **The agent counts it as alive.** A full primary is not stepped down by self-health, and the
+  agent waits instead of acting on it.
+- **A lease-holding standby holds off.** It waits up to `2 x LeaseDuration` before promoting
+  past a full peer whose WAL position it cannot read, unless that peer's fresh gossip shows it
+  is not ahead.
+- **It is exported.** `pg_ha_agent_local_saturated` and `pg_ha_agent_peers_saturated` report
+  it, and the agent logs each transition.
 
 ## Databases & roles
 

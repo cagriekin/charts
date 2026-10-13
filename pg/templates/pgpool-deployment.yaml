@@ -137,6 +137,10 @@ spec:
                   { $0 = splice($0, "__POSTGRES_USER__", ENVIRON["SUB_USER"])
                     $0 = splice($0, "__POSTGRES_PASSWORD__", ENVIRON["SUB_PASS"])
                     $0 = splice($0, "__POSTGRES_DB__", ENVIRON["SUB_DB"])
+                    $0 = splice($0, "__CHECK_USER__", ENVIRON["SUB_CHECK_USER"])
+                    $0 = splice($0, "__CHECK_PASSWORD__", ENVIRON["SUB_CHECK_PASS"])
+                    $0 = splice($0, "__APP_USER__", ENVIRON["SUB_APP_USER"])
+                    $0 = splice($0, "__APP_PASSWORD__", ENVIRON["SUB_APP_PASS"])
                     print }
                 ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
               }
@@ -146,13 +150,21 @@ spec:
               SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
               SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
               SUB_DB=$(printf '%s' "$POSTGRES_DB" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
-              export SUB_USER SUB_PASS SUB_DB
+              SUB_CHECK_USER=$(printf '%s' "$PGPOOL_CHECK_USER" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+              SUB_CHECK_PASS=""
+              SUB_APP_USER=""
+              SUB_APP_PASS=""
+              export SUB_USER SUB_PASS SUB_DB SUB_CHECK_USER SUB_CHECK_PASS SUB_APP_USER SUB_APP_PASS
               subst /usr/local/etc/pgpool.conf
               # pool_passwd escapes backslash and the field separator with
               # backslash: \ -> \\ first, then : -> \:
               SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               SUB_DB="$POSTGRES_DB"
+              SUB_CHECK_USER=$(printf '%s' "$PGPOOL_CHECK_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              SUB_CHECK_PASS=$(printf '%s' "$PGPOOL_CHECK_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              SUB_APP_USER=$(printf '%s' "$APP_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              SUB_APP_PASS=$(printf '%s' "$APP_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               subst /usr/local/etc/pool_passwd
 {{- if .Values.pgpool.tls.enabled }}
               # Stage TLS certs from the read-only Secret mounts into the emptyDir with
@@ -185,6 +197,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+            - name: PGPOOL_CHECK_USER
+              value: {{ include "pg.pgpoolCheckUsername" . | quote }}
+            - name: PGPOOL_CHECK_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
+            - name: APP_USER
+              value: {{ include "pg.appUsername" . | quote }}
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretAppPasswordKey" . }}
             - name: PCP_ADMIN_USER
               valueFrom:
                 secretKeyRef:
@@ -212,6 +238,49 @@ spec:
               readOnly: true
 {{- end }}
 {{- end }}
+        {{- /* Hold pgpool back until its check role can log in. The role is created by the
+               agent on the primary (HA) or the postStart hook (standalone), and on an upgrade
+               this pod can start before that has run. Started without it, every health
+               check fails, the RO backend is detached and the probes -- which route through
+               pgpool -- fail too. Waiting here instead keeps the new pod out of service
+               (maxUnavailable 0: the old pods keep serving) and the reason in this
+               container's log. No deadline: a role that never appears is a provisioning
+               failure the agent's log or the FailedPostStartHook event names, and giving up
+               would only start pgpool into the broken state. Same backend and TLS as
+               pgpool's own checks. */}}
+        - name: wait-check-role
+          image: {{ include "pg.image" .Values.pgpool.image | quote }}
+          imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until err=$(PGCONNECT_TIMEOUT=5 psql -h {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }} -p 5432 -U "$PGPOOL_CHECK_USER" -d "$POSTGRES_DB" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); do
+                echo "waiting for pgpool check role $PGPOOL_CHECK_USER to log in: $err"
+                sleep 5
+              done
+              echo "pgpool check role $PGPOOL_CHECK_USER logs in; starting pgpool"
+          env:
+{{- include "pg.pgpoolBackendTLSEnv" . | nindent 12 }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+            - name: PGPOOL_CHECK_USER
+              value: {{ include "pg.pgpoolCheckUsername" . | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
+          volumeMounts:
+            - name: pgpool-config
+              mountPath: /usr/local/etc
       containers:
         - name: pgpool
           image: {{ include "pg.image" .Values.pgpool.image | quote }}
@@ -295,22 +364,7 @@ spec:
               containerPort: 9898
               protocol: TCP
           env:
-{{- if .Values.pgpool.tls.enabled }}
-            # Backend TLS (pgpool -> PostgreSQL) via libpq env (#110). Under PostgreSQL
-            # mTLS, backendClientCert supplies the client cert pgpool presents.
-            - name: PGSSLMODE
-              value: {{ .Values.pgpool.tls.backendSslmode | quote }}
-{{- if has .Values.pgpool.tls.backendSslmode (list "verify-ca" "verify-full") }}
-            - name: PGSSLROOTCERT
-              value: /usr/local/etc/tls/ca.crt
-{{- end }}
-{{- if .Values.pgpool.tls.backendClientCert }}
-            - name: PGSSLCERT
-              value: /usr/local/etc/tls/backend.crt
-            - name: PGSSLKEY
-              value: /usr/local/etc/tls/backend.key
-{{- end }}
-{{- end }}
+{{- include "pg.pgpoolBackendTLSEnv" . | nindent 12 }}
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:

@@ -164,6 +164,13 @@ type agent struct {
 	// lifetime. Once all have, the cold-boot wait never applies again -- so a
 	// steady-state failover is not delayed by a recent agent/pod restart.
 	peersSeen map[string]bool
+	// peerSaturatedSince records when each peer was first seen refusing connections with
+	// too_many_connections in its current episode; cleared when it answers or fails
+	// differently. Bounds PeerState.SaturatedWait. Reconcile goroutine only.
+	peerSaturatedSince map[string]time.Time
+	// localSaturated latches the local saturation state so the log records transitions,
+	// not every tick.
+	localSaturated bool
 	// rewindFailures counts CONSECUTIVE non-divergence pg_rewind failures against
 	// rewindFailureTarget, so a persistently unrewindable node still recovers (#298 review).
 	// Classification is fail-safe -- anything that is not provably divergence is retried
@@ -310,6 +317,9 @@ type agent struct {
 	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
 	// flips true on success, so a transient failure retries the next primary tick.
 	rehashedManagedUsers atomic.Bool
+	// managedRolesDone latches once ensureManagedRolesOnce has converged (or hit a
+	// permanent error) in this process.
+	managedRolesDone atomic.Bool
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -365,6 +375,10 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 	}
 	mech := newMechanism(cfg, pgBindir)
 	conns := pg.NewConnCache()
+	prober, err := pg.NewProber(conns)
+	if err != nil {
+		return nil, err
+	}
 	return &agent{
 		cfg:    cfg,
 		log:    log,
@@ -372,18 +386,19 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		kube:   kube,
 		mech:   mech,
 		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
-		prober: pg.NewProber(conns),
+		prober: prober,
 		conns:  conns,
 		metr:   observe.New(),
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
-		health:           &selfHealthTracker{grace: cfg.LeaseDuration},
-		pgBindir:         pgBindir,
-		pgControlDataBin: pgBindir + "/pg_controldata",
-		repmgrModulePath: filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
-		base:             podname.Base(cfg.PodName),
-		bootAt:           time.Now(),
-		peersSeen:        map[string]bool{},
+		health:             &selfHealthTracker{grace: cfg.LeaseDuration},
+		pgBindir:           pgBindir,
+		pgControlDataBin:   pgBindir + "/pg_controldata",
+		repmgrModulePath:   filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
+		base:               podname.Base(cfg.PodName),
+		bootAt:             time.Now(),
+		peersSeen:          map[string]bool{},
+		peerSaturatedSince: map[string]time.Time{},
 		// One slot: a second concurrent node-local operation waits on the channel rather
 		// than queueing up behind an unbounded backlog of restarts.
 		intents: make(chan intentRequest, 1),
@@ -849,6 +864,7 @@ func (a *agent) tick(ctx context.Context) {
 	// it is a primary-only convergence step.
 	if err == nil && (dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary) {
 		a.rehashManagedUsersOnce(ctx)
+		a.ensureManagedRolesOnce(ctx)
 		// Same reason, same place (#288 review, second pass). topologyTick is PURELY
 		// observational -- gauges only -- and it makes an apiserver pod LIST plus a psql query,
 		// both hangable. Inside act() it held opMu for its own fenceBudget() ON TOP of the
@@ -979,6 +995,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	ls := reconcile.LocalState{
 		HasData:    process.HasData(a.cfg.PGDATA),
 		Running:    local.Reachable,
+		Saturated:  local.Saturated,
 		InRecovery: local.Role == pg.RoleStandby,
 		Timeline:   local.Timeline,
 		TimelineOK: local.TimelineOK,
@@ -990,6 +1007,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// so a standby cloned from a restored primary correctly reports none of its own.
 		RestoredAt: a.localRestoredAt(),
 	}
+	a.trackLocalSaturation(ls.Saturated)
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
 	// to a stopped node (without this a fenced primary-state node has no timeline,
@@ -1085,17 +1103,23 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			defer pwg.Done()
 			ns := a.prober.Probe(ctx, a.peerConn(name))
 			probes[i] = peerProbe{set: true, ps: reconcile.PeerState{
-				Name: name, Reachable: ns.Reachable, Role: ns.Role,
+				Name: name, Reachable: ns.Reachable, Saturated: ns.Saturated, Role: ns.Role,
 				Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
 			}}
 		}(i, name)
 	}
 	pwg.Wait()
+	now := time.Now()
+	saturatedPeers := 0
 	for _, pr := range probes {
 		if !pr.set {
 			continue
 		}
 		name, ps := pr.ps.Name, pr.ps
+		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, now)
+		if ps.Saturated {
+			saturatedPeers++
+		}
 		// An unreachable peer with fresh gossip contributes its self-reported
 		// position to the election (it is never a rewind/follow target -- only the
 		// release/handoff decision uses it).
@@ -1115,6 +1139,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 		o.Peers = append(o.Peers, ps)
 	}
+	a.metr.SetPeersSaturated(saturatedPeers)
 	// Bounded for the same reason as the gossip read above (#298 review); the marker
 	// is re-read every tick, so a deadline miss self-heals.
 	mctx, mcancel := context.WithTimeout(ctx, a.fenceBudget())
@@ -1229,7 +1254,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// fire an unwanted ReleaseLease failover the moment pause is lifted. On resume a
 	// still-stopped node is then treated as a startup, not a regression.
 	shouldServe := o.HoldLease && !o.Paused && o.Local.HasData && !o.Local.InRecovery
-	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
+	// A too_many_connections refusal counts as running here: it proves the postmaster is
+	// alive and forking backends, and the step-down this tracker drives (SIGQUIT the
+	// primary, release the Lease) is for a frozen node. Treating a full primary as wedged
+	// would turn a connection storm into a write outage plus a failover.
+	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running || o.Local.Saturated, time.Now())
 	// PeersPending: the holder waits (does not promote/resume) only during a true
 	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)
 	// records peers ever SQL-reachable; once all have been seen, the wait never
@@ -1253,6 +1282,40 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// FROM it (which would deadlock-by-delay the bootstrap).
 	o.PeersPending = o.Marker.Present && anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
 	return o
+}
+
+// trackLocalSaturation publishes the local saturation gauge and logs transitions.
+func (a *agent) trackLocalSaturation(saturated bool) {
+	a.metr.SetLocalSaturated(saturated)
+	switch {
+	case saturated && !a.localSaturated:
+		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) but unobservable until a slot frees")
+	case !saturated && a.localSaturated:
+		a.log.Info("local postgres accepts the agent's connections again")
+	}
+	a.localSaturated = saturated
+}
+
+// trackPeerSaturation records a peer's saturation episode and reports whether it is still
+// inside the grace during which a lease-holding standby waits rather than promote past it
+// (reconcile.PeerState.SaturatedWait). The grace is bootstrapGrace, 2x LeaseDuration: long
+// enough to ride out a connection spike, bounded because the saturated node's own agent is
+// just as blind to it and cannot take over.
+func (a *agent) trackPeerSaturation(name string, saturated bool, now time.Time) bool {
+	since, was := a.peerSaturatedSince[name]
+	if !saturated {
+		if was {
+			a.log.Info("peer accepts the agent's connections again", "peer", name)
+			delete(a.peerSaturatedSince, name)
+		}
+		return false
+	}
+	if !was {
+		a.log.Warn("peer is refusing the agent's connections: max_connections exhausted; treating it as alive with an unknown position", "peer", name)
+		since = now
+		a.peerSaturatedSince[name] = since
+	}
+	return now.Sub(since) < a.bootstrapGrace()
 }
 
 // observeStandbyStall sets Observation.StandbyStalled when this node has been a running standby
@@ -2746,6 +2809,46 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 	if ok {
 		a.rehashedManagedUsers.Store(true)
 		a.log.Info("md5->scram managed-user re-hash converged")
+	}
+}
+
+// ensureManagedRolesOnce provisions the chart's non-superuser login roles -- the
+// application role and pgpool's check role -- on this node once it is serving read-write.
+// Standbys get them by replication. Runs at most once per process, latching on success so
+// a transient failure retries on the next primary tick, and on a permanent failure (a
+// password the agent cannot hash) so it is reported once instead of every tick. Outside
+// opMu and the fence budget for the same reason as the re-hash above.
+//
+// pgpool's init container waits until the check role can log in, so until this converges
+// a new pgpool pod stays in Init -- that, and the log line here, are where a failure shows.
+func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
+	if a.managedRolesDone.Load() {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ok, permanent := true, false
+	for _, r := range []pg.ManagedRole{
+		{Name: a.cfg.AppUser, Password: a.cfg.AppPassword, Kind: pg.RoleApp},
+		{Name: a.cfg.PgpoolCheckUser, Password: a.cfg.PgpoolCheckPassword, Kind: pg.RolePgpoolCheck},
+	} {
+		err := pg.EnsureRole(rctx, pg.OSExec{}, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
+		switch {
+		case err == nil:
+		case pg.IsPermanentRoleError(err):
+			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)
+			permanent = true
+		default:
+			a.log.Warn("managed role provisioning failed (retries next primary tick)", "role", r.Name, "err", err)
+			ok = false
+		}
+	}
+	if !ok {
+		return
+	}
+	a.managedRolesDone.Store(true)
+	if !permanent {
+		a.log.Info("managed roles provisioned", "app", a.cfg.AppUser, "pgpoolCheck", a.cfg.PgpoolCheckUser)
 	}
 }
 

@@ -12,6 +12,8 @@
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateRoleNames" . }}
+{{- include "pg.validateManagedRoles" . }}
+{{- include "pg.validateConnectionReserves" . }}
 {{- include "pg.validatePgHba" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validatePgbackrestPassthrough" . }}
@@ -255,11 +257,8 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
-{{- if or (eq (include "pg.postgresqlConfigRenders" .) "true") .Values.postgresql.podAnnotations }}
       annotations:
-{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
-        checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
-{{- end }}
+        checksum/postgresql-config: {{ include "pg.postgresqlConfigMap" . | sha256sum }}
 {{- if .Values.pgbackrest.enabled }}
         # Roll the pod when the pgbackrest config (S3 endpoint/bucket/retention)
         # changes: pgbackrest.conf is a subPath mount, which the kubelet never
@@ -270,7 +269,6 @@ spec:
       {{- with .Values.postgresql.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
-{{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -720,19 +718,9 @@ spec:
             - -c
             - |
               CONF=/var/lib/postgresql/data/pgdata/postgresql.conf
-{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
               if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                 echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
               fi
-{{- else }}
-              # A stale include_dir left in PGDATA while conf.d features
-              # were enabled is fatal at postmaster start once the mount
-              # is gone.
-              if [ -f "$CONF" ] && grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
-                grep -v "include_dir = '/etc/postgresql/conf.d'" "$CONF" > "$CONF.tmp"
-                mv "$CONF.tmp" "$CONF"
-              fi
-{{- end }}
 {{- if not .Values.pgbackrest.enabled }}
               # pgbackrest disabled: the HA image entrypoint persisted
               # archive_mode=on + a pgbackrest archive_command into PGDATA's
@@ -802,6 +790,22 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+            # Chart-managed non-superuser roles, provisioned by the agent on the primary (HA)
+            # or by the postStart hook below (standalone).
+            - name: APP_USER
+              value: {{ include "pg.appUsername" . | quote }}
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretAppPasswordKey" . }}
+            - name: PGPOOL_CHECK_USER
+              value: {{ include "pg.pgpoolCheckUsername" . | quote }}
+            - name: PGPOOL_CHECK_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
 {{- if and .Values.postgresql.extensions.enabled .Values.postgresql.extensions.extraLibs }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
             # #309: an apt-installed extension's transitive shared-library dependency
@@ -1072,12 +1076,10 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
-                        {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         {{- /* Insert the operator's rules as ONE ordered block, anchored on the
@@ -1157,6 +1159,57 @@ spec:
                         rm -f "$PGCHART_INS"
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+                        {{- /* Chart-managed non-superuser roles (postgresql.app, pgpool.checkUser):
+                               standalone has no agent, so this hook provisions them on every start,
+                               the same definition pg.EnsureRole asserts in HA mode -- created if
+                               absent, then LOGIN without any elevated attribute, the password from
+                               the Secret, and the kind's privileges. Passwords reach psql only
+                               through the environment (\getenv), statement logging is lowered
+                               before they are sent, and VERBOSITY terse keeps the dynamic ALTER
+                               out of the error CONTEXT. A failure fails the hook: the kubelet
+                               restarts the container and records the message in a
+                               FailedPostStartHook event, where it is visible, instead of pgpool
+                               waiting forever on a role that was never created. */}}
+                        if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 \
+                             -v r_app="$APP_USER" -v r_check="$PGPOOL_CHECK_USER" -v d="$POSTGRES_DB" <<'SQL'
+                    \set VERBOSITY terse
+                    \getenv app_pw APP_PASSWORD
+                    \getenv check_pw PGPOOL_CHECK_PASSWORD
+                    SET log_statement = 'none';
+                    SET log_min_duration_statement = -1;
+                    SET log_min_error_statement = 'panic';
+                    SET client_min_messages = 'warning';
+                    SET password_encryption = 'scram-sha-256';
+                    SET myvars.app = :'r_app';
+                    SET myvars.app_pw = :'app_pw';
+                    SET myvars.chk = :'r_check';
+                    SET myvars.chk_pw = :'check_pw';
+                    SET myvars.db = :'d';
+                    DO $$
+                    DECLARE
+                      r RECORD;
+                    BEGIN
+                      FOR r IN SELECT * FROM (VALUES
+                          (current_setting('myvars.app'), current_setting('myvars.app_pw'), 'app'),
+                          (current_setting('myvars.chk'), current_setting('myvars.chk_pw'), 'pgpool-check')) AS t(name, pw, kind)
+                      LOOP
+                        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name) THEN
+                          EXECUTE format('CREATE ROLE %I', r.name);
+                        END IF;
+                        EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', r.name, r.pw);
+                        IF r.kind = 'pgpool-check' THEN
+                          EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', r.name);
+                        ELSE
+                          EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('myvars.db'), r.name);
+                        END IF;
+                      END LOOP;
+                    END
+                    $$;
+                    SQL
+                        then
+                          echo "postStart: provisioning the managed roles ($APP_USER, $PGPOOL_CHECK_USER) failed; see the psql error above" >&2
+                          exit 1
+                        fi
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
                         {{- end }}
@@ -1186,12 +1239,10 @@ spec:
 {{- end }}
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
-                        {{- end }}
                         {{- /* md5/SCRAM pg_hba compat, the md5->scram re-hash and the user
                                pgHba entries are all authored by the agent (single author, #199):
                                it writes the md5-first compat pg_hba on every node and re-hashes
@@ -1422,11 +1473,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
             - name: postgresql-config
               mountPath: /etc/postgresql/conf.d
               readOnly: true
-{{- end }}
 {{- if .Values.postgresql.tls.enabled }}
             - name: postgresql-tls
               mountPath: /etc/postgresql/tls
@@ -1531,21 +1580,10 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- /* The disjuncts are the conditions that actually CONTRIBUTE a volume (#298 review).
-       `.Values.ha.enabled` used to stand in for agent mode, but the only volume it ever
-       gated by itself was repmgr-config, which this release deletes -- so on the chart
-       DEFAULT (ha on, persistence on, everything else off) this emitted a `volumes:` key
-       with no items, i.e. `volumes: null` in the pod spec. The two agent-mode volumes that
-       really exist are named explicitly instead, so the key appears exactly when there is
-       something to put under it and cannot silently lose one either. */}}
-{{- $needsVolumes := or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") (and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName)) $control.enabled -}}
-{{- if $needsVolumes }}
       volumes:
-{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config
           configMap:
             name: {{ include "pg.fullname" . }}-postgresql-config
-{{- end }}
 {{- if .Values.postgresql.tls.enabled }}
         # Server cert (#110). defaultMode 0400 + fsGroup 103 -> the postgres uid reads
         # it and PostgreSQL accepts the key (root-owned, not group/world readable),
@@ -1639,7 +1677,6 @@ spec:
           # never null (an empty sizeLimit would render as unbounded again).
           emptyDir:
             sizeLimit: {{ .Values.postgresql.persistence.emptyDir.sizeLimit | default .Values.postgresql.persistence.size | default "10Gi" }}
-{{- end }}
 {{- end }}
 {{- if .Values.postgresql.persistence.enabled }}
   volumeClaimTemplates:

@@ -1,6 +1,53 @@
 # pgvector chart changelog
 
-## 2.4.2 - 2026-10-13
+## 2.5.0 - 2026-10-13
+
+### Upgrade notes
+
+- **Two new roles are created on upgrade: `app_user` (`postgresql.app.username`) and
+  `pgpool_check` (`pgpool.checkUser.username`).** Both are plain `LOGIN` roles, and the chart
+  re-asserts their definition on every primary start: no superuser or other elevated attribute,
+  the password from the release Secret. **A role that already exists under one of these names is
+  converted** (demoted to `NOSUPERUSER`, password reset). Rename the value if you already use the
+  name. A name that collides with `postgresql.username`, `ha.username`, the monitoring user or a
+  `postgresql.roles[]` entry is refused at render time.
+- **`app_user` becomes the owner of `postgresql.database`.** Objects already in that database keep
+  their current owner, so give `app_user` access to them (`GRANT`, or `REASSIGN OWNED BY` the
+  superuser) before you point applications at it. Until you do, applications keep working as
+  `postgresql.username`. Nothing forces them to switch.
+- **With `postgresql.existingSecret`, the Secret needs two new keys**: `app-password` and
+  `pgpool-check-password`, or set `postgresql.existingSecret.appPasswordKey` /
+  `pgpoolCheckPasswordKey`. Generated Secrets get both keys automatically.
+- **PostgreSQL 16 or newer is required** when `postgresql.majorVersion` is set (both images ship
+  18). `postgresql.configuration.superuser_reserved_connections` and `reserved_connections` are
+  now refused. The chart owns both, and `max_connections` must exceed their sum.
+- **The pods roll once** (new configuration, environment and image), and so does pgpool. Each new
+  pgpool pod waits in its `wait-check-role` init container until the agent on the primary (or the
+  standalone postStart hook) has created `pgpool_check`. The old pgpool pods keep serving until
+  then.
+
+### Added
+
+- **Connection reserves, so a full node stays observable.** A chart-owned
+  `reserved-connections.conf` sets `superuser_reserved_connections` to one slot per node plus 3
+  (every agent holds one session to every node; standalone keeps PostgreSQL's 3), and
+  `reserved_connections` to `2 x pgpool.replicaCount + 1`, for pgpool's checks. Applications get
+  the rest. The postgresql ConfigMap therefore renders on every install.
+- **`postgresql.app`: a non-superuser application role** that owns `postgresql.database`. All
+  superusers share one emergency pool (`superuser_reserved_connections`), so an application
+  logged in as the superuser can use up the slots the agent needs. Point applications at
+  `app_user` through pgpool, which now accepts it, or directly. The password is in the release
+  Secret under `app-password`.
+- **`pgpool.checkUser`: pgpool's health and streaming checks no longer log in as the superuser.**
+  The check role has `pg_monitor` and `pg_use_reserved_connections`, so the checks draw from
+  `reserved_connections`. When application sessions fill a node, its health check still passes
+  and pgpool does not detach it.
+- **The agent treats `too many clients` (SQLSTATE 53300) as proof that a node is alive.** A full
+  primary is never stepped down by self-health: before, a primary whose connections ran out for
+  `LeaseDuration` was SIGQUIT'd and failed over as if wedged. A lease-holding standby waits up to
+  `2 x LeaseDuration` before promoting past a full peer whose position it cannot read, unless that
+  peer's fresh gossip shows it is not ahead. New gauges: `pg_ha_agent_local_saturated`,
+  `pg_ha_agent_peers_saturated`.
 
 ### Changed
 
@@ -11,12 +58,12 @@
   scales with tenant count. The agent now keeps one connection per node across ticks (every query
   under the per-probe deadline; re-dialled on a connection failure, kept on an ordinary SQL error;
   one in-call retry on a fresh dial when a reused socket fails, with `TCP_USER_TIMEOUT` failing a
-  socket to a vanished peer within 3s so that retry still fits the deadline; connections idle for
+  socket to a vanished peer within 5s so that retry still fits the deadline; connections idle for
   5 minutes, such as to a scaled-down ordinal, are closed; sessions are terminated cleanly on
-  shutdown). Failover and fencing
-  timings are unchanged; the sessions appear as `application_name = pg-ha-agent` in
+  shutdown). An open session is not affected when the node reaches `max_connections`. Failover
+  and fencing timings are unchanged; the sessions appear as `application_name = pg-ha-agent` in
   `pg_stat_activity`, one from each agent on every node. `ha.image.tag` and the etcd bootstrap
-  image move to `2.2.0-pg18`. **The pods roll once.**
+  image move to `2.2.0-pg18`.
 
 ## 2.4.1 - 2026-10-08
 

@@ -61,6 +61,9 @@ type LocalState struct {
 	RestoredAt string
 	HasData    bool
 	Running    bool
+	// Saturated: postgres refused the agent's connection with too_many_connections, so
+	// Running is false but the postmaster is provably alive (see pg.NodeState.Saturated).
+	Saturated  bool
 	InRecovery bool
 	Timeline   pg.Timeline
 	TimelineOK bool
@@ -82,6 +85,13 @@ type PeerState struct {
 	TimelineOK bool
 	LSN        pg.LSN
 	LSNOK      bool
+	// Saturated: the peer refused the probe with too_many_connections -- alive, but its
+	// live role and position are unreadable (it is not Reachable).
+	Saturated bool
+	// SaturatedWait is Saturated within the grace the observer allows (2x LeaseDuration
+	// from the first saturated probe). While set, a lease-holding standby does not
+	// promote past this peer unless its fresh gossip shows it is not ahead.
+	SaturatedWait bool
 	// RestoredAt is this peer's last successful restore, gossiped (#288). A peer that was
 	// restored more recently than this node carries the cluster's intended history even though
 	// a PITR restore leaves it BEHIND in LSN terms -- so it outranks on provenance, not
@@ -234,6 +244,9 @@ func Decide(o Observation) Decision {
 	// confirm the role. A previously-ready node now frozen is caught by LocalStuck
 	// below (self-health failover), so exclude that case.
 	if o.LocalProcessAlive && !o.Local.Running && !o.LocalStuck {
+		if o.Local.Saturated {
+			return d(Wait, "", "postgres is running but refusing new connections (max_connections exhausted); waiting for a free slot")
+		}
 		return d(Wait, "", "postgres is running but not yet accepting connections; waiting for it to reach a ready state")
 	}
 
@@ -286,6 +299,9 @@ func Decide(o Observation) Decision {
 				if o.PeersPending {
 					return d(Wait, "", "cold boot: a gossip-only peer reports more WAL; wait for it to become observable before promoting (it may promote to a newer timeline)")
 				}
+			}
+			if p := saturatedPeerBlockingPromote(o); p != "" {
+				return d(Wait, "", "peer "+p+" is alive but refusing connections (max_connections exhausted), so its WAL position is unknown; wait before promoting past it")
 			}
 			if o.PeersPending {
 				return d(Wait, "", "cold boot: waiting for peers to report their position before promoting (recovery-mode makes stopped primary-state peers observable)")
@@ -712,6 +728,28 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 		return bestReach, true
 	}
 	return best, bestReachable
+}
+
+// saturatedPeerBlockingPromote returns a peer that is alive but refusing connections, and
+// may hold more WAL than local, while still inside its SaturatedWait grace; "" if none.
+// Without this a saturated peer ranks as absent: an unreachable peer with no position is
+// skipped by moreAdvancedPeer, so the holder could promote past a live standby that is
+// ahead and discard its WAL on the rewind (invariant 8). Fresh gossip that shows the peer
+// is NOT ahead settles the question. The wait is bounded because the saturated node's own
+// agent is equally blind to it and cannot take over; past the grace the ordinary
+// unreachable-peer logic applies.
+func saturatedPeerBlockingPromote(o Observation) string {
+	for i := range o.Peers {
+		p := &o.Peers[i]
+		if !p.SaturatedWait {
+			continue
+		}
+		if p.Gossip && !peerAhead(*p, o.Local) {
+			continue
+		}
+		return p.Name
+	}
+	return ""
 }
 
 func peerAhead(p PeerState, l LocalState) bool {

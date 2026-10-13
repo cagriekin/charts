@@ -356,6 +356,7 @@ func TestConnCacheEvictsIdleEntries(t *testing.T) {
 	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
 		t.Fatal(err)
 	}
+	c.evicting.Wait() // the close runs in the background
 	if gone.closes != 1 {
 		t.Errorf("the idle entry's connection was not closed: closes=%d", gone.closes)
 	}
@@ -459,7 +460,15 @@ func TestConnCacheQueryWaitingThroughCloseDoesNotDial(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- c.Close(probeCtx(t)) }()
-	time.Sleep(20 * time.Millisecond)
+	for {
+		c.mu.Lock()
+		closing := c.isClosed
+		c.mu.Unlock()
+		if closing {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	e.unlock()
 	if err := <-closeDone; err != nil {
 		t.Fatalf("Close: %v", err)
@@ -480,4 +489,62 @@ func TestConnCacheRequiresADeadline(t *testing.T) {
 	if len(*dsns) != 0 {
 		t.Errorf("want no dial, got %d", len(*dsns))
 	}
+}
+
+// The close of an evicted connection runs off the probe path: a probe that triggers the
+// sweep is not held by a Terminate to an unrelated node, even when that close stalls.
+func TestConnCacheEvictionCloseDoesNotBlockTheProbe(t *testing.T) {
+	stalled := &stallingCloseConn{fakeSQLConn: fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}, release: make(chan struct{})}
+	live := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {rows: [][][]byte{row("t")}}}}
+	conns := []sqlConn{stalled, live}
+	i := 0
+	clock := time.Unix(1_700_000_000, 0)
+	c := &ConnCache{
+		dial: func(context.Context, string, string) (sqlConn, error) {
+			conn := conns[i]
+			i++
+			return conn, nil
+		},
+		idleTTL: time.Minute,
+		now:     func() time.Time { return clock },
+	}
+	departed := ci
+	departed.Host = "pg-2.pg-headless"
+	if _, err := c.QueryText(probeCtx(t), departed, "q"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.QueryText(probeCtx(t), ci, "q"); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Minute)
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.QueryText(probeCtx(t), ci, "q")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the probe waited on the close of an evicted connection")
+	}
+	close(stalled.release)
+	c.evicting.Wait()
+	if !stalled.isClosed {
+		t.Error("the evicted connection was never closed")
+	}
+}
+
+// stallingCloseConn blocks in close until released, standing in for a Terminate to a
+// node that has stopped answering.
+type stallingCloseConn struct {
+	fakeSQLConn
+	release chan struct{}
+}
+
+func (s *stallingCloseConn) close(ctx context.Context) {
+	<-s.release
+	s.fakeSQLConn.close(ctx)
 }

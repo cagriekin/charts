@@ -85,6 +85,13 @@ type Config struct {
 	PostgresUser      string // POSTGRES_USER: superuser, exempt from clientcert
 	MonitoringUser    string // MONITORING_USER: monitoring user, exempt; "" when disabled
 
+	// Chart-managed non-superuser login roles the agent provisions on the primary. All
+	// required: the chart always renders them, and pgpool waits for the check role.
+	AppUser             string // APP_USER: application role, owns POSTGRES_DB
+	AppPassword         string // APP_PASSWORD
+	PgpoolCheckUser     string // PGPOOL_CHECK_USER: pgpool sr/health check role
+	PgpoolCheckPassword string // PGPOOL_CHECK_PASSWORD
+
 	// md5->scram managed-user re-hash on promotion/boot-primary (#199). When
 	// MigrateLegacyMd5Users is set the agent re-hashes any managed user whose stored
 	// password is still md5 to scram-sha-256 via local psql; it needs the plaintext
@@ -280,6 +287,11 @@ func Load(get func(string) string) (*Config, error) {
 		PGDATA:            l.str("PGDATA"),
 		DCSBackend:        l.str("DCS_BACKEND"),
 		PgHbaPeerCIDR:     l.str("POD_CIDR"),
+
+		AppUser:             strings.TrimSpace(l.str("APP_USER")),
+		AppPassword:         l.str("APP_PASSWORD"),
+		PgpoolCheckUser:     strings.TrimSpace(l.str("PGPOOL_CHECK_USER")),
+		PgpoolCheckPassword: l.str("PGPOOL_CHECK_PASSWORD"),
 	}
 	// User pg_hba rules (optional), newline-separated; the agent places them above
 	// the hardened network catch-alls.
@@ -294,7 +306,7 @@ func Load(get func(string) string) (*Config, error) {
 	c.TLSEnabled = boolEnv(get("TLS_ENABLED"))
 	c.TLSRequireSSL = boolEnv(get("TLS_REQUIRE_SSL"))
 	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
-	c.PostgresUser = strings.TrimSpace(get("POSTGRES_USER"))
+	c.PostgresUser = strings.TrimSpace(l.str("POSTGRES_USER"))
 	c.MonitoringUser = strings.TrimSpace(get("MONITORING_USER"))
 
 	// md5->scram re-hash inputs (#199). Optional -- the agent runs the re-hash on
@@ -302,7 +314,7 @@ func Load(get func(string) string) (*Config, error) {
 	// container env (the chart's postStart used them), so no new secret is exposed.
 	c.MigrateLegacyMd5Users = boolEnv(get("MIGRATE_LEGACY_MD5_USERS"))
 	c.PostgresPassword = get("POSTGRES_PASSWORD")
-	c.PostgresDB = strings.TrimSpace(get("POSTGRES_DB"))
+	c.PostgresDB = strings.TrimSpace(l.str("POSTGRES_DB"))
 
 	// Cascading replication (issue #29). Optional -- absent/empty means off.
 	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))
@@ -377,6 +389,31 @@ func Load(get func(string) string) (*Config, error) {
 	}
 	// POD_CIDR is interpolated raw into pg_hba.conf; a malformed value would corrupt
 	// the whole file and fail Postgres start. Validate the CIDR form up front.
+	// The agent ALTERs the managed roles to NOSUPERUSER on every primary start, so one that
+	// named the superuser, the replication user or the monitoring user would strip that
+	// role's privileges. The chart refuses these collisions at render time; this catches a
+	// hand-edited StatefulSet.
+	for _, m := range []struct{ name, val string }{
+		{"APP_USER", c.AppUser},
+		{"PGPOOL_CHECK_USER", c.PgpoolCheckUser},
+	} {
+		if m.val == "" {
+			continue // reported as missing above
+		}
+		for _, o := range []struct{ name, val string }{
+			{"POSTGRES_USER", c.PostgresUser},
+			{"REPMGR_USER", c.RepmgrUser},
+			{"MONITORING_USER", c.MonitoringUser},
+			{"the bootstrap superuser", "postgres"},
+		} {
+			if m.val == o.val {
+				l.invalid = append(l.invalid, fmt.Sprintf("%s=%q collides with %s: the agent provisions it as a non-superuser login and would strip that role's privileges", m.name, m.val, o.name))
+			}
+		}
+	}
+	if c.AppUser != "" && c.AppUser == c.PgpoolCheckUser {
+		l.invalid = append(l.invalid, fmt.Sprintf("APP_USER and PGPOOL_CHECK_USER are both %q: the two roles get different privileges and must be distinct", c.AppUser))
+	}
 	if c.PgHbaPeerCIDR != "" {
 		if _, _, err := net.ParseCIDR(c.PgHbaPeerCIDR); err != nil {
 			l.invalid = append(l.invalid, fmt.Sprintf("POD_CIDR=%q is not a valid CIDR: %v", c.PgHbaPeerCIDR, err))

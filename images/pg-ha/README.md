@@ -71,6 +71,14 @@ inside the main container where it can be fenced.
 | `PGBACKREST_ENABLED` | No | Set to `true` to enable WAL archiving via pgBackRest during initdb |
 | `PGBACKREST_STANZA` | No | pgBackRest stanza name (default: `db`). Only used when `PGBACKREST_ENABLED=true` |
 
+### agent mode
+
+The chart's `ENVIRONMENT.md` lists the full set. Since 2.2.0 the agent also requires
+`APP_USER`/`APP_PASSWORD` and `PGPOOL_CHECK_USER`/`PGPOOL_CHECK_PASSWORD`, plus `POSTGRES_USER` and
+`POSTGRES_DB`. On the primary it provisions those two non-superuser roles over the local socket,
+and it refuses to start if one of them is named like the superuser, the replication user or the
+monitoring user.
+
 ### init mode
 
 Reads exactly one variable (#290). It used to need the credentials, the headless service and the

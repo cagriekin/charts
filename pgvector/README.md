@@ -121,7 +121,8 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. With `ha.enabled` the server runs from the HA image and follows `ha.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
-| `postgresql.username` | Database username | `postgres` |
+| `postgresql.username` | Database username (a superuser; the chart's own tooling logs in as it) | `postgres` |
+| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` (see the pg chart README, "Application role and connection reserves") | `app_user` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |
@@ -316,7 +317,8 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (also sizes `reserved_connections`: 2 per instance + 1) | `1` |
+| `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
 | `pgpool.maxPool` | Max cached connections per process | `4` |
@@ -402,12 +404,15 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 | `postgresql.existingSecret.databaseKey` | Database key in secret | `database` |
 | `postgresql.existingSecret.repmgrPasswordKey` | Repmgr password key in secret | `repmgr-password` |
 | `postgresql.existingSecret.monitoringPasswordKey` | Monitoring-user password key in secret (required when `prometheusExporter.monitoringUser.enabled`) | `monitoring-password` |
+| `postgresql.existingSecret.appPasswordKey` | Application-role (`postgresql.app`) password key in secret | `app-password` |
+| `postgresql.existingSecret.pgpoolCheckPasswordKey` | pgpool check-role (`pgpool.checkUser`) password key in secret | `pgpool-check-password` |
 
 When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-generated with:
 - `username`: Base64 encoded value from `postgresql.username`
 - `password`: Random 32 character alphanumeric string
 - `database`: Base64 encoded value from `postgresql.database`
 - `repmgr-password`: Random 32 character alphanumeric string (when `ha.enabled` is true — the key keeps its 1.x name; see `ha.username`)
+- `app-password`, `pgpool-check-password`: Random 32 character alphanumeric strings, kept across upgrades
 
 ### Service Parameters
 

@@ -237,6 +237,64 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
+{{- define "pg.secretAppPasswordKey" -}}
+{{- if .Values.postgresql.existingSecret.enabled }}
+{{- required "postgresql.existingSecret.appPasswordKey is required when postgresql.existingSecret.enabled (the application role postgresql.app is always provisioned)" .Values.postgresql.existingSecret.appPasswordKey }}
+{{- else }}
+{{- "app-password" }}
+{{- end }}
+{{- end }}
+
+{{- define "pg.secretPgpoolCheckPasswordKey" -}}
+{{- if .Values.postgresql.existingSecret.enabled }}
+{{- required "postgresql.existingSecret.pgpoolCheckPasswordKey is required when postgresql.existingSecret.enabled (pgpool's check role pgpool.checkUser is always provisioned)" .Values.postgresql.existingSecret.pgpoolCheckPasswordKey }}
+{{- else }}
+{{- "pgpool-check-password" }}
+{{- end }}
+{{- end }}
+
+{{- /* The two chart-managed non-superuser roles. Both are always provisioned (by the agent
+       on the primary in HA mode, by the postStart hook in standalone), so their names are
+       required and restricted to plain lower-case identifiers: they travel through psql
+       variables, pgpool.conf and pool_passwd, and a plain identifier needs no quoting in
+       any of them. */ -}}
+{{- /* Backend TLS (pgpool -> PostgreSQL) via libpq env (#110), shared by the pgpool
+       container and its wait-check-role init container so the wait connects exactly as
+       pgpool's checks will. Under PostgreSQL mTLS, backendClientCert supplies the client
+       cert pgpool presents. Empty when pgpool.tls is off. */ -}}
+{{- define "pg.pgpoolBackendTLSEnv" -}}
+{{- if .Values.pgpool.tls.enabled }}
+- name: PGSSLMODE
+  value: {{ .Values.pgpool.tls.backendSslmode | quote }}
+{{- if has .Values.pgpool.tls.backendSslmode (list "verify-ca" "verify-full") }}
+- name: PGSSLROOTCERT
+  value: /usr/local/etc/tls/ca.crt
+{{- end }}
+{{- if .Values.pgpool.tls.backendClientCert }}
+- name: PGSSLCERT
+  value: /usr/local/etc/tls/backend.crt
+- name: PGSSLKEY
+  value: /usr/local/etc/tls/backend.key
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "pg.appUsername" -}}
+{{- $u := required "postgresql.app.username is required: the chart always provisions the application role" (.Values.postgresql.app).username | toString -}}
+{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
+{{- fail (printf "postgresql.app.username is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $u) -}}
+{{- end -}}
+{{- $u -}}
+{{- end -}}
+
+{{- define "pg.pgpoolCheckUsername" -}}
+{{- $u := required "pgpool.checkUser.username is required: the chart always provisions pgpool's check role" (.Values.pgpool.checkUser).username | toString -}}
+{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
+{{- fail (printf "pgpool.checkUser.username is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $u) -}}
+{{- end -}}
+{{- $u -}}
+{{- end -}}
+
 {{- /* Name of the Secret holding the shared S3 access/secret key for pgBackRest
        (pgbackrest.s3.keyType=shared). Single source of truth for the `required`
        guard so the four secretKeyRef sites can't drift apart. */ -}}
@@ -291,7 +349,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Reserve the chart-internal identifiers UNCONDITIONALLY (even when repmgr / the
        monitoring user are currently disabled): a declared role colliding with one that a
        later `helm upgrade` enables would produce conflicting role management. */ -}}
-{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.ha.username .Values.prometheusExporter.monitoringUser.username -}}
+{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.ha.username .Values.prometheusExporter.monitoringUser.username (include "pg.appUsername" .) (include "pg.pgpoolCheckUsername" .) -}}
 {{- /* Precompute the declared role names and the databases a grant may target (declared
        databases + the primary database) so memberOf/grant refs can be checked at render
        time -- they may reference an entry declared later in the list. */ -}}
@@ -339,7 +397,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if $d.owner -}}
     {{- $o := $d.owner | toString -}}
     {{- if not (regexMatch $idRe $o) }}{{- fail (printf "postgresql.databases[%s].owner: invalid role name %q" $n $o) }}{{- end -}}
-    {{- if and (not (has $o $roleNames)) (ne $o $.Values.postgresql.username) }}{{- fail (printf "postgresql.databases[%s].owner %q must be declared in postgresql.roles[] or be the primary user" $n $o) }}{{- end -}}
+    {{- if and (not (has $o $roleNames)) (ne $o $.Values.postgresql.username) (ne $o (include "pg.appUsername" $)) }}{{- fail (printf "postgresql.databases[%s].owner %q must be declared in postgresql.roles[], or be the primary user or the application role (postgresql.app.username)" $n $o) }}{{- end -}}
+    {{- /* The chart gives postgresql.database to the application role on every primary start;
+           a different owner here would be re-applied by the roles Job on every upgrade, and the
+           two would flip ownership back and forth. */ -}}
+    {{- if and (eq $n ($.Values.postgresql.database | toString)) (ne $o (include "pg.appUsername" $)) }}{{- fail (printf "postgresql.databases[%s].owner is %q, but %q is postgresql.database, which the chart assigns to the application role %q. Drop the owner from this entry or set it to %q." $n $o $n (include "pg.appUsername" $) (include "pg.appUsername" $)) }}{{- end -}}
   {{- end -}}
   {{- range $e := ($d.extensions | default list) -}}
     {{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_-]*$" ($e | toString)) }}{{- fail (printf "postgresql.databases[%s].extensions: invalid extension name %q" $n $e) }}{{- end -}}
@@ -1014,6 +1076,98 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- if and $monUser (or (eq $monUser $pgUser) $haCollides (eq $monUser "postgres")) -}}
 {{- fail (printf "prometheusExporter.monitoringUser.username is %q, which collides with %s: the monitoring-user hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so it would OVERWRITE that role's password minutes after install -- breaking superuser auth cluster-wide, or streaming replication on every standby at once. Fix: give the monitoring role a distinct name (default \"monitoring\"), or set prometheusExporter.monitoringUser.enabled=false to let the exporter use the superuser." $monUser (ternary (printf "postgresql.username (%q)" $pgUser) (ternary (printf "ha.username (%q)" $haUser) "initdb's bootstrap superuser \"postgres\"" $haCollides) (eq $monUser $pgUser))) -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The managed roles are provisioned as NOSUPERUSER logins with their password reset on
+       every run, so a name shared with any other role would strip that role's privileges
+       or overwrite its password -- the superuser, the replication role, the monitoring
+       role, a postgresql.roles[] entry, or each other. */ -}}
+{{- define "pg.validateManagedRoles" -}}
+{{- $app := include "pg.appUsername" . -}}
+{{- $check := include "pg.pgpoolCheckUsername" . -}}
+{{- $taken := dict "postgres" "initdb's bootstrap superuser" -}}
+{{- $_ := set $taken (.Values.postgresql.username | toString) "postgresql.username" -}}
+{{- if .Values.ha.enabled -}}
+{{- $_ := set $taken (.Values.ha.username | toString) "ha.username" -}}
+{{- end -}}
+{{- if and (.Values.prometheusExporter).enabled (((.Values.prometheusExporter).monitoringUser).enabled) -}}
+{{- $_ := set $taken (((.Values.prometheusExporter).monitoringUser).username | toString) "prometheusExporter.monitoringUser.username" -}}
+{{- end -}}
+{{- range $r := (.Values.postgresql.roles | default list) -}}
+{{- $_ := set $taken ($r.name | toString) "a postgresql.roles[] entry" -}}
+{{- end -}}
+{{- range $pair := list (list "postgresql.app.username" $app) (list "pgpool.checkUser.username" $check) -}}
+{{- $name := index $pair 1 -}}
+{{- if hasKey $taken $name -}}
+{{- fail (printf "%s is %q, which collides with %s: the chart provisions it as a non-superuser login and resets its password, which would strip or overwrite that role. Give it a distinct name." (index $pair 0) $name (get $taken $name)) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $app $check -}}
+{{- fail (printf "postgresql.app.username and pgpool.checkUser.username are both %q: the two roles get different privileges and must be distinct" $app) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* Connection reserves. PostgreSQL refuses a NEW connection once max_connections is
+       used up, which used to blind the agent: a reconnect to a full node failed, and a full
+       primary was then indistinguishable from a dead one. Three pools instead of one:
+         - superuser_reserved_connections: superusers only. Every agent holds one session to
+           every node, so a node needs one slot per node, plus 3 for reconnect overlap, the
+           chart's superuser tooling (backups, hook Jobs) and an operator's psql.
+           Standalone has no agent: PostgreSQL's own 3.
+         - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
+           i.e. pgpool's check role. Each pgpool replica runs a health check and a
+           streaming check, so 2 per replica, plus 1. 0 without pgpool.
+         - the rest: everyone else, applications included.
+       Chart-owned: setting either in postgresql.configuration is refused, so there is one
+       source of truth and the sizing cannot silently drift from the topology. */ -}}
+{{- define "pg.superuserReservedConnections" -}}
+{{- if .Values.ha.enabled -}}
+{{- add .Values.postgresql.replicaCount 1 3 -}}
+{{- else -}}
+3
+{{- end -}}
+{{- end -}}
+
+{{- define "pg.reservedConnections" -}}
+{{- if .Values.pgpool.enabled -}}
+{{- add (mul .Values.pgpool.replicaCount 2) 1 -}}
+{{- else -}}
+0
+{{- end -}}
+{{- end -}}
+
+{{- /* max_connections as the server will run it: the postgresql.configuration value when
+       set (GUC names are case-insensitive), else PostgreSQL's compiled-in 100 -- the chart
+       never sets it otherwise. */ -}}
+{{- define "pg.maxConnections" -}}
+{{- $max := 100 -}}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
+{{- if eq (lower ($k | toString)) "max_connections" -}}
+{{- $max = atoi (toString $v) -}}
+{{- end -}}
+{{- end -}}
+{{- $max -}}
+{{- end -}}
+
+{{- define "pg.validateConnectionReserves" -}}
+{{- range $k, $_ := (.Values.postgresql.configuration | default dict) -}}
+{{- $lk := lower ($k | toString) -}}
+{{- if or (eq $lk "superuser_reserved_connections") (eq $lk "reserved_connections") -}}
+{{- fail (printf "postgresql.configuration.%s is set, but the chart owns the connection reserves: superuser_reserved_connections is sized from the node count (one slot per agent session, plus headroom) and reserved_connections from pgpool.replicaCount (pgpool's check role). Remove the key; raise max_connections if the application pool is too small." $k) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Only when declared: postgresql.majorVersion is otherwise required just for extension
+       paths, and an empty value has always rendered. A pre-16 server still refuses
+       reserved_connections at startup, by name. */ -}}
+{{- if and (toString .Values.postgresql.majorVersion) (lt (atoi (toString .Values.postgresql.majorVersion)) 16) -}}
+{{- fail (printf "postgresql.majorVersion=%q: the chart sets reserved_connections and grants pg_use_reserved_connections to pgpool's check role, both introduced in PostgreSQL 16. Use PostgreSQL 16 or newer." (toString .Values.postgresql.majorVersion)) -}}
+{{- end -}}
+{{- $su := atoi (include "pg.superuserReservedConnections" .) -}}
+{{- $res := atoi (include "pg.reservedConnections" .) -}}
+{{- $max := atoi (include "pg.maxConnections" .) -}}
+{{- if ge (add $su $res) $max -}}
+{{- fail (printf "max_connections is %d, but the chart reserves %d superuser slots (superuser_reserved_connections: one per node plus 3) and %d for pgpool's checks (reserved_connections: 2 x pgpool.replicaCount + 1), leaving no slot for applications. Raise postgresql.configuration.max_connections above %d." $max $su $res (add $su $res)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1897,30 +2051,6 @@ helper is kept rather than inlined so the ~20 call sites keep reading as a mode 
        coercion keeps the helper safe even for renders that skip schema validation
        (--set-string bypasses nothing here). */ -}}
 {{- if .Values.ha.enabled -}}true{{- else -}}false{{- end -}}
-{{- end -}}
-
-{{- /* The single condition under which postgresql-configmap.yaml renders a ConfigMap at
-       all (#308). statefulset.yaml needs this SAME condition in seven places -- the
-       checksum annotation, the postgresql-config volume mount (twice, for postStart
-       include_dir wiring on two different code paths), and the volume definition itself
-       -- and duplicating the raw boolean expression at each site is exactly how the
-       postgresql.walLevel / ha.agent.syncReplicationSlots additions below ended up
-       missed at first: the ConfigMap's own guard was updated but the volume MOUNT guard
-       was not, so the rendered ConfigMap existed but was never attached to the pod (a
-       live KinD suite run caught it -- wal_level and sync_replication_slots silently
-       stayed at their defaults with no error). Every one of those seven sites -- and the
-       ConfigMap's own top-level `if` -- must use this helper instead of repeating the
-       condition, so a future addition to the list cannot drift the same way. */ -}}
-{{- define "pg.postgresqlConfigRenders" -}}
-{{- /* `if`, not a bare `or` -- Sprig's `or` returns the first truthy ARGUMENT (here,
-       postgresql.configuration itself, a map, when non-empty), not a boolean, so
-       stringifying its result directly would print the map's Go representation instead
-       of "true" and every `eq (include ...) "true"` call site would always be false.
-       `if` properly coerces any type's truthiness and lets this emit a literal "true"
-       or empty string, matching what those call sites actually compare against. */ -}}
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots) -}}
-true
-{{- end -}}
 {{- end -}}
 
 {{- /* The single condition under which the `create jobs` grant is rendered (#276). Both

@@ -61,6 +61,18 @@ postgresql:
   database: postgres
   username: postgres
 
+  # Application role. postgresql.username is a SUPERUSER (initdb's bootstrap role by
+  # default) and the chart's own tooling -- the HA agent, backups, hook Jobs -- logs in as
+  # a superuser too. Superusers share one emergency pool, superuser_reserved_connections,
+  # so an application connecting as the superuser can exhaust the very slots that keep
+  # the agent able to observe and manage a node at max_connections. Point applications at
+  # this role instead: a plain LOGIN that owns postgresql.database, created and kept in
+  # sync by the chart (the agent on the primary in HA mode, the postStart hook in
+  # standalone), password in the release Secret under "app-password". Existing
+  # applications keep working on postgresql.username until they switch.
+  app:
+    username: app_user
+
   existingSecret:
     enabled: false
     name: ""
@@ -70,6 +82,10 @@ postgresql:
     repmgrPasswordKey: repmgr-password
     # Required only when prometheusExporter.monitoringUser.enabled is true.
     monitoringPasswordKey: monitoring-password
+    # Passwords of the application role (postgresql.app) and pgpool's check role
+    # (pgpool.checkUser). Always required with existingSecret.
+    appPasswordKey: app-password
+    pgpoolCheckPasswordKey: pgpool-check-password
 
   livenessProbe:
     enabled: true
@@ -641,6 +657,16 @@ pgpool:
     pullPolicy: IfNotPresent
 
   replicaCount: 1
+
+  # Role pgpool's health and streaming-replication checks log in as. A plain LOGIN with
+  # pg_monitor and pg_use_reserved_connections, so the checks draw from
+  # reserved_connections -- sized by the chart to 2 x pgpool.replicaCount + 1 -- rather
+  # than competing with application sessions: a node that is merely full must not fail
+  # its health check and be detached. Created by the chart like postgresql.app; the
+  # password lives in the release Secret under "pgpool-check-password". A new pgpool pod
+  # waits in Init until this role can log in.
+  checkUser:
+    username: pgpool_check
 
   # Startup command override for the pgpool container. Empty uses the chart default,
   # which reaps SysV shmem/semaphores orphaned by a prior OOM-killed pgpool

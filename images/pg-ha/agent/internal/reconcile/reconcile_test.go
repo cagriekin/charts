@@ -672,3 +672,37 @@ func TestLagGateDoesNotPreemptEarlierGuards(t *testing.T) {
 		t.Errorf("highwater guard should speak before the gate: %+v", got)
 	}
 }
+
+// A peer refusing connections at max_connections is alive with an unknown position. Within
+// its grace a lease-holding standby waits rather than promote past it, unless fresh gossip
+// shows it is not ahead; past the grace the ordinary unreachable-peer logic applies.
+func TestDecideSaturation(t *testing.T) {
+	localStandby := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
+	saturated := func(p PeerState, wait bool) PeerState {
+		p.Reachable, p.Saturated, p.SaturatedWait = false, true, wait
+		return p
+	}
+	cases := []struct {
+		name string
+		obs  Observation
+		want Action
+	}{
+		{"saturated local primary, process alive, holder -> wait, never a step-down",
+			Observation{HoldLease: true, LocalProcessAlive: true, Local: LocalState{HasData: true, Saturated: true, Timeline: tl(5), TimelineOK: true}}, Wait},
+		{"saturated peer without gossip inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, true)}}, Wait},
+		{"saturated peer whose gossip is ahead, inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x200), true)}}, Wait},
+		{"saturated peer whose gossip is behind -> promote",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x80), true)}}, Promote},
+		{"saturated peer past its grace -> promote",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, false)}}, Promote},
+		{"reachable peer ahead still wins the handoff over a saturated one",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-1", 5, 5, 0x200), saturated(PeerState{Name: "pg-2"}, true)}}, ReleaseLease},
+	}
+	for _, c := range cases {
+		if got := Decide(c.obs); got.Action != c.want {
+			t.Errorf("%s: got %v (%s), want %v", c.name, got.Action, got.Reason, c.want)
+		}
+	}
+}

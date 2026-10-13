@@ -79,6 +79,8 @@ func TestEveryMetricIsWiredToItsOwnSetter(t *testing.T) {
 		{"pg_ha_agent_is_leader", "1", func(m *Metrics) { m.SetLeader(true) }},
 		{"pg_ha_agent_is_paused", "1", func(m *Metrics) { m.SetPaused(true) }},
 		{"pg_ha_agent_tls_inactive", "1", func(m *Metrics) { m.SetTLSInactive(true) }},
+		{"pg_ha_agent_local_saturated", "1", func(m *Metrics) { m.SetLocalSaturated(true) }},
+		{"pg_ha_agent_peers_saturated", "2", func(m *Metrics) { m.SetPeersSaturated(2) }},
 		{"pg_ha_agent_renew_failures_total", "1", func(m *Metrics) { m.IncRenewFailure() }},
 		{"pg_ha_agent_promotions_total", "1", func(m *Metrics) { m.IncPromotion() }},
 		{"pg_ha_agent_promotions_refused_lag_total", "1", func(m *Metrics) { m.IncPromotionRefusedLag() }},

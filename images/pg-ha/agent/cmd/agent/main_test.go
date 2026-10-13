@@ -24,6 +24,8 @@ import (
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
@@ -187,15 +189,15 @@ func (f *fakeDCS) IsLeader() bool {
 func (f *fakeDCS) Leader() string { return "" }
 func (f *fakeDCS) Release()       { f.released = true }
 
-// scriptedExec backs BOTH mechanism.Runner (repmgr CLI) and pg.Exec (psql) -- the
-// signatures are identical -- so one fake drives the whole Follow act() path. It
-// counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
 // execProber is a Prober whose SQL goes through ExecQuerier over e, so a fake Exec
 // answers probes by inspecting the psql argument list.
 func execProber(e pg.Exec) *pg.Prober {
 	return &pg.Prober{Exec: e, SQL: pg.ExecQuerier{Exec: e, Timeout: time.Second}, Timeout: time.Second}
 }
 
+// scriptedExec backs BOTH mechanism.Runner (repmgr CLI) and pg.Exec (psql) -- the
+// signatures are identical -- so one fake drives the whole Follow act() path. It
+// counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
 type scriptedExec struct {
 	walRcv       string // pg_stat_wal_receiver "sender_host|status" output (psql)
 	nodes        string // SELECT node_id FROM repmgr.nodes output (psql)
@@ -4346,5 +4348,109 @@ func TestUpstreamHost(t *testing.T) {
 				t.Errorf("upstreamHost(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// saturatingQuerier refuses every connection the way a node at max_connections does.
+type saturatingQuerier struct{}
+
+func (saturatingQuerier) QueryText(context.Context, pg.ConnInfo, string) (string, error) {
+	return "", &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+}
+
+// refusingQuerier fails every connection the way a dead node does.
+type refusingQuerier struct{}
+
+func (refusingQuerier) QueryText(context.Context, pg.ConnInfo, string) (string, error) {
+	return "", errors.New("dial tcp: connect: connection refused")
+}
+
+func saturationTestAgent(t *testing.T, q pg.Querier) *agent {
+	t.Helper()
+	pgdata := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agent{
+		cfg: &config.Config{
+			PGDATA: pgdata, HeadlessService: "h", PodName: "pg-0", NodeCount: 3,
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RenewDeadline: 2 * time.Second,
+			LeaseDuration: 15 * time.Second,
+		},
+		base:               "pg",
+		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:                &fakeDCS{leader: true},
+		kube:               k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
+		prober:             &pg.Prober{Exec: noopExec{}, SQL: q, Timeout: time.Second},
+		sup:                process.NewSupervisor(&fakePostmaster{}),
+		metr:               observe.New(),
+		peersSeen:          map[string]bool{},
+		peerSaturatedSince: map[string]time.Time{},
+		// A primary that was running and whose grace has already elapsed: the next
+		// unhealthy observation past the first one trips the step-down.
+		health: &selfHealthTracker{grace: time.Nanosecond, wasRunning: true},
+	}
+}
+
+// A primary at max_connections refuses the agent's probe, but that refusal proves it is
+// alive: the self-health step-down (SIGQUIT the primary, release the Lease) must not arm.
+// The same observation with a dead node's error does trip it, so the suppression is keyed
+// on the SQLSTATE, not on probe failure in general.
+func TestObserveSaturatedPrimaryIsNotSteppedDown(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	var o reconcile.Observation
+	for i := 0; i < 3; i++ {
+		o = a.observe(context.Background())
+	}
+	if !o.Local.Saturated || o.Local.Running {
+		t.Fatalf("local = %+v, want Saturated and not Running", o.Local)
+	}
+	if o.LocalStuck {
+		t.Error("a saturated primary was declared stuck; self-health would step it down")
+	}
+	if len(o.Peers) != 2 {
+		t.Fatalf("peers = %+v", o.Peers)
+	}
+	for _, p := range o.Peers {
+		if !p.Saturated || !p.SaturatedWait || p.Reachable {
+			t.Errorf("peer %s = %+v, want Saturated within its grace and not Reachable", p.Name, p)
+		}
+	}
+	if !a.localSaturated {
+		t.Error("the local saturation transition was not latched")
+	}
+
+	dead := saturationTestAgent(t, refusingQuerier{})
+	for i := 0; i < 3; i++ {
+		o = dead.observe(context.Background())
+	}
+	if !o.LocalStuck {
+		t.Error("control: a primary failing probes for a non-saturation reason must still trip self-health")
+	}
+	if o.Local.Saturated {
+		t.Error("control: connection refused was classified as saturation")
+	}
+}
+
+// A peer's saturation grace starts at its first saturated probe, ends after bootstrapGrace,
+// and restarts after the peer answers again.
+func TestTrackPeerSaturationGrace(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.bootstrapGrace()
+	if !a.trackPeerSaturation("pg-1", true, t0) {
+		t.Fatal("the first saturated probe must start the grace")
+	}
+	if !a.trackPeerSaturation("pg-1", true, t0.Add(grace-time.Second)) {
+		t.Error("still inside the grace")
+	}
+	if a.trackPeerSaturation("pg-1", true, t0.Add(grace)) {
+		t.Error("the grace must end after bootstrapGrace")
+	}
+	if a.trackPeerSaturation("pg-1", false, t0.Add(grace+time.Second)) {
+		t.Error("an answering peer is never in the wait")
+	}
+	if !a.trackPeerSaturation("pg-1", true, t0.Add(2*grace)) {
+		t.Error("a new saturation episode must start a fresh grace")
 	}
 }

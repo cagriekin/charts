@@ -108,7 +108,15 @@ type ConnCache struct {
 	mu       sync.Mutex
 	entries  map[string]*cacheEntry
 	isClosed bool
+	// evicting tracks background closes of evicted connections, so Close can wait for them.
+	evicting sync.WaitGroup
 }
+
+// evictCloseTimeout bounds the Terminate exchange of one evicted connection. Evicted
+// connections belong to nodes the agent stopped probing, so the close runs in the
+// background on its own budget rather than on the deadline of whichever probe happened
+// to trigger the sweep.
+const evictCloseTimeout = time.Second
 
 // connIdleTTL is how long an unused entry is kept. Every reconcile tick probes every
 // current member, so only nodes the agent stopped probing reach it; a reconcile interval
@@ -116,9 +124,11 @@ type ConnCache struct {
 const connIdleTTL = 5 * time.Minute
 
 // tcpUserTimeout is how long sent data may go unacknowledged before the kernel fails the
-// socket. Short enough that a vanished peer fails, and the redial runs, well inside the
-// 10s probe deadline; long enough for many retransmissions on a congested but live path.
-const tcpUserTimeout = 3 * time.Second
+// socket. On Linux it also caps the SYN retries of a connect. Short enough that a vanished
+// peer fails with half the 10s probe deadline left for the redial; long enough that a
+// healthy peer behind a few seconds of packet loss is not reported unreachable -- a
+// result that feeds survivor ranking and failover.
+const tcpUserTimeout = 5 * time.Second
 
 // cacheEntry serialises use of one connection: pgconn connections are not safe for
 // concurrent use, and the control API can probe the same node the reconcile loop is
@@ -204,8 +214,14 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 	e.lastUsed = now
 	c.mu.Unlock()
 	for _, old := range evicted {
-		c.drop(ctx, old)
-		old.unlock()
+		c.evicting.Add(1)
+		go func(old *cacheEntry) {
+			defer c.evicting.Done()
+			cctx, cancel := context.WithTimeout(context.Background(), evictCloseTimeout)
+			defer cancel()
+			c.drop(cctx, old)
+			old.unlock()
+		}(old)
 	}
 
 	if err := e.lock(ctx); err != nil {
@@ -220,42 +236,35 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, sql string) (str
 	if closed {
 		return "", errors.New("connection cache is closed")
 	}
-	reused := e.conn != nil && !e.conn.closed()
-	if !reused {
-		if err := c.redial(ctx, deadline, e, ci); err != nil {
-			return "", err
+	// A reused socket that fails may only mean the peer restarted since the last tick, so
+	// it gets one fresh dial inside the same deadline: the probe then reports what a fresh
+	// connection sees rather than a stale one's error. A fresh dial is never retried.
+	for {
+		reused := e.conn != nil && !e.conn.closed()
+		if !reused {
+			if err := c.redial(ctx, deadline, e, ci); err != nil {
+				return "", err
+			}
 		}
-	}
-	rows, err := e.conn.exec(ctx, sql)
-	if err != nil {
-		if c.keepOnServerError(err, e) {
+		rows, err := e.conn.exec(ctx, sql)
+		if err == nil {
+			return formatRows(rows), nil
+		}
+		if keepOnServerError(err, e) {
 			return "", err
 		}
 		c.drop(ctx, e)
 		if !reused || ctx.Err() != nil {
 			return "", err
 		}
-		// A reused socket failed: the peer may simply have restarted since the last tick.
-		// One fresh dial inside the same deadline, so this probe reports what a fresh
-		// connection sees rather than a stale one's error.
-		if rerr := c.redial(ctx, deadline, e, ci); rerr != nil {
-			return "", rerr
-		}
-		if rows, err = e.conn.exec(ctx, sql); err != nil {
-			if !c.keepOnServerError(err, e) {
-				c.drop(ctx, e)
-			}
-			return "", err
-		}
 	}
-	return formatRows(rows), nil
 }
 
 // keepOnServerError reports whether err is a server-side ERROR (permission denied, a
 // RAISE, a duplicate slot) that left the session usable: such an error would recur on a
 // fresh dial, so the connection is kept and the statement not retried. A FATAL (e.g.
 // admin shutdown on a restarted peer) closes the session, so it is not kept.
-func (c *ConnCache) keepOnServerError(err error, e *cacheEntry) bool {
+func keepOnServerError(err error, e *cacheEntry) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && !e.conn.closed()
 }
@@ -325,6 +334,8 @@ func (c *ConnCache) Close(ctx context.Context) error {
 		c.drop(ctx, e)
 		e.unlock()
 	}
+	// Background closes of evicted entries are already bounded by evictCloseTimeout.
+	c.evicting.Wait()
 	return errors.Join(errs...)
 }
 

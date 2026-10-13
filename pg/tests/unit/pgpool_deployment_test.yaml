@@ -112,3 +112,54 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'pgpool.reattach.enabled=true but pgpool.command is set'
+
+  # --- wait-check-role: pgpool starts only once its check role logs in ---
+  - it: a wait-check-role init container runs after init-config and before pgpool
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: init-config
+      - equal:
+          path: spec.template.spec.initContainers[1].name
+          value: wait-check-role
+      - matchRegex:
+          path: spec.template.spec.initContainers[1].command[2]
+          pattern: 'until err=\$\(PGCONNECT_TIMEOUT=5 psql -h "test-pg[a-z-]*\.NAMESPACE\.svc\.cluster\.local" -p 5432 -U "\$PGPOOL_CHECK_USER" -d "\$POSTGRES_DB"'
+      - equal:
+          path: spec.template.spec.initContainers[1].env[?(@.name=="PGPASSWORD")].valueFrom.secretKeyRef.key
+          value: pgpool-check-password
+
+  - it: under backend TLS the wait connects with pgpool's own client certificate
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.tls.enabled: true
+      pgpool.tls.existingSecret: pgpool-tls
+      pgpool.tls.backendSslmode: verify-ca
+      pgpool.tls.backendClientCert: pgpool-client
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers[1].env
+          content:
+            name: PGSSLCERT
+            value: /usr/local/etc/tls/backend.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLCERT
+            value: /usr/local/etc/tls/backend.crt
+
+  - it: init-config splices the check and application roles into pool_passwd
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: 'splice\(\$0, "__CHECK_USER__", ENVIRON\["SUB_CHECK_USER"\]\)[\s\S]*splice\(\$0, "__APP_PASSWORD__", ENVIRON\["SUB_APP_PASS"\]\)'
+      - equal:
+          path: spec.template.spec.initContainers[0].env[?(@.name=="APP_PASSWORD")].valueFrom.secretKeyRef.key
+          value: app-password

@@ -983,3 +983,43 @@ func TestProberRequiresSQLAndTimeout(t *testing.T) {
 		t.Error("a Prober without a Timeout ran a probe")
 	}
 }
+
+// A too_many_connections refusal leaves the node unreachable (nothing could be read) but
+// marks it Saturated, the evidence that its postmaster is alive. Any other failure does not.
+func TestProbeMarksATooManyConnectionsRefusalAsSaturated(t *testing.T) {
+	refused := &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"too many clients", refused, true},
+		{"wrapped by the dial", fmt.Errorf("failed to connect to `host=pg-1`: %w", refused), true},
+		{"reserved slots", &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "remaining connection slots are reserved for roles with the SUPERUSER attribute"}, true},
+		{"connection refused", errors.New("dial tcp 10.0.0.1:5432: connect: connection refused"), false},
+		{"deadline", context.DeadlineExceeded, false},
+		{"other FATAL", &pgconn.PgError{Severity: "FATAL", Code: "57P03", Message: "the database system is starting up"}, false},
+	} {
+		ns := (&Prober{SQL: errQuerier{err: c.err}, Timeout: time.Second}).Probe(context.Background(), ConnInfo{Host: "pg-1"})
+		if ns.Reachable {
+			t.Errorf("%s: a failed probe reported Reachable", c.name)
+		}
+		if ns.Saturated != c.want {
+			t.Errorf("%s: Saturated = %v, want %v", c.name, ns.Saturated, c.want)
+		}
+	}
+}
+
+func TestNewProberRequiresATransport(t *testing.T) {
+	if _, err := NewProber(nil); err == nil {
+		t.Error("NewProber(nil) must fail")
+	}
+	var cc *ConnCache
+	if _, err := NewProber(cc); err == nil {
+		t.Error("NewProber with a nil *ConnCache must fail")
+	}
+	p, err := NewProber(NewConnCache())
+	if err != nil || p.SQL == nil || p.Timeout != 10*time.Second {
+		t.Errorf("NewProber(NewConnCache()) = %+v, %v", p, err)
+	}
+}

@@ -42,7 +42,7 @@ assert_not_contains "minimal: no service-updater sidecar" "${minimal}" "name: se
 assert_not_contains "minimal: no pod annotations on statefulset" "${minimal}" "karpenter.sh/do-not-disrupt"
 
 # Minimal: should NOT have pgpool
-assert_not_contains "minimal: no pgpool deployment" "${minimal}" "pgpool"
+assert_not_contains "minimal: no pgpool deployment" "${minimal}" "app.kubernetes.io/component: pgpool"
 
 # Minimal: should NOT have prometheus exporter
 assert_not_contains "minimal: no prometheus exporter" "${minimal}" "postgres-exporter"
@@ -1807,20 +1807,20 @@ assert_not_contains "#298: ...in the same awk pass, not a pre-pass that can drop
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
-# Test: configuration disabled still renders setup-config, which strips a
-# stale include_dir left in PGDATA by a previous enable (#107)
+# Test: with no postgresql.configuration the ConfigMap still renders and is wired in, since it
+# carries reserved-connections.conf. The include_dir strip that #107 needed when conf.d could
+# disappear is gone with that possibility: setup-config only ever appends.
 no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
-assert_not_contains "no config: no postgresql-config configmap" "${no_config}" "postgresql-config"
+assert_contains "no config: postgresql-config configmap renders (connection reserves)" "${no_config}" "reserved-connections.conf"
 assert_contains "no config: setup-config init container still present" "${no_config}" "name: setup-config"
-assert_contains "no config: setup-config strips stale include_dir" "${no_config}" 'grep -v "include_dir'
-assert_not_contains "no config: setup-config does not append include_dir" "${no_config}" 'echo "include_dir'
-assert_not_contains "no config: no checksum annotation" "${no_config}" "checksum/postgresql-config"
-assert_not_contains "no config: no conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
+assert_not_contains "no config: setup-config never strips include_dir" "${no_config}" 'grep -v "include_dir'
+assert_contains "no config: setup-config appends include_dir" "${no_config}" 'echo "include_dir'
+assert_contains "no config: checksum annotation" "${no_config}" "checksum/postgresql-config"
+assert_contains "no config: conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
 
-# Test: repmgr defaults (no configuration set) also render the cleanup
 no_config_ha=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
-assert_not_contains "no config HA: no postgresql-config configmap" "${no_config_ha}" "postgresql-config"
-assert_contains "no config HA: setup-config strips stale include_dir" "${no_config_ha}" 'grep -v "include_dir'
+assert_contains "no config HA: postgresql-config configmap renders (connection reserves)" "${no_config_ha}" "reserved-connections.conf"
+assert_not_contains "no config HA: setup-config never strips include_dir" "${no_config_ha}" 'grep -v "include_dir'
 
 # Test: enabled render appends and never strips
 assert_not_contains "config standalone: no include_dir strip when enabled" "${config_standalone}" 'grep -v "include_dir'
@@ -3373,11 +3373,10 @@ assert_contains "#308: standalone + walLevel=logical mounts postgresql-config" "
 walevel_standalone_volumes=$(grep -A1 "^      volumes:" <<< "${walevel_standalone_sts}")
 assert_contains "#308: standalone + walLevel=logical declares the matching volume" "${walevel_standalone_volumes}" "name: postgresql-config"
 
-# Byte-stable: an install that touches nothing #308-related must not gain a new
-# ConfigMap just because postgresql.walLevel defaults to "replica" in values.yaml.
-walevel_default_no_cm_rc=0
-helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml >/dev/null 2>&1 || walevel_default_no_cm_rc=$?
-assert_gt "#308: default walLevel renders no configmap at all (byte-stable)" "${walevel_default_no_cm_rc}" "0"
+# The default walLevel ("replica") must not emit wal-level.conf. The ConfigMap itself always
+# renders now (reserved-connections.conf), so the check is on the file, not the document.
+walevel_default_cm=$(helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308: default walLevel renders no wal-level.conf" "${walevel_default_cm}" "wal-level.conf"
 
 # Custom max_wal_senders must survive: pgbackrest-archive.conf does not re-assert its own.
 maxsenders_custom=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \

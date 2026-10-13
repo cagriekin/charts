@@ -10,24 +10,30 @@ import (
 
 func fullEnv() map[string]string {
 	return map[string]string{
-		"POD_NAME":           "pg-0",
-		"NAMESPACE":          "db",
-		"LEASE_NAME":         "pg-leader",
-		"LEASE_DURATION":     "15s",
-		"RENEW_DEADLINE":     "10s",
-		"RETRY_PERIOD":       "2s",
-		"RECONCILE_INTERVAL": "5s",
-		"HEADLESS_SERVICE":   "pg-headless",
-		"REPMGR_NODE_COUNT":  "3",
-		"MASTER_SERVICE":     "pg",
-		"PRIMARY_MARKER":     "pg-primary",
-		"POD_SELECTOR":       "app.kubernetes.io/component=postgresql",
-		"REPMGR_USER":        "repmgr",
-		"REPMGR_DB":          "repmgr",
-		"REPMGR_PASSWORD":    "secret",
-		"PGDATA":             "/var/lib/postgresql/data/pgdata",
-		"DCS_BACKEND":        "kubernetes",
-		"POD_CIDR":           "10.0.0.0/8",
+		"POD_NAME":              "pg-0",
+		"NAMESPACE":             "db",
+		"LEASE_NAME":            "pg-leader",
+		"LEASE_DURATION":        "15s",
+		"RENEW_DEADLINE":        "10s",
+		"RETRY_PERIOD":          "2s",
+		"RECONCILE_INTERVAL":    "5s",
+		"HEADLESS_SERVICE":      "pg-headless",
+		"REPMGR_NODE_COUNT":     "3",
+		"MASTER_SERVICE":        "pg",
+		"PRIMARY_MARKER":        "pg-primary",
+		"POD_SELECTOR":          "app.kubernetes.io/component=postgresql",
+		"REPMGR_USER":           "repmgr",
+		"REPMGR_DB":             "repmgr",
+		"REPMGR_PASSWORD":       "secret",
+		"PGDATA":                "/var/lib/postgresql/data/pgdata",
+		"DCS_BACKEND":           "kubernetes",
+		"POD_CIDR":              "10.0.0.0/8",
+		"POSTGRES_USER":         "postgres",
+		"POSTGRES_DB":           "postgres",
+		"APP_USER":              "application",
+		"APP_PASSWORD":          "app-secret",
+		"PGPOOL_CHECK_USER":     "pgpool_check",
+		"PGPOOL_CHECK_PASSWORD": "check-secret",
 	}
 }
 
@@ -304,8 +310,8 @@ func TestLoadTLSFieldsDefaultOff(t *testing.T) {
 	if c.TLSRequireSSL || c.TLSClientCertAuth {
 		t.Errorf("TLS booleans must default false: require=%v mtls=%v", c.TLSRequireSSL, c.TLSClientCertAuth)
 	}
-	if c.PostgresUser != "" || c.MonitoringUser != "" {
-		t.Errorf("user exemptions must default empty: postgres=%q monitoring=%q", c.PostgresUser, c.MonitoringUser)
+	if c.MonitoringUser != "" {
+		t.Errorf("the monitoring exemption must default empty, got %q", c.MonitoringUser)
 	}
 }
 
@@ -745,5 +751,46 @@ func TestLoadMaxLagOnFailover(t *testing.T) {
 		if _, err := Load(getter(env)); err == nil || !strings.Contains(err.Error(), "MAX_LAG_ON_FAILOVER_BYTES") {
 			t.Errorf("%q: want a MAX_LAG_ON_FAILOVER_BYTES error, got %v", bad, err)
 		}
+	}
+}
+
+// The managed roles are required, and the agent refuses names that would make its
+// NOSUPERUSER provisioning strip another role's privileges.
+func TestLoadManagedRoles(t *testing.T) {
+	for _, key := range []string{"APP_USER", "APP_PASSWORD", "PGPOOL_CHECK_USER", "PGPOOL_CHECK_PASSWORD", "POSTGRES_USER", "POSTGRES_DB"} {
+		m := fullEnv()
+		delete(m, key)
+		if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("missing %s must fail, got %v", key, err)
+		}
+	}
+	for _, c := range []struct{ key, other string }{
+		{"APP_USER", "POSTGRES_USER"},
+		{"APP_USER", "REPMGR_USER"},
+		{"APP_USER", "MONITORING_USER"},
+		{"PGPOOL_CHECK_USER", "POSTGRES_USER"},
+		{"PGPOOL_CHECK_USER", "REPMGR_USER"},
+		{"PGPOOL_CHECK_USER", "APP_USER"},
+	} {
+		m := fullEnv()
+		m["POSTGRES_USER"] = "dbadmin"
+		m["MONITORING_USER"] = "monitoring"
+		m[c.key] = m[c.other]
+		if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), c.key) {
+			t.Errorf("%s equal to %s must fail, got %v", c.key, c.other, err)
+		}
+	}
+	m := fullEnv()
+	m["APP_USER"] = "postgres"
+	m["POSTGRES_USER"] = "dbadmin"
+	if _, err := Load(getter(m)); err == nil {
+		t.Error("APP_USER=postgres must fail: it is the bootstrap superuser")
+	}
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AppUser != "application" || c.AppPassword != "app-secret" || c.PgpoolCheckUser != "pgpool_check" || c.PgpoolCheckPassword != "check-secret" {
+		t.Errorf("managed roles not loaded: %+v", c)
 	}
 }

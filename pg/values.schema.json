@@ -293,6 +293,19 @@
         },
         "resources": {
           "$ref": "#/definitions/resources"
+        },
+        "app": {
+          "type": "object",
+          "description": "Application role: a non-superuser LOGIN that owns postgresql.database, provisioned by the chart.",
+          "required": [
+            "username"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+            }
+          }
         }
       }
     },
@@ -496,6 +509,19 @@
           "properties": {
             "resources": {
               "$ref": "#/definitions/resources"
+            }
+          }
+        },
+        "checkUser": {
+          "type": "object",
+          "description": "Role pgpool's health and streaming checks log in as (pg_monitor + pg_use_reserved_connections), provisioned by the chart.",
+          "required": [
+            "username"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_]{0,62}$"
             }
           }
         }

@@ -67,8 +67,8 @@ func withStderr(err error) error {
 	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
 }
 
-// ConnInfo is how to reach one PostgreSQL node. Password is passed via PGPASSWORD,
-// never on the command line, so it never appears in argv or logs.
+// ConnInfo is how to reach one PostgreSQL node. Password is never put into argv or a
+// connection string, so it never appears in a process list or a parse error.
 type ConnInfo struct {
 	Host     string
 	Port     int
@@ -110,9 +110,14 @@ type NodeState struct {
 	// primary's current WAL LSN, or a standby's last *received* LSN.
 	WriteLSN LSN
 	LSNOK    bool
+	// Saturated is true when the node refused the probe's connection with
+	// too_many_connections (53300): it is NOT Reachable -- nothing about its role or
+	// position could be read -- but the refusal is positive evidence the postmaster is
+	// alive and forking backends, which a crashed or frozen node never produces.
+	Saturated bool
 }
 
-// Prober runs SQL probes against PostgreSQL nodes via psql.
+// Prober runs SQL probes against PostgreSQL nodes through its SQL transport.
 type Prober struct {
 	// Exec runs the external commands the agent still needs a process for (the bootstrap
 	// entrypoint, pg_ctl). It is no longer how SQL reaches a node.
@@ -126,9 +131,16 @@ type Prober struct {
 }
 
 // NewProber returns the agent's prober: SQL over sql, 10s per-probe deadline. The caller
-// owns sql (the agent closes its ConnCache on shutdown).
-func NewProber(sql Querier) *Prober {
-	return &Prober{Exec: OSExec{}, SQL: sql, Timeout: 10 * time.Second}
+// owns sql (the agent closes its ConnCache on shutdown). A missing transport is refused
+// here, at startup, rather than surfacing as every peer reading unreachable.
+func NewProber(sql Querier) (*Prober, error) {
+	if sql == nil {
+		return nil, errors.New("prober: SQL querier is required")
+	}
+	if cc, ok := sql.(*ConnCache); ok && cc == nil {
+		return nil, errors.New("prober: SQL querier is a nil *ConnCache")
+	}
+	return &Prober{Exec: OSExec{}, SQL: sql, Timeout: 10 * time.Second}, nil
 }
 
 // psql runs sql against ci under the per-probe deadline and returns `psql -tA` shaped
@@ -655,7 +667,19 @@ func IsDuplicateSlot(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDuplicateObject
 }
 
-const sqlstateDuplicateObject = "42710"
+const (
+	sqlstateDuplicateObject    = "42710"
+	sqlstateTooManyConnections = "53300"
+)
+
+// IsTooManyConnections reports whether err is the server refusing a new connection
+// because its slots are exhausted: "sorry, too many clients already" and "remaining
+// connection slots are reserved ..." both carry SQLSTATE 53300. The refusal comes from
+// a backend the postmaster has just forked, so it proves the postmaster is alive.
+func IsTooManyConnections(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstateTooManyConnections
+}
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
 //
@@ -716,7 +740,11 @@ func validSlotName(name string) error {
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
 	ns := NodeState{Host: ci.Host}
 	inRec, reachable, err := p.InRecovery(ctx, ci)
-	if err != nil || !reachable {
+	if err != nil {
+		ns.Saturated = IsTooManyConnections(err)
+		return ns
+	}
+	if !reachable {
 		return ns
 	}
 	ns.Reachable = true

@@ -13,9 +13,13 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
 | `PGDATA` | string | yes | `/var/lib/postgresql/data/pgdata` | postgres / entrypoint |
-| `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool |
+| `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool, agent (required: superuser for role provisioning over the local socket) |
 | `POSTGRES_PASSWORD` | string | yes | secret (`password`) | entrypoint |
-| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint |
+| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint, agent (required: database for role provisioning; the application role owns it) |
+| `APP_USER` | string | yes | `postgresql.app.username` (`app_user`) | agent (provisions the non-superuser application role on the primary), standalone postStart (same) |
+| `APP_PASSWORD` | string | yes | secret (`app-password`, or `postgresql.existingSecret.appPasswordKey`) | agent, standalone postStart |
+| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` (`pgpool_check`) | agent (provisions pgpool's check role: `pg_monitor`, `pg_use_reserved_connections`), standalone postStart (same) |
+| `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`, or `postgresql.existingSecret.pgpoolCheckPasswordKey`) | agent, standalone postStart |
 | `LD_LIBRARY_PATH` | string | no | `/usr/lib/postgresql/<major>/extra-lib` | dynamic linker (`postgresql.extensions.extraLibs`, #309; emitted only when non-empty) |
 
 ## repmgr (both failover modes, when `ha.enabled=true`)
@@ -187,6 +191,15 @@ these variables. Nothing injects or reads them any more:
 | `PGBACKREST_ENABLED` | bool | yes | `true` | entrypoint (archive/restore commands) |
 | `PGBACKREST_STANZA` | string | yes | `pgbackrest.stanza` | entrypoint, pgbackrest sidecar |
 | `PGBACKREST_REPO1_S3_*` | string | yes | `pgbackrest.existingSecret` | pgbackrest sidecar |
+
+## pgpool init containers (when `pgpool.enabled=true`)
+
+| Variable | Type | Required | Default / source | Consumer |
+|----------|------|----------|------------------|----------|
+| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` | init-config (`sr_check_user`/`health_check_user` and its `pool_passwd` entry), wait-check-role (login probe) |
+| `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`) | init-config (`pool_passwd`) |
+| `APP_USER` / `APP_PASSWORD` | string | yes | `postgresql.app.username` / secret (`app-password`) | init-config (`pool_passwd`, so pgpool accepts the application role) |
+| `PGPASSWORD` | string | yes | secret (`pgpool-check-password`) | wait-check-role (psql login as the check role before pgpool starts) |
 
 ## metrics / exporters
 
