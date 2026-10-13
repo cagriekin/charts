@@ -111,16 +111,25 @@ type NodeState struct {
 
 // Prober runs SQL probes against PostgreSQL nodes via psql.
 type Prober struct {
-	Exec    Exec
+	// Exec runs the external commands the agent still needs a process for (the bootstrap
+	// entrypoint, pg_ctl). It is no longer how SQL reaches a node.
+	Exec Exec
+	// SQL is the transport every probe goes through. The agent sets a ConnCache -- one
+	// persistent connection per node (#364). nil, as the unit tests leave it, means
+	// ExecQuerier over Exec: the original psql-per-query transport, whose fakes answer by
+	// inspecting the psql argument list.
+	SQL     Querier
 	Timeout time.Duration
 }
 
-// NewProber returns a Prober using the real psql with the shell's 10s timeout.
-func NewProber() *Prober { return &Prober{Exec: OSExec{}, Timeout: 10 * time.Second} }
+// NewProber returns the agent's prober: persistent connections, 10s per-probe deadline.
+func NewProber() *Prober {
+	return &Prober{Exec: OSExec{}, SQL: NewConnCache(), Timeout: 10 * time.Second}
+}
 
-// psql runs one query (tuples-only, unaligned) and returns trimmed stdout. The
-// per-call context bounds total time; PGCONNECT_TIMEOUT bounds the connect phase
-// (mirrors the shell `timeout 10 psql ... connect_timeout=10`).
+// psql runs sql against ci under the per-probe deadline and returns `psql -tA` shaped
+// text (see Querier). The name is historical: until #364 this really was a psql process
+// per call, and every parser below still consumes that output shape.
 func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, error) {
 	to := p.Timeout
 	if to <= 0 {
@@ -128,20 +137,11 @@ func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
-	env := []string{
-		"PGPASSWORD=" + ci.Password,
-		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(to.Seconds())),
+	q := p.SQL
+	if q == nil {
+		q = ExecQuerier{Exec: p.Exec, Timeout: to}
 	}
-	// --no-psqlrc, as RehashMd5User already passes (#298 review). Every caller here parses
-	// psql's OUTPUT SHAPE -- `strings.Cut(out, "|")`, an exact "t"/"f", a bare LSN for
-	// ParseLSN -- and a startup file can change all of it (`\pset fieldsep`, `\pset null`,
-	// a banner) while psql still exits 0. PSQLRC reaches this process through
-	// postgresql.extraEnv and childenv.Filtered strips only *PASSWORD*, and the agent itself
-	// writes into the postgres home (writePgpass), so ~/.psqlrc is reachable too. The failure
-	// is silent and cluster-wide: LSNOK false on every node, so survivor ranking has no
-	// positions to compare and the failover simply never happens.
-	args := []string{"--no-psqlrc", "-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
-	return p.Exec.Run(ctx, env, "psql", args...)
+	return q.QueryText(ctx, ci, sql)
 }
 
 // InRecovery reports pg_is_in_recovery(). reachable is false when the node could

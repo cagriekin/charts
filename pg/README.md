@@ -629,6 +629,17 @@ This is the only failover path. It has been the default since `1.0.0`; the legac
 service-updater sidecars were removed in **2.0.0**, and `repmgr.failoverMode` is now rejected at
 render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
+**How it observes.** Every tick the agent queries its own PostgreSQL and every peer (role,
+timeline, WAL position; the primary's replication topology and slots) as the replication user
+over TCP, on **one persistent connection per node** that it keeps across ticks and re-dials on
+any error (pg-ha image 2.2.0, #364). Each query runs under the agent's per-probe deadline, so a
+dead peer is still noticed within that deadline rather than hidden behind a stale socket, and a
+peer that restarted between ticks is re-dialled inside the same probe. The sessions show as
+`application_name = pg-ha-agent` in `pg_stat_activity`: expect one from each agent on every
+node, so a 3-node cluster holds three such sessions per node. Before 2.2.0 every probe was a
+fresh `psql` process, which in this image resolves to Debian's Perl wrapper; at six to nine probes
+per tick that cost over half a CPU core per *idle* pod on slow vCPUs.
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `ha.agent.leaseDuration` | Lease TTL; a challenger cannot acquire until this elapses since the last renew | `15s` |
