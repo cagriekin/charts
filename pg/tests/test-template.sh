@@ -2135,7 +2135,8 @@ assert_contains "#361: agent pgpool: RO backend is detachable" "${agent_pgpool}"
 assert_not_contains "#361: ... and no longer DISALLOW_TO_FAILOVER" "${agent_pgpool}" "backend_flag1 = 'DISALLOW_TO_FAILOVER'"
 pgpool_dep_361=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_eq "#361: the re-attach loop runs beside pgpool (pcp_attach_node once)" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pcp_attach_node -h 127.0.0.1')"
-assert_eq "#361: both probes pin SELECT 1 to the primary" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'NO LOAD BALANCE\*/ SELECT 1')"
+assert_eq "#361: both probes ask pgpool over PCP, not through a PostgreSQL session" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info')"
+assert_not_contains "#361: no probe opens a session through pgpool" "${pgpool_dep_361}" 'psql -h 127.0.0.1 -p 9999'
 pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpool_dep_361_off}" "pcp_attach_node"
 assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"

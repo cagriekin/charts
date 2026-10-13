@@ -375,21 +375,29 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
-          # Probes query through pgpool: a tcpSocket probe stays green on a
-          # wedged pgpool that accepts TCP but rejects every session with
-          # "all backend nodes are down" (#122). pool_hba trusts 127.0.0.1
-          # on the frontend; the backend side authenticates via pool_passwd.
-          # A failing liveness restarts pgpool with a fresh status file,
-          # which re-runs backend discovery and reattaches recovered nodes.
-          # /*NO LOAD BALANCE*/ pins the probe to the primary (#361): the
-          # proxy is healthy when the write path works, and a read backend
-          # that is detached or lagging must not make it unready or restart it.
+          # Probes ask pgpool itself, over PCP, and open no PostgreSQL session. Any session
+          # through pgpool -- whatever the role -- makes pgpool open a backend connection and
+          # keep it cached in that child, and a probe lands on a different one of the
+          # numInitChildren children each time. On a node at max_connections those
+          # connections came out of a reserve and stayed there: as the superuser they took
+          # superuser_reserved_connections from the agent; as pgpool.checkUser they would
+          # take reserved_connections from pgpool's own health checks; as the application
+          # role a full node would fail the probes and restart the proxy.
+          # Liveness: PCP answers and at least one backend is not down. That still catches
+          # the #122 wedge -- a pgpool that accepts TCP but rejects every session with "all
+          # backend nodes are down" -- and restarts it with a fresh status file.
+          # Readiness: PCP answers and node 0 -- the primary, the write path -- is up or
+          # waiting. A read backend that is detached or lagging must not make the proxy
+          # unready (#361); the re-attach loop brings it back. The PCP credentials are the
+          # .pcppass init-config writes for the re-attach loop.
           livenessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
+                - |
+                  info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w) || exit 1
+                  printf '%s\n' "$info" | awk '$5 != "" && $5 != "down" { live = 1 } END { exit !live }'
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
@@ -399,7 +407,9 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "/*NO LOAD BALANCE*/ SELECT 1" > /dev/null
+                - |
+                  info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w) || exit 1
+                  printf '%s\n' "$info" | awk 'NR == 1 { exit !($5 == "up" || $5 == "waiting") } END { if (NR == 0) exit 1 }'
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

@@ -81,6 +81,17 @@
 
 ### Changed
 
+- **pgpool's liveness and readiness probes ask pgpool over PCP instead of running `SELECT 1`
+  through it.** A session through pgpool leaves a cached backend connection in one of its
+  children, whatever the role. On a node at `max_connections` that connection came out of a
+  reserve and stayed there: the probes logged in as the superuser and so took
+  `superuser_reserved_connections` slots from the agent. Now readiness requires node 0 (the
+  primary, the write path) to be up or waiting, and liveness fails only when PCP stops answering
+  or every backend is marked down (the #122 wedge). A detached read backend still never makes
+  pgpool unready (#361). Unlike before, an unreachable primary that pgpool still lists as up no
+  longer makes pgpool unready: sessions fail with pgpool's error instead of being refused by an
+  empty Service.
+
 - **pg-ha image 2.2.0: the agent probes over persistent connections (#364).** Every probe used to
   be a fresh `psql` process, and `psql` on the image's PATH is Debian's Perl wrapper, so each of
   the six to nine probes per tick paid a Perl start, a psql start, a TCP connect, authentication

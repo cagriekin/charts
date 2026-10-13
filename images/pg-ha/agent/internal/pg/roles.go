@@ -70,23 +70,20 @@ BEGIN
   EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', v_name, v_secret);
   IF v_kind = 'pgpool-check' THEN
     EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
-  ELSIF v_kind = 'app' AND v_db = 'postgres' THEN
-    IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
-               WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
-                 AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
-      EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', v_name);
-    END IF;
-    EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', v_db, v_name);
-    IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
-      EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', v_name);
-    END IF;
   ELSIF v_kind = 'app' THEN
     IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
                  AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
       EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', v_name);
     END IF;
-    EXECUTE format('ALTER DATABASE %I OWNER TO %I', v_db, v_name);
+    IF v_db = 'postgres' THEN
+      EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', v_db, v_name);
+      IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
+        EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', v_name);
+      END IF;
+    ELSE
+      EXECUTE format('ALTER DATABASE %I OWNER TO %I', v_db, v_name);
+    END IF;
   ELSE
     RAISE EXCEPTION 'unknown managed role kind %', v_kind;
   END IF;
@@ -132,8 +129,3 @@ var ErrRoleNotManaged = errors.New("role exists and is not managed by the pg cha
 // notManagedPhrase is the text ensureRoleSQL's RAISE carries; psql reports the server
 // error only as text, so EnsureRole recognises the refusal by it.
 const notManagedPhrase = "is not managed by the pg chart"
-
-// IsPermanentRoleError reports whether EnsureRole failed in a way no retry can fix.
-func IsPermanentRoleError(err error) bool {
-	return errors.Is(err, ErrNeedsSASLprep) || errors.Is(err, ErrRoleNotManaged)
-}

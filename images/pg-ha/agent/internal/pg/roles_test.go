@@ -48,7 +48,8 @@ func TestEnsureRoleSQL(t *testing.T) {
 		"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L",
 		"GRANT pg_monitor, pg_use_reserved_connections TO %I",
 		"ALTER DATABASE %I OWNER TO %I",
-		"ELSIF v_kind = 'app' AND v_db = 'postgres' THEN",
+		"ELSIF v_kind = 'app' THEN",
+		"IF v_db = 'postgres' THEN",
 		"GRANT CONNECT ON DATABASE %I TO %I",
 		"GRANT USAGE, CREATE ON SCHEMA public TO %I",
 		"REVOKE pg_monitor, pg_use_reserved_connections FROM %I",
@@ -93,11 +94,11 @@ func TestEnsureRoleRejectsMissingInputs(t *testing.T) {
 
 func TestEnsureRolePermanentAndTransientErrors(t *testing.T) {
 	err := EnsureRole(context.Background(), &fakeStdinExec{}, "postgres", "db", ManagedRole{Name: "app", Password: "pässwörd ", Kind: RoleApp})
-	if err == nil || !IsPermanentRoleError(err) {
+	if !errors.Is(err, ErrNeedsSASLprep) {
 		t.Errorf("a password needing SASLprep must be a permanent error, got %v", err)
 	}
 	err = EnsureRole(context.Background(), &fakeStdinExec{err: errors.New("psql: connection refused")}, "postgres", "db", ManagedRole{Name: "app", Password: "pw", Kind: RoleApp})
-	if err == nil || IsPermanentRoleError(err) {
+	if err == nil || errors.Is(err, ErrNeedsSASLprep) || errors.Is(err, ErrRoleNotManaged) {
 		t.Errorf("a psql failure must be a retryable error, got %v", err)
 	}
 }
@@ -107,7 +108,7 @@ func TestEnsureRolePermanentAndTransientErrors(t *testing.T) {
 func TestEnsureRoleNotManagedIsPermanent(t *testing.T) {
 	f := &fakeStdinExec{err: errors.New(`psql: exit status 3: ERROR:  role app_user already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE app_user IS 'managed by the pg chart'`)}
 	err := EnsureRole(context.Background(), f, "postgres", "db", ManagedRole{Name: "app_user", Password: "pw", Kind: RoleApp})
-	if !errors.Is(err, ErrRoleNotManaged) || !IsPermanentRoleError(err) {
+	if !errors.Is(err, ErrRoleNotManaged) {
 		t.Errorf("want a permanent ErrRoleNotManaged, got %v", err)
 	}
 }

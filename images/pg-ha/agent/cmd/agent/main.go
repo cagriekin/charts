@@ -2876,7 +2876,12 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		if a.managedRoleDone[i].Load() {
 			continue
 		}
-		err := pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
+		// Heartbeat across the call: rctx allows 30s, twice the /healthz staleness threshold on
+		// chart defaults, and an ALTER ROLE queued behind a lock would otherwise get the
+		// primary's agent liveness-killed.
+		err := a.beatDuring(func() error {
+			return pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
+		})
 		switch {
 		case err == nil:
 			a.managedRoleDone[i].Store(true)

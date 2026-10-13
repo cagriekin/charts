@@ -91,17 +91,27 @@ tests:
       - matchRegex:
           path: spec.template.spec.initContainers[0].command[2]
           pattern: PCP_PASS=\$\(printf '%s' "\$PCP_ADMIN_PASSWORD"\)[\s\S]*contains a newline[\s\S]*printf '%s' "\$PCP_PASS" \| md5sum[\s\S]*PCP_PASS_ESC=\$\(printf '%s' "\$PCP_PASS"
-  - it: both probes pin SELECT 1 to the primary (#361)
+  # The probes ask pgpool over PCP and open no PostgreSQL session: a session through pgpool
+  # leaves a cached backend connection behind, which on a full node comes out of a reserve.
+  # Readiness follows node 0 (the write path) only, so a detached read backend never makes
+  # the proxy unready (#361); liveness fails only when every backend is down (#122).
+  - it: both probes use PCP and open no PostgreSQL session
     template: templates/pgpool-deployment.yaml
     set:
       pgpool.enabled: true
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
-          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*\$5 != "" && \$5 != "down" \{ live = 1 \}'
       - matchRegex:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
-          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*NR == 1 \{ exit !\(\$5 == "up" \|\| \$5 == "waiting"\) \}'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: psql
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: psql
   # The loop lives in the default command; a custom command with it still enabled would
   # silently drop the only thing that re-attaches a read backend, so the render refuses.
   - it: pgpool.command with pgpool.reattach.enabled fails fast (#361)

@@ -4486,6 +4486,7 @@ func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:     observe.New(),
 		roleExec: ex,
 	}
 	for i := 0; i < 3; i++ {
@@ -4512,6 +4513,7 @@ func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:     observe.New(),
 		roleExec: perm,
 	}
 	b.ensureManagedRolesOnce(context.Background())
@@ -4543,6 +4545,7 @@ func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
 		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:     observe.New(),
 		roleExec: ex,
 	}
 	for i := 0; i < 3; i++ {

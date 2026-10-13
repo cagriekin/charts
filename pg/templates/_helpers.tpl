@@ -1161,7 +1161,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $_ := (.Values.postgresql.configuration | default dict) -}}
 {{- $lk := lower ($k | toString) -}}
 {{- if or (eq $lk "superuser_reserved_connections") (eq $lk "reserved_connections") -}}
-{{- fail (printf "postgresql.configuration.%s is set, but the chart owns the connection reserves: superuser_reserved_connections is sized from the node count (one slot per agent session, plus headroom) and reserved_connections from pgpool.replicaCount (pgpool's check role). Remove the key; raise max_connections if the application pool is too small." $k) -}}
+{{- fail (printf "postgresql.configuration.%s is set, but the chart owns the connection reserves: superuser_reserved_connections is sized from the node count (one slot per agent session, plus headroom) and reserved_connections from pgpool.reservedConnections (pgpool's check role). Remove the key; raise max_connections if the application pool is too small." $k) -}}
 {{- end -}}
 {{- end -}}
 {{- /* Only when declared: postgresql.majorVersion is otherwise required just for extension

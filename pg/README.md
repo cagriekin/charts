@@ -3269,7 +3269,7 @@ Check that the Services have endpoints (`my-postgres-pg-readonly` exists when `h
 kubectl get endpoints my-postgres-pg my-postgres-pg-pgpool my-postgres-pg-readonly
 ```
 
-The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pg-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
+The PGPool-II probes ask pgpool itself over its PCP port (`pcp_node_info`) and open no PostgreSQL session: a session through pgpool leaves a cached backend connection behind, and on a node at `max_connections` that connection would come out of a reserved pool. Readiness requires node 0 -- the primary, the write path -- to be up, so empty `my-postgres-pg-pgpool` endpoints mean pgpool has the primary marked down, or PCP does not answer. A detached read backend never makes pgpool unready; the re-attach loop brings it back. Liveness restarts PGPool-II after about 60 seconds when PCP stops answering or every backend is marked down.
 
 If reads through the `my-postgres-pg-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the agent re-applies every reconcile tick, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
 
