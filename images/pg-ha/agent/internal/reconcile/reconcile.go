@@ -159,6 +159,12 @@ type Observation struct {
 	// grace -- a frozen/wedged postmaster that Start cannot recover and the
 	// reconcile-loop liveness probe won't catch. It drives self-health failover.
 	LocalStuck bool
+	// LocalSaturationExpired is set by the agent when the local node has been in a
+	// saturation episode (refusing new connections with too_many_connections, possibly
+	// interleaved with failed probes) for longer than the saturation grace. A lease holder
+	// that is a standby uses it to release the Lease instead of waiting forever for a free
+	// slot it needs before it can promote.
+	LocalSaturationExpired bool
 	// StandbyStalled is set by the agent (a stateful, time-based signal, like LocalStuck) when
 	// this node has been a RUNNING standby with NO walreceiver for several consecutive ticks.
 	//
@@ -247,6 +253,9 @@ func Decide(o Observation) Decision {
 	// confirm the role. A previously-ready node now frozen is caught by LocalStuck
 	// below (self-health failover), so exclude that case.
 	if o.LocalProcessAlive && !o.Local.Running && !o.LocalStuck {
+		if o.HoldLease && o.Local.HasData && o.Local.InRecovery && o.LocalSaturationExpired {
+			return d(ReleaseLease, "", "lease holder is a standby that has refused new connections past the saturation grace; releasing the lease so a peer can take over")
+		}
 		if o.Local.Saturated {
 			return d(Wait, "", "postgres is running but refusing new connections (max_connections exhausted); waiting for a free slot")
 		}

@@ -1027,7 +1027,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// so a standby cloned from a restored primary correctly reports none of its own.
 		RestoredAt: a.localRestoredAt(),
 	}
-	a.trackLocalSaturation(ls.Saturated, ls.Running, time.Now())
+	a.trackLocalSaturation(ls.Saturated, ls.Running, a.sup.Running(), time.Now())
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
 	// to a stopped node (without this a fenced primary-state node has no timeline,
@@ -1114,8 +1114,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// promote-distance and role-label logic downstream reads this slice, and a peer order that
 	// varied with which probe returned first would make two identical clusters disagree.
 	type peerProbe struct {
-		ps  reconcile.PeerState
-		set bool
+		ps      reconcile.PeerState
+		refused bool
+		set     bool
 	}
 	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a negative
 	// value reaches here and `make` with a negative length PANICS -- which for PID 1 is a
@@ -1131,7 +1132,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		go func(i int, name string) {
 			defer pwg.Done()
 			ns := a.prober.Probe(ctx, a.peerConn(name))
-			probes[i] = peerProbe{set: true, ps: reconcile.PeerState{
+			probes[i] = peerProbe{set: true, refused: ns.ConnRefused, ps: reconcile.PeerState{
 				Name: name, Reachable: ns.Reachable, Saturated: ns.Saturated, Role: ns.Role,
 				Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
 			}}
@@ -1147,7 +1148,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 		name, ps := pr.ps.Name, pr.ps
 		probed[name] = true
-		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, ps.Reachable, now)
+		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, ps.Reachable, pr.refused, now)
 		if ps.Saturated {
 			saturatedPeers++
 		}
@@ -1300,6 +1301,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// from holding the Lease forever (see localSaturationAlive).
 	now = time.Now()
 	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running || a.localSaturationAlive(now), now)
+	o.LocalSaturationExpired = a.localSaturationEpisodeExpired(now)
 	// PeersPending: the holder waits (does not promote/resume) only during a true
 	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)
 	// records peers ever SQL-reachable; once all have been seen, the wait never
@@ -1327,12 +1329,18 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 
 // trackLocalSaturation publishes the local saturation gauge and tracks the saturation
 // EPISODE. The episode starts at the first too_many_connections refusal and ends only on
-// positive evidence -- a probe that succeeds (reachable). Any other failure (a timeout, a
-// refused connection) does not end it: a primary on hung storage alternates between
+// positive evidence: a probe that succeeds (reachable), or the supervised postmaster no
+// longer running (processAlive false), so the next refusal is a new server's and starts a
+// fresh grace. A failed probe does not end it: a primary on hung storage alternates between
 // refusals and timeouts, and restarting the clock on every timeout would renew
 // SaturationGrace forever and keep the Lease on a node that should step down.
-func (a *agent) trackLocalSaturation(saturated, reachable bool, now time.Time) {
+func (a *agent) trackLocalSaturation(saturated, reachable, processAlive bool, now time.Time) {
 	a.metr.SetLocalSaturated(saturated)
+	if !processAlive && !a.localSaturatedSince.IsZero() {
+		a.log.Info("local postmaster is not running; ending the saturation episode")
+		a.localSaturatedSince = time.Time{}
+		a.localSaturationExpired = false
+	}
 	if saturated && a.localSaturatedSince.IsZero() {
 		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) for up to the saturation grace, but unobservable until a slot frees", "grace", a.cfg.SaturationGrace)
 		a.localSaturatedSince = now
@@ -1365,10 +1373,20 @@ func (a *agent) localSaturationAlive(now time.Time) bool {
 	return false
 }
 
+// localSaturationEpisodeExpired reports whether the local saturation episode has lasted
+// past cfg.SaturationGrace. Unlike localSaturationAlive it holds across the failed probes
+// between refusals, because the episode does: it is what lets a lease-holding standby that
+// stays saturated release the Lease (reconcile.Observation.LocalSaturationExpired).
+func (a *agent) localSaturationEpisodeExpired(now time.Time) bool {
+	return !a.localSaturatedSince.IsZero() && now.Sub(a.localSaturatedSince) >= a.cfg.SaturationGrace
+}
+
 // trackPeerSaturation records a peer's saturation episode and reports whether a
 // lease-holding standby must still wait rather than promote past it
 // (reconcile.PeerState.SaturatedWait). A too_many_connections refusal starts an episode;
-// only a successful probe (reachable) ends it. While an episode is active, ANY failed probe
+// it ends only on positive evidence: a successful probe (reachable), or a refused TCP
+// connection (refused), which means nothing is listening, so the peer's postmaster exited
+// and a later refusal belongs to a new server. While an episode is active, any other failed probe
 // keeps the wait in force until the grace runs out: a full peer alternating between refusals
 // and timeouts is just as alive, and just as possibly ahead, on its timeout ticks -- letting
 // those ticks through would promote past it and discard its WAL (invariant 8). This is the
@@ -1377,11 +1395,18 @@ func (a *agent) localSaturationAlive(now time.Time) bool {
 // bootstrapGrace, 2x LeaseDuration from the first refusal: long enough to ride out a
 // connection spike, bounded because the saturated node's own agent is just as blind to it and
 // cannot take over.
-func (a *agent) trackPeerSaturation(name string, saturated, reachable bool, now time.Time) bool {
+func (a *agent) trackPeerSaturation(name string, saturated, reachable, refused bool, now time.Time) bool {
 	since, active := a.peerSaturatedSince[name]
 	if reachable {
 		if active {
 			a.log.Info("peer accepts the agent's connections again", "peer", name)
+			delete(a.peerSaturatedSince, name)
+		}
+		return false
+	}
+	if refused {
+		if active {
+			a.log.Info("peer refuses TCP connections (postmaster not running); ending its saturation episode", "peer", name)
 			delete(a.peerSaturatedSince, name)
 		}
 		return false

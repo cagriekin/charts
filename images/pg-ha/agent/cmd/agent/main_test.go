@@ -4451,19 +4451,19 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
 	grace := a.bootstrapGrace()
-	if !a.trackPeerSaturation("pg-1", true, false, t0) {
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0) {
 		t.Fatal("the first saturated probe must start the grace")
 	}
-	if !a.trackPeerSaturation("pg-1", true, false, t0.Add(grace-time.Second)) {
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(grace-time.Second)) {
 		t.Error("still inside the grace")
 	}
-	if a.trackPeerSaturation("pg-1", true, false, t0.Add(grace)) {
+	if a.trackPeerSaturation("pg-1", true, false, false, t0.Add(grace)) {
 		t.Error("the grace must end after bootstrapGrace")
 	}
-	if a.trackPeerSaturation("pg-1", false, true, t0.Add(grace+time.Second)) {
+	if a.trackPeerSaturation("pg-1", false, true, false, t0.Add(grace+time.Second)) {
 		t.Error("an answering peer is never in the wait")
 	}
-	if !a.trackPeerSaturation("pg-1", true, false, t0.Add(2*grace)) {
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(2*grace)) {
 		t.Error("a new saturation episode must start a fresh grace")
 	}
 }
@@ -4477,21 +4477,39 @@ func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
 	grace := a.bootstrapGrace()
-	if a.trackPeerSaturation("pg-1", false, false, t0) {
+	if a.trackPeerSaturation("pg-1", false, false, false, t0) {
 		t.Error("an unreachable peer outside an episode is not saturated")
 	}
-	a.trackPeerSaturation("pg-1", true, false, t0)
-	if !a.trackPeerSaturation("pg-1", false, false, t0.Add(grace/2)) {
+	a.trackPeerSaturation("pg-1", true, false, false, t0)
+	if !a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace/2)) {
 		t.Error("a timeout tick inside an active episode must keep the standby waiting")
 	}
-	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace)) {
+	if a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace)) {
 		t.Error("the grace runs from the FIRST refusal; the timeouts must not have restarted it")
 	}
-	if a.trackPeerSaturation("pg-1", false, true, t0.Add(grace+time.Second)) {
+	if a.trackPeerSaturation("pg-1", false, true, false, t0.Add(grace+time.Second)) {
 		t.Error("a successful probe ends the episode")
 	}
-	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace+2*time.Second)) {
+	if a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace+2*time.Second)) {
 		t.Error("after the episode ended, a timeout is the ordinary unreachable case")
+	}
+}
+
+// A refused TCP connection means the peer's postmaster exited, so it ends the episode: the
+// next refusal belongs to a new server and gets a fresh grace instead of an expired one.
+func TestTrackPeerSaturationEndsOnRefusedConnection(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.bootstrapGrace()
+	a.trackPeerSaturation("pg-1", true, false, false, t0)
+	if a.trackPeerSaturation("pg-1", false, false, true, t0.Add(grace/2)) {
+		t.Error("a refused connection ends the episode; the standby no longer waits on it")
+	}
+	if _, active := a.peerSaturatedSince["pg-1"]; active {
+		t.Error("the episode must be cleared")
+	}
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(2*grace)) {
+		t.Error("a refusal after the restart must start a fresh grace")
 	}
 }
 
@@ -4619,6 +4637,9 @@ func TestObserveSaturationPastTheGraceIsNotAlive(t *testing.T) {
 	if !o.LocalStuck {
 		t.Error("a primary saturated past the grace must trip self-health")
 	}
+	if !o.LocalSaturationExpired {
+		t.Error("observe must report the expired episode")
+	}
 	if !a.localSaturationExpired {
 		t.Error("the expiry must be latched (logged once)")
 	}
@@ -4628,15 +4649,15 @@ func TestObserveSaturationPastTheGraceIsNotAlive(t *testing.T) {
 func TestLocalSaturationGraceIsPerEpisode(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
-	a.trackLocalSaturation(true, false, t0)
+	a.trackLocalSaturation(true, false, true, t0)
 	if !a.localSaturationAlive(t0.Add(30 * time.Second)) {
 		t.Error("inside the grace a saturated node counts as alive")
 	}
 	if a.localSaturationAlive(t0.Add(2 * time.Minute)) {
 		t.Error("past the grace it must not")
 	}
-	a.trackLocalSaturation(false, true, t0.Add(3*time.Minute))
-	a.trackLocalSaturation(true, false, t0.Add(4*time.Minute))
+	a.trackLocalSaturation(false, true, true, t0.Add(3*time.Minute))
+	a.trackLocalSaturation(true, false, true, t0.Add(4*time.Minute))
 	if !a.localSaturationAlive(t0.Add(4*time.Minute + 30*time.Second)) {
 		t.Error("a new episode must start a fresh grace")
 	}
@@ -4652,18 +4673,61 @@ func TestLocalSaturationGraceSurvivesTimeouts(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	g := a.cfg.SaturationGrace
 	t0 := time.Unix(1_700_000_000, 0)
-	a.trackLocalSaturation(true, false, t0)
-	a.trackLocalSaturation(false, false, t0.Add(g/4)) // timeout: neither saturated nor reachable
+	a.trackLocalSaturation(true, false, true, t0)
+	a.trackLocalSaturation(false, false, true, t0.Add(g/4)) // timeout: neither saturated nor reachable
 	if a.localSaturationAlive(t0.Add(g / 4)) {
 		t.Error("a timeout tick is not proof of life")
 	}
-	a.trackLocalSaturation(true, false, t0.Add(g*3/4))
+	a.trackLocalSaturation(true, false, true, t0.Add(g*3/4))
 	if !a.localSaturationAlive(t0.Add(g * 3 / 4)) {
 		t.Error("still inside the original grace")
 	}
-	a.trackLocalSaturation(true, false, t0.Add(g))
+	a.trackLocalSaturation(true, false, true, t0.Add(g))
 	if a.localSaturationAlive(t0.Add(g)) {
 		t.Error("the grace runs from the FIRST refusal; the timeout in between must not have restarted it")
+	}
+}
+
+// The episode ends when the supervised postmaster stops: a refusal after a restart is a new
+// server's and must get a fresh grace, not inherit the old episode's expiry.
+func TestLocalSaturationEpisodeEndsWhenPostmasterStops(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, false, true, t0)
+	if !a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Fatal("control: the episode expires at the grace")
+	}
+	a.trackLocalSaturation(false, false, false, t0.Add(g))
+	if a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Error("a stopped postmaster must end the episode")
+	}
+	a.trackLocalSaturation(true, false, true, t0.Add(g+time.Second))
+	if !a.localSaturationAlive(t0.Add(g + 2*time.Second)) {
+		t.Error("a refusal after the restart must start a fresh grace")
+	}
+}
+
+// The expiry that releases a saturated standby's Lease holds across the timeout ticks
+// between refusals, as the episode does.
+func TestLocalSaturationEpisodeExpiredSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	if a.localSaturationEpisodeExpired(t0.Add(10 * g)) {
+		t.Error("no episode, no expiry")
+	}
+	a.trackLocalSaturation(true, false, true, t0)
+	if a.localSaturationEpisodeExpired(t0.Add(g - time.Second)) {
+		t.Error("inside the grace")
+	}
+	a.trackLocalSaturation(false, false, true, t0.Add(g)) // timeout tick
+	if !a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Error("a timeout tick past the grace must still report the expiry")
+	}
+	a.trackLocalSaturation(false, true, true, t0.Add(g+time.Second))
+	if a.localSaturationEpisodeExpired(t0.Add(g + time.Second)) {
+		t.Error("a successful probe ends the episode")
 	}
 }
 

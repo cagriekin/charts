@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -115,6 +116,11 @@ type NodeState struct {
 	// position could be read -- but the refusal is positive evidence the postmaster is
 	// alive and forking backends, which a crashed or frozen node never produces.
 	Saturated bool
+	// ConnRefused is true when the TCP connection itself was refused (ECONNREFUSED):
+	// nothing is listening on the port, so the postmaster has exited. Unlike a timeout,
+	// which a frozen or overloaded node also produces, it is positive evidence of a
+	// restart, and it ends a saturation episode.
+	ConnRefused bool
 }
 
 // Prober runs SQL probes against PostgreSQL nodes through its SQL transport.
@@ -684,6 +690,12 @@ func IsTooManyConnections(err error) bool {
 	return hasSQLState(err, sqlstateTooManyConnections)
 }
 
+// IsConnRefused reports whether err is a refused TCP connection: no process is
+// listening on the port.
+func IsConnRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
 //
 // The `AND NOT active` lives in the SQL, not in Go, on purpose: it makes "never drop a
@@ -745,6 +757,7 @@ func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
 	inRec, reachable, err := p.InRecovery(ctx, ci)
 	if err != nil {
 		ns.Saturated = IsTooManyConnections(err)
+		ns.ConnRefused = IsConnRefused(err)
 		return ns
 	}
 	if !reachable {

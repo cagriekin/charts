@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1006,6 +1009,22 @@ func TestProbeMarksATooManyConnectionsRefusalAsSaturated(t *testing.T) {
 		}
 		if ns.Saturated != c.want {
 			t.Errorf("%s: Saturated = %v, want %v", c.name, ns.Saturated, c.want)
+		}
+	}
+}
+
+func TestIsConnRefused(t *testing.T) {
+	refused := fmt.Errorf("dial: %w", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)})
+	if !IsConnRefused(refused) {
+		t.Error("a wrapped ECONNREFUSED must be recognised")
+	}
+	for _, err := range []error{
+		&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)},
+		&pgconn.PgError{Code: sqlstateTooManyConnections},
+		context.DeadlineExceeded,
+	} {
+		if IsConnRefused(err) {
+			t.Errorf("%v must not read as a refused connection", err)
 		}
 	}
 }

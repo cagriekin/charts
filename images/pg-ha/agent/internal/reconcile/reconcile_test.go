@@ -705,6 +705,16 @@ func TestDecideSaturation(t *testing.T) {
 			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, false)}}, Promote},
 		{"reachable peer ahead still wins the handoff over a saturated one",
 			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-1", 5, 5, 0x200), saturated(PeerState{Name: "pg-2"}, true)}}, ReleaseLease},
+		{"saturated local standby holder inside the grace -> wait",
+			Observation{HoldLease: true, LocalProcessAlive: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, Wait},
+		{"saturated local standby holder past the grace -> release the lease",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, ReleaseLease},
+		{"local standby holder past the grace on a timeout tick -> release the lease",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, InRecovery: true}}, ReleaseLease},
+		{"saturated local standby past the grace without the lease -> wait",
+			Observation{LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, Wait},
+		{"saturated local primary holder past the grace, not yet stuck -> wait for self-health",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true}}, Wait},
 	}
 	for _, c := range cases {
 		if got := Decide(c.obs); got.Action != c.want {
