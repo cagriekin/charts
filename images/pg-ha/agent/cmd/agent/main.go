@@ -1126,11 +1126,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	pwg.Wait()
 	now := time.Now()
 	saturatedPeers := 0
+	probed := make(map[string]bool, len(probes))
 	for _, pr := range probes {
 		if !pr.set {
 			continue
 		}
 		name, ps := pr.ps.Name, pr.ps
+		probed[name] = true
 		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, now)
 		if ps.Saturated {
 			saturatedPeers++
@@ -1153,6 +1155,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			ps.RestoredAt = validRestoreProvenance(g.RestoredAt, time.Now())
 		}
 		o.Peers = append(o.Peers, ps)
+	}
+	// A peer that left the probe set (scale-down) must not carry its old episode start into
+	// a later one, which would skip the SaturatedWait grace on its first saturated probe.
+	for name := range a.peerSaturatedSince {
+		if !probed[name] {
+			delete(a.peerSaturatedSince, name)
+		}
 	}
 	a.metr.SetPeersSaturated(saturatedPeers)
 	// Bounded for the same reason as the gossip read above (#298 review); the marker

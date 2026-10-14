@@ -663,8 +663,12 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 // (P0001), so it is not swallowed; neither is any error that did not come from the
 // server (connection loss, deadline), which carries no SQLSTATE at all (#364).
 func IsDuplicateSlot(err error) bool {
+	return hasSQLState(err, sqlstateDuplicateObject)
+}
+
+func hasSQLState(err error, code string) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == sqlstateDuplicateObject
+	return errors.As(err, &pgErr) && pgErr.Code == code
 }
 
 const (
@@ -677,8 +681,7 @@ const (
 // connection slots are reserved ..." both carry SQLSTATE 53300. The refusal comes from
 // a backend the postmaster has just forked, so it proves the postmaster is alive.
 func IsTooManyConnections(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == sqlstateTooManyConnections
+	return hasSQLState(err, sqlstateTooManyConnections)
 }
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
