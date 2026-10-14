@@ -79,7 +79,9 @@
 - **`pgpool.checkUser`: pgpool's health and streaming checks no longer log in as the superuser.**
   The check role has `pg_monitor` and `pg_use_reserved_connections`, so the checks draw from
   `reserved_connections`. When application sessions fill a node, its health check still passes
-  and pgpool does not detach it.
+  and pgpool does not detach it. With `postgresql.tls.clientCertAuth`, the check role is exempt
+  from the client-certificate requirement like the other internal users (password over TLS),
+  since pgpool's backend connections present no client certificate.
 - **The agent treats `too many clients` (SQLSTATE 53300) as proof that a node is alive.** A full
   primary is not stepped down by self-health for up to `ha.agent.saturationGrace` (default 2m):
   before, a primary whose connections ran out for `LeaseDuration` was SIGQUIT'd and failed over as

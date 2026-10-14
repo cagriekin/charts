@@ -932,7 +932,7 @@ spec:
 {{- if .Values.postgresql.tls.enabled }}
             {{- /* Client TLS pg_hba (#110): the agent emits hostssl on the pod CIDR
                    when require/clientCertAuth, exempting the internal service users
-                   (repmgr/postgres/monitoring) from the client-cert requirement. */}}
+                   (repmgr/postgres/monitoring/pgpool check role) from the client-cert requirement. */}}
             {{- /* TLS_ENABLED carries the INTENT, which the agent cannot infer from the two
                    variables below: `require` defaults to false, so an absent TLS_REQUIRE_SSL and
                    a deliberate `require: false` are the same value. The agent needs the intent

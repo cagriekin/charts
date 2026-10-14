@@ -2987,6 +2987,7 @@ func (a *agent) writePgHba() error {
 		ClientCertAuth:  a.cfg.TLSClientCertAuth,
 		PostgresUser:    a.cfg.PostgresUser,
 		MonitoringUser:  a.cfg.MonitoringUser,
+		PgpoolCheckUser: a.cfg.PgpoolCheckUser,
 		MD5Fallback:     true,
 	})
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)

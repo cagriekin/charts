@@ -60,9 +60,10 @@ func TestAssemblePgHbaClientCertAuthExemptsInternalUsers(t *testing.T) {
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 	})
 	// Internal users get hostssl WITHOUT clientcert (password over TLS).
-	for _, u := range []string{"repmgr", "postgres", "monitoring"} {
+	for _, u := range []string{"repmgr", "postgres", "monitoring", "pgpool_check"} {
 		line := "hostssl     all           " + u + "        10.0.0.0/8        scram-sha-256"
 		if !strings.Contains(out, line) {
 			t.Errorf("mTLS: internal user %q must be exempt from clientcert:\n%s", u, out)
@@ -90,6 +91,7 @@ func TestAssemblePgHbaClientCertAuthSkipsEmptyMonitoringUser(t *testing.T) {
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
+		PgpoolCheckUser: "pgpool_check",
 		// MonitoringUser empty -> no monitoring exemption rule emitted.
 	})
 	if strings.Contains(out, "monitoring") {
@@ -123,6 +125,7 @@ func TestAssemblePgHbaClientCertAuthOnlyForcesHostssl(t *testing.T) {
 		RequireSSL:      false, // explicitly off
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 	})
 	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
 		t.Errorf("clientCertAuth alone must emit the clientcert catch-all:\n%s", out)
@@ -136,7 +139,7 @@ func TestAssemblePgHbaClientCertAuthOnlyForcesHostssl(t *testing.T) {
 func TestAssemblePgHbaRequireAndClientCertAuthMatchesClientCertOnly(t *testing.T) {
 	// require=true is subsumed by clientCertAuth=true: the rule set is identical whether
 	// require is also set, so the two flags never produce conflicting/duplicate rules.
-	base := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PostgresUser: "postgres"}
+	base := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PostgresUser: "postgres", PgpoolCheckUser: "pgpool_check"}
 	withReq := base
 	withReq.RequireSSL = true
 	if AssemblePgHba(base) != AssemblePgHba(withReq) {
@@ -151,6 +154,7 @@ func TestAssemblePgHbaEmptyPostgresUserMTLS(t *testing.T) {
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
+		PgpoolCheckUser: "pgpool_check",
 		// PostgresUser + MonitoringUser empty
 	})
 	if !strings.Contains(out, "hostssl     all           repmgr        10.0.0.0/8        scram-sha-256") {
@@ -196,6 +200,7 @@ func TestAssemblePgHbaMD5FallbackMTLSNeverBypassesClientCert(t *testing.T) {
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 		MD5Fallback:     true,
 	})
 	// Internal-user exemptions get an md5 twin (they auth by password over TLS).

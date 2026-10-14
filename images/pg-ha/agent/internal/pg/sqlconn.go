@@ -251,10 +251,7 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 	defer e.unlock()
 	// Close may have swept this entry while we waited for it; dialling now would open a
 	// session Close never sees.
-	c.mu.Lock()
-	closed := c.isClosed
-	c.mu.Unlock()
-	if closed {
+	if c.closing() {
 		return "", errors.New("connection cache is closed")
 	}
 	// A reused socket that fails may only mean the peer restarted since the last tick, so a
@@ -281,13 +278,16 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 		}
 		// Close may have started while the query ran; a redial now would open a session it
 		// never terminates.
-		c.mu.Lock()
-		closed := c.isClosed
-		c.mu.Unlock()
-		if closed {
+		if c.closing() {
 			return "", err
 		}
 	}
+}
+
+func (c *ConnCache) closing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isClosed
 }
 
 // keepOnServerError reports whether err is a server-side ERROR (permission denied, a

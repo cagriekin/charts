@@ -35,13 +35,18 @@ type PgHbaOptions struct {
 	// client cert (clientcert=verify-ca) for app/other users, while the internal
 	// service users below are EXEMPTED (they authenticate by password over TLS and
 	// hold no client cert): the agent prober / repmgr CLI (ReplicationUser), pgpool
-	// health + service-updater (PostgresUser), and the exporter (MonitoringUser).
+	// service-updater (PostgresUser), pgpool's health/streaming checks and its exporter
+	// (PgpoolCheckUser), and the exporter (MonitoringUser).
 	// Loopback and the replication rule are never converted -- replication stays
 	// plaintext on the pod network (#110 non-goal).
 	RequireSSL     bool
 	ClientCertAuth bool
 	PostgresUser   string // superuser, exempt from clientcert
 	MonitoringUser string // monitoring user, exempt from clientcert; "" to skip
+	// PgpoolCheckUser is pgpool's check role, exempt from clientcert: pgpool's backend
+	// connections present no client certificate (pgpool.conf's ssl_cert is its server cert).
+	// Required under ClientCertAuth.
+	PgpoolCheckUser string
 }
 
 // AssemblePgHba returns the agent-authored pg_hba.conf: loopback + the pod CIDR over
@@ -78,6 +83,7 @@ func AssemblePgHba(o PgHbaOptions) string {
 		if o.MonitoringUser != "" {
 			emitRule(&b, fmt.Sprintf("hostssl     all           %s        %s        scram-sha-256", o.MonitoringUser, o.PeerCIDR), o.MD5Fallback)
 		}
+		emitRule(&b, fmt.Sprintf("hostssl     all           %s        %s        scram-sha-256", o.PgpoolCheckUser, o.PeerCIDR), o.MD5Fallback)
 		// The app catch-all requires a client cert; it is NEVER md5-fallback'd -- an md5
 		// line above it would let app users authenticate by password and skip the cert (#199).
 		fmt.Fprintf(&b, "hostssl     all           all        %s        scram-sha-256 clientcert=verify-ca\n", o.PeerCIDR)
