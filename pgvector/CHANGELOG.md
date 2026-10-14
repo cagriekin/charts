@@ -83,6 +83,16 @@
 
 ### Changed
 
+- **Fresh standalone installs load conf.d settings at the first server start.** On a new volume
+  `postgresql.conf` does not exist yet when the `setup-config` init container runs, so
+  `include_dir` used to be appended by the postStart hook after PostgreSQL had started. Settings
+  that only apply at server start -- `max_connections`, `shared_buffers`, `wal_level`,
+  `reserved_connections` and every other postmaster-level key in `postgresql.configuration` or a
+  chart-owned conf.d file -- then stayed at PostgreSQL's defaults until the pod's next restart.
+  A script mounted into `/docker-entrypoint-initdb.d` now adds `include_dir` after `initdb` and
+  before that first start; `setup-config` keeps covering every later start. HA installs are
+  unaffected (the agent wires `include_dir` before starting PostgreSQL).
+
 - **pgpool's liveness and readiness probes ask pgpool over PCP instead of running `SELECT 1`
   through it.** A session through pgpool leaves a cached backend connection in one of its
   children, whatever the role. On a node at `max_connections` that connection came out of a
