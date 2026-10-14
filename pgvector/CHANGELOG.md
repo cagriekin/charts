@@ -152,6 +152,16 @@
   `pg_stat_activity`, one from each agent on every node. `ha.image.tag` and the etcd bootstrap
   image move to `2.2.0-pg18`.
 
+### Fixed
+
+- **A standby that has just followed a new timeline can be promoted right away.** The agent
+  forces a restartpoint so the standby's control file records the timeline it streams; the check
+  ran at most every 15s, so a primary lost within that window after the standby began streaming
+  its timeline left a caught-up standby refusing to promote on the timeline highwater guard, with
+  no walreceiver left to trigger the repair later. The timeline is now read on every reconcile tick
+  and the restartpoint forced on the first tick that sees it lag; only repeated restartpoints are
+  backed off.
+
 ## 2.4.1 - 2026-10-08
 
 ### Changed

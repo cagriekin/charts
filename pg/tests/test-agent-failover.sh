@@ -224,6 +224,18 @@ holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.hold
 
 if [[ "${holder}" == "${POD0}" ]]; then
   echo "  Lease is on ${POD0}; moving it to ${POD1} first..."
+  # Right after the cold boot ${POD1} may still be recording the new timeline in its control
+  # file (the agent forces a restartpoint for it). Taking the Lease before that, it reads the
+  # old timeline once the walreceiver drops and refuses on the highwater guard (#125), so the
+  # handover under test never happens. Wait until its durable timeline matches the primary's.
+  primary_tl=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT ('x' || substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8))::bit(32)::int" "testuser" "testdb" 2>/dev/null || echo "")
+  standby_tl=""
+  for _ in $(seq 1 30); do
+    standby_tl=$(pg_exec "${NAMESPACE}" "${POD1}" "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), (SELECT min_recovery_end_timeline FROM pg_control_recovery()))" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ -n "${primary_tl}" && "${standby_tl}" == "${primary_tl}" ]] && break
+    sleep 2
+  done
+  assert_eq "${POD1} has recorded the primary's timeline before the Lease is moved to it" "${primary_tl}" "${standby_tl}"
   park_uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
   kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   for _ in $(seq 1 30); do

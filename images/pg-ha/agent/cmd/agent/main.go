@@ -302,12 +302,11 @@ type agent struct {
 	tlsCheckedAt       time.Time
 	tlsInactiveLatched bool
 
-	// durableTLNextAt throttles the restartpoint that keeps a standby's control-file timeline
-	// current (#298). Same shape as tlsCheckedAt, but stored as the NEXT due time rather than
-	// the last check, so a restartpoint that did not advance the timeline can back itself off
-	// (durableTLNoAdvanceInterval) without a second field. The condition it repairs changes
-	// only when this node follows a new timeline, and the steady-state check is one SQL round
-	// trip.
+	// durableTLNextAt backs off the restartpoint that keeps a standby's control-file timeline
+	// current (#298) after one that failed or did not advance the timeline
+	// (durableTLNoAdvanceInterval); zero when no backoff is in force. Only the CHECKPOINT is
+	// throttled: the timeline read runs every tick, so the first tick that sees the streamed
+	// timeline ahead repairs it at once.
 	durableTLNextAt time.Time
 
 	// Control API (#276), present only when it is enabled. intents carries node-local
@@ -3384,27 +3383,15 @@ const (
 	slotPrecreateBackoff  = 3 * time.Second
 )
 
-// durableTLInterval throttles the restartpoint check. Generous, because the condition it
-// repairs arises only when this node starts following a new timeline.
-// 15s, not a minute (#298, found by re-running the failover suite). The stamp is taken BEFORE the
-// comparison -- deliberately, so a failing read cannot spin -- which means the FIRST tick after a
-// boot consumes the whole interval, and at that moment the node has usually not started streaming
-// the new timeline yet, so there is nothing to repair. The repair therefore landed one full
-// interval later: observed as a standby that acquired the lease, refused on the highwater guard,
-// and only became promotable 55s afterwards -- long enough that a failover window can close first
-// (it made the disk-loss stage of test-agent-failover skip seven assertions). Four ticks is
-// cheap: the steady-state check is a single SQL round trip.
-const durableTLInterval = 15 * time.Second
-
-// durableTLNoAdvanceInterval backs the check off after a restartpoint that did NOT move the
-// durable timeline (#298 review).
+// durableTLNoAdvanceInterval backs the restartpoint off after one that failed or did NOT move
+// the durable timeline (#298 review).
 //
 // The no-op case is not free. PostgreSQL skips the restartpoint only when no NEWER checkpoint
 // record has been replayed; a standby working through a replay backlog behind a timeline switch
 // (or one held back by recovery_min_apply_delay) keeps replaying checkpoint records on the OLD
 // timeline, so every CHECKPOINT performs a real restartpoint -- a full flush of dirty shared
 // buffers -- while the durable timeline stays put because the switch itself has not been
-// replayed yet. At durableTLInterval that is a forced checkpoint every 15 seconds on a node
+// replayed yet. Without the backoff that is a forced checkpoint on every tick on a node
 // already saturated with replay I/O, for a repair that cannot land until replay catches up.
 // Retrying a minute apart still records the timeline long before checkpoint_timeout (5 minutes on
 // chart defaults) would have, which is the window this whole check exists to close.
@@ -3442,13 +3429,17 @@ const durableTLBudget = 10 * time.Second
 // next restartpoint. Measuring against the checkpoint TLI alone therefore called a node stale
 // that was already promotable, and forced a full restartpoint on it every interval, forever.
 //
-// Best-effort and throttled: a failed checkpoint is not an incident, it just leaves the node in
-// the state it was already in, and the next tick past the interval tries again.
+// The read runs on every tick and only the CHECKPOINT is throttled (#364). A throttle on the
+// read left a window of up to the interval between this node starting to stream a new timeline
+// and the repair; a primary lost inside it left a caught-up standby refusing to promote, with no
+// walreceiver left to show the newer timeline and trigger the repair later (observed as the
+// disk-loss stage of test-agent-failover skipping: the standby took the Lease 9s after it began
+// streaming timeline 3 and refused on the highwater guard). The steady-state read is one SQL round
+// trip per tick.
+//
+// Best-effort: a failed checkpoint is not an incident, it just leaves the node in the state it
+// was already in, and the first tick past the backoff tries again.
 func (a *agent) ensureDurableTimeline(ctx context.Context) {
-	if !a.durableTLNextAt.IsZero() && time.Now().Before(a.durableTLNextAt) {
-		return
-	}
-	a.durableTLNextAt = time.Now().Add(durableTLInterval)
 	dctx, dcancel := context.WithTimeout(ctx, durableTLBudget)
 	defer dcancel()
 	self := a.selfConn()
@@ -3464,6 +3455,9 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	a.metr.Beat()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {
+		return
+	}
+	if !a.durableTLNextAt.IsZero() && time.Now().Before(a.durableTLNextAt) {
 		return
 	}
 	// And again before the CHECKPOINT, which is the one call here that is slow while perfectly
@@ -3512,6 +3506,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 			"durableTimeline", uint32(after), "streamedTimeline", uint32(reported), "retryIn", durableTLNoAdvanceInterval.String())
 		return
 	}
+	a.durableTLNextAt = time.Time{}
 	a.log.Info("forced a restartpoint so the control file records the timeline this standby is streaming (#298)",
 		"was", uint32(durable), "now", uint32(after))
 }

@@ -4251,16 +4251,31 @@ func TestEnsureDurableTimelineForcesARestartpointWhenItLags(t *testing.T) {
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	// Throttled to the normal interval after a repair that landed.
-	if got := time.Until(a.durableTLNextAt); got > durableTLInterval || got < durableTLInterval/2 {
-		t.Errorf("next check due in %s, want ~%s (not the no-advance backoff)", got, durableTLInterval)
+	if !a.durableTLNextAt.IsZero() {
+		t.Errorf("a repair that landed must leave no backoff, got one until %s", a.durableTLNextAt)
+	}
+}
+
+// The read runs every tick, so the first tick that sees the streamed timeline ahead of the
+// durable one repairs it at once (#364). A throttled read left a window in which a primary lost
+// right after this node began streaming its timeline left the node refusing to promote.
+func TestEnsureDurableTimelineRepairsOnTheFirstLaggingTick(t *testing.T) {
+	ex := &durableTLExec{reads: []string{"2|2", "2|3", "3|3"}}
+	a := newDurableTLAgent(t, ex)
+	a.ensureDurableTimeline(context.Background())
+	if ex.checkpoints != 0 {
+		t.Fatalf("nothing to repair yet, got %d restartpoint(s)", ex.checkpoints)
+	}
+	a.ensureDurableTimeline(context.Background())
+	if ex.checkpoints != 1 {
+		t.Errorf("the next tick streams timeline 3: want one restartpoint at once, got %d", ex.checkpoints)
 	}
 }
 
 // A restartpoint PostgreSQL skipped (no newer checkpoint record replayed yet) must back the check
 // off (#298 review). Without it a standby working through a replay backlog behind a timeline
 // switch -- or one held back by recovery_min_apply_delay -- takes a forced flush of dirty shared
-// buffers every durableTLInterval, indefinitely, for a repair that cannot land until replay
+// buffers every tick, indefinitely, for a repair that cannot land until replay
 // catches up.
 func TestEnsureDurableTimelineBacksOffWhenTheRestartpointDidNotAdvanceIt(t *testing.T) {
 	ex := &durableTLExec{reads: []string{"2|3"}} // the re-read still says 2
@@ -4269,10 +4284,10 @@ func TestEnsureDurableTimelineBacksOffWhenTheRestartpointDidNotAdvanceIt(t *test
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
-	// And the throttle is honoured: a second call in the same window does nothing at all.
+	// And the backoff is honoured: a second call in the same window reads but forces nothing.
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
 		t.Errorf("the backoff did not hold: %d restartpoints", ex.checkpoints)
@@ -4313,8 +4328,8 @@ func TestEnsureDurableTimelineBacksOffWhenTheRestartpointFails(t *testing.T) {
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint attempt, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
@@ -4332,8 +4347,8 @@ func TestEnsureDurableTimelineBacksOffWhenTheConfirmationReadFails(t *testing.T)
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
 }
 
