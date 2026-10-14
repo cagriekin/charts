@@ -4468,19 +4468,30 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 	}
 }
 
-// Only a successful probe ends a peer's episode. A timeout between refusals is not saturation
-// (no wait on that tick) but must not restart the grace either, or a peer alternating between
-// refusals and timeouts would keep a lease-holding standby waiting forever.
+// Only a successful probe ends a peer's episode, and while it is active every failed probe --
+// a timeout as much as a refusal -- keeps the standby waiting until the grace runs out. A full
+// peer alternating between refusals and timeouts may still be ahead on its timeout ticks;
+// letting those through would promote past it (invariant 8). The timeouts must not restart
+// the grace either.
 func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
 	grace := a.bootstrapGrace()
-	a.trackPeerSaturation("pg-1", true, false, t0)
-	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace/2)) {
-		t.Error("a timeout tick is not saturated and must not wait")
+	if a.trackPeerSaturation("pg-1", false, false, t0) {
+		t.Error("an unreachable peer outside an episode is not saturated")
 	}
-	if a.trackPeerSaturation("pg-1", true, false, t0.Add(grace)) {
-		t.Error("the timeout must not have restarted the grace: it ends bootstrapGrace after the FIRST refusal")
+	a.trackPeerSaturation("pg-1", true, false, t0)
+	if !a.trackPeerSaturation("pg-1", false, false, t0.Add(grace/2)) {
+		t.Error("a timeout tick inside an active episode must keep the standby waiting")
+	}
+	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace)) {
+		t.Error("the grace runs from the FIRST refusal; the timeouts must not have restarted it")
+	}
+	if a.trackPeerSaturation("pg-1", false, true, t0.Add(grace+time.Second)) {
+		t.Error("a successful probe ends the episode")
+	}
+	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace+2*time.Second)) {
+		t.Error("after the episode ended, a timeout is the ordinary unreachable case")
 	}
 }
 

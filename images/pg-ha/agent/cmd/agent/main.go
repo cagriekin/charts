@@ -168,8 +168,8 @@ type agent struct {
 	// too_many_connections in its current episode; cleared when it answers or fails
 	// differently. Bounds PeerState.SaturatedWait. Reconcile goroutine only.
 	peerSaturatedSince map[string]time.Time
-	// localSaturated latches the local saturation state so the log records transitions,
-	// not every tick.
+	// localSaturated is this tick's local saturation result; localSaturationAlive counts
+	// only a tick that is saturated now, so a timeout between refusals does not.
 	localSaturated bool
 	// localSaturatedSince is when the current local saturation episode began; zero when
 	// the local node is not saturated. Bounds how long saturation counts as alive.
@@ -1365,26 +1365,31 @@ func (a *agent) localSaturationAlive(now time.Time) bool {
 	return false
 }
 
-// trackPeerSaturation records a peer's saturation episode and reports whether it is
-// saturated now and still inside the grace during which a lease-holding standby waits
-// rather than promote past it (reconcile.PeerState.SaturatedWait). The grace is
-// bootstrapGrace, 2x LeaseDuration: long enough to ride out a connection spike, bounded
-// because the saturated node's own agent is just as blind to it and cannot take over.
-// As for the local node, only a successful probe (reachable) ends the episode: a timeout
-// between refusals must neither restart the grace nor, on its own tick, count as saturated.
+// trackPeerSaturation records a peer's saturation episode and reports whether a
+// lease-holding standby must still wait rather than promote past it
+// (reconcile.PeerState.SaturatedWait). A too_many_connections refusal starts an episode;
+// only a successful probe (reachable) ends it. While an episode is active, ANY failed probe
+// keeps the wait in force until the grace runs out: a full peer alternating between refusals
+// and timeouts is just as alive, and just as possibly ahead, on its timeout ticks -- letting
+// those ticks through would promote past it and discard its WAL (invariant 8). This is the
+// opposite of the local rule (localSaturationAlive), where uncertainty leans toward the
+// self-health step-down; for a peer it leans toward not promoting. The grace is
+// bootstrapGrace, 2x LeaseDuration from the first refusal: long enough to ride out a
+// connection spike, bounded because the saturated node's own agent is just as blind to it and
+// cannot take over.
 func (a *agent) trackPeerSaturation(name string, saturated, reachable bool, now time.Time) bool {
-	since, was := a.peerSaturatedSince[name]
+	since, active := a.peerSaturatedSince[name]
 	if reachable {
-		if was {
+		if active {
 			a.log.Info("peer accepts the agent's connections again", "peer", name)
 			delete(a.peerSaturatedSince, name)
 		}
 		return false
 	}
-	if !saturated {
-		return false
-	}
-	if !was {
+	if !active {
+		if !saturated {
+			return false // an unreachable peer outside an episode is the ordinary unreachable case
+		}
 		a.log.Warn("peer is refusing the agent's connections: max_connections exhausted; treating it as alive with an unknown position", "peer", name)
 		since = now
 		a.peerSaturatedSince[name] = since

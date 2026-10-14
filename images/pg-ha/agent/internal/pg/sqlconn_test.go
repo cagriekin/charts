@@ -572,3 +572,18 @@ func TestConnCacheDoesNotRetryAWriteOnAStaleConnection(t *testing.T) {
 		t.Errorf("want the next call to dial: dials=%d", len(*dsns))
 	}
 }
+
+// The password is required: an empty one is refused before any dial, instead of falling back
+// to .pgpass or the libpq environment and surfacing as an auth failure that reads like an
+// unreachable node.
+func TestConnCacheRequiresAPassword(t *testing.T) {
+	c, dsns := cacheWith(&fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}})
+	noPassword := ci
+	noPassword.Password = ""
+	if _, err := c.QueryText(probeCtx(t), noPassword, QueryRead, "q"); err == nil || !strings.Contains(err.Error(), "no password") {
+		t.Fatalf("want a refusal for an empty password, got %v", err)
+	}
+	if len(*dsns) != 0 {
+		t.Errorf("an empty password must be refused before dialling, got %d dials", len(*dsns))
+	}
+}

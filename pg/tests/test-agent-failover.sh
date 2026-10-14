@@ -248,7 +248,16 @@ fi
 if [[ "${holder}" == "${POD1}" ]]; then
   # Something only the surviving primary knows, so a divergent initdb cannot fake it.
   DV="disk-loss-$(date +%s)"
-  pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}')" "testuser" "testdb" 2>/dev/null || true
+  # Holding the Lease is not yet being the primary: when the lease was just parked on ${POD1},
+  # it promotes a tick or two later, and a write before that is rejected read-only -- the
+  # marker row then never exists and the clone assertion below fails for the wrong reason.
+  # Wait for ${POD1} to leave recovery, and require the write to land.
+  for _ in $(seq 1 60); do
+    [[ "$(pg_exec "${NAMESPACE}" "${POD1}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")" == "f" ]] && break
+    sleep 2
+  done
+  dv_written=$(pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}') RETURNING value" "testuser" "testdb" 2>/dev/null | head -1 || echo "")
+  assert_eq "the marker row lands on ${POD1} (the primary) before ${POD0}'s disk is lost" "${DV}" "${dv_written}"
 
   echo "  Emptying ${POD0}'s data directory (simulated disk loss)..."
   # `|| echo ""` like every other capture in this file: the preceding readiness wait is

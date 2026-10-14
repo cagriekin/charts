@@ -88,9 +88,12 @@ type PeerState struct {
 	// Saturated: the peer refused the probe with too_many_connections -- alive, but its
 	// live role and position are unreadable (it is not Reachable).
 	Saturated bool
-	// SaturatedWait is Saturated within the grace the observer allows (2x LeaseDuration
-	// from the first saturated probe). While set, a lease-holding standby does not
-	// promote past this peer unless its fresh gossip shows it is not ahead.
+	// SaturatedWait: the peer is in a saturation episode -- started by a
+	// too_many_connections refusal, not yet ended by a successful probe -- and within the
+	// grace the observer allows (2x LeaseDuration from the first refusal). It stays set on
+	// a tick whose probe timed out: the peer may still be alive and ahead. While set, a
+	// lease-holding standby does not promote past this peer unless its fresh gossip shows
+	// it is not ahead.
 	SaturatedWait bool
 	// RestoredAt is this peer's last successful restore, gossiped (#288). A peer that was
 	// restored more recently than this node carries the cluster's intended history even though

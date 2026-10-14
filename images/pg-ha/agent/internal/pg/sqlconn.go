@@ -106,15 +106,16 @@ func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
 // upstream the agent no longer probes -- are closed and forgotten on the next query.
 //
 // Connections are dialled from the same libpq environment psql used -- PGSSLMODE,
-// PGSSLROOTCERT, PGPASSFILE (the agent's own .pgpass) and friends are honoured by
-// pgconn's config parser -- with host, port, user, database and connect_timeout set
-// explicitly and the password from ConnInfo when it carries one. The password is set on
+// PGSSLROOTCERT and friends are honoured by pgconn's config parser -- with host, port,
+// user, database and connect_timeout set explicitly and the password from ConnInfo,
+// which is required (no .pgpass fallback: every caller passes the replication password
+// config.Load requires, so an empty one is a bug, refused up front). The password is set on
 // the parsed config, never written into the connection string, so a parse error (which
 // pgx quotes with only partial password redaction) cannot leak it. Sessions identify as
 // application_name=pg-ha-agent in pg_stat_activity.
 type ConnCache struct {
-	// dial opens a connection for dsn, authenticating with password when it is not
-	// empty (the libpq environment and .pgpass otherwise).
+	// dial opens a connection for dsn, authenticating with password (required; QueryText
+	// refuses an empty one).
 	dial    func(ctx context.Context, dsn, password string) (sqlConn, error)
 	idleTTL time.Duration
 	now     func() time.Time
@@ -185,9 +186,7 @@ func NewConnCache() *ConnCache {
 			// A custom DialFunc, not a tcp_user_timeout keyword: pgconn does not know that
 			// keyword and would send it to the server as a run-time parameter.
 			cfg.DialFunc = dialer.DialContext
-			if password != "" {
-				cfg.Password = password
-			}
+			cfg.Password = password
 			c, err := pgconn.ConnectConfig(ctx, cfg)
 			if err != nil {
 				return nil, err
@@ -204,6 +203,12 @@ func NewConnCache() *ConnCache {
 func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error) {
 	if c.dial == nil || c.now == nil || c.idleTTL <= 0 {
 		return "", errors.New("connection cache is not initialised (use NewConnCache)")
+	}
+	// Every caller passes the replication password, which config.Load requires. An empty
+	// one must fail here rather than fall back to .pgpass or the libpq environment, where it
+	// would surface as an authentication failure that reads like an unreachable node.
+	if ci.Password == "" {
+		return "", fmt.Errorf("connection cache: no password for %s@%s", ci.User, ci.Host)
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
