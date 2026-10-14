@@ -364,3 +364,39 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
           pattern: 'pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q && psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -tAc "SELECT 1"[\s\S]*did not come up on 127\.0\.0\.1[\s\S]*if ! psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1'
+
+  # Standalone first boot: include_dir goes in through docker-entrypoint-initdb.d, before the
+  # first real start, so postmaster-level conf.d settings (reserved_connections) are live from
+  # the start; the postStart hook no longer appends it after the server is up.
+  - it: standalone mounts the include-confd script into docker-entrypoint-initdb.d
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: postgresql-config
+            mountPath: /docker-entrypoint-initdb.d/00-include-confd.sh
+            subPath: include-confd.sh
+            readOnly: true
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'echo "include_dir'
+
+  - it: the standalone ConfigMap carries the include-confd script
+    template: templates/postgresql-configmap.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: data["include-confd.sh"]
+          pattern: 'grep -q "\^include_dir = ''/etc/postgresql/conf\.d''" "\$PGDATA/postgresql\.conf"[\s\S]*echo "include_dir = ''/etc/postgresql/conf\.d''" >> "\$PGDATA/postgresql\.conf"'
+
+  - it: HA neither carries nor mounts the include-confd script (the agent wires include_dir)
+    template: templates/postgresql-configmap.yaml
+    asserts:
+      - notExists:
+          path: data["include-confd.sh"]

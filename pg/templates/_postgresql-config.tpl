@@ -15,6 +15,18 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 data:
+{{- if not .Values.ha.enabled }}
+  # Standalone first boot (mounted at /docker-entrypoint-initdb.d by statefulset.yaml): the
+  # official image sources this after initdb and BEFORE the first real server start, so conf.d
+  # -- reserved-connections.conf among it -- is loaded by that start. Postmaster-level settings
+  # such as reserved_connections cannot be applied by a later reload, and on a fresh volume the
+  # setup-config init container has no postgresql.conf to edit yet. Every later start is
+  # setup-config's. include_dir only reads *.conf, so this file is inert in conf.d itself.
+  include-confd.sh: |
+    if ! grep -q "^include_dir = '/etc/postgresql/conf.d'" "$PGDATA/postgresql.conf"; then
+      echo "include_dir = '/etc/postgresql/conf.d'" >> "$PGDATA/postgresql.conf"
+    fi
+{{- end }}
 {{- /* When the chart owns shared_preload_libraries (pgaudit must be preserved -- the
        repmgr prepend went with the mechanism in #294, and #293's
        pg.validateNativePreloadRepmgr now REFUSES any render that asks for it), the merged

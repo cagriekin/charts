@@ -7,6 +7,9 @@ postgresql:
   replicaCount: 0
 
   configuration:
+    # Postmaster-level and different from PostgreSQL's 100: proves conf.d is loaded by the
+    # FIRST start of a fresh standalone install, which a reload could not do.
+    max_connections: "120"
     work_mem: "64MB"
     maintenance_work_mem: "128MB"
     log_statement: "all"

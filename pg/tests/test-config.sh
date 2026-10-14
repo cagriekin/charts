@@ -38,6 +38,13 @@ probe_lab_350 "${NAMESPACE}" "${POD}"
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem is 64MB" "64MB" "${work_mem}"
 
+# conf.d must be loaded by the FIRST server start of a fresh install, not by a later reload:
+# postmaster-level settings (max_connections here; reserved_connections, which pgpool's check
+# role depends on) only apply at start. A conf.d added after the start shows the new value as
+# pending_restart with the old one still live.
+max_conn=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT setting || ':' || pending_restart FROM pg_settings WHERE name = 'max_connections'" "testuser" "testdb")
+assert_eq "postmaster-level conf.d setting is live at first start (max_connections=120, no pending restart)" "120:false" "${max_conn}"
+
 maint_work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW maintenance_work_mem" "testuser" "testdb")
 assert_eq "maintenance_work_mem is 128MB" "128MB" "${maint_work_mem}"
 

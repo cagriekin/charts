@@ -1079,10 +1079,10 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        CONF="$PGDATA/postgresql.conf"
-                        if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
-                          echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
-                        fi
+                        {{- /* include_dir is not appended here any more: a reload cannot apply
+                               postmaster-level conf.d settings (reserved_connections), so it has
+                               to be in place before the server starts -- the initdb.d script on
+                               a fresh volume, setup-config on every later start. */}}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         {{- /* Insert the operator's rules as ONE ordered block, anchored on the
@@ -1526,6 +1526,12 @@ spec:
             - name: postgresql-config
               mountPath: /etc/postgresql/conf.d
               readOnly: true
+{{- if not .Values.ha.enabled }}
+            - name: postgresql-config
+              mountPath: /docker-entrypoint-initdb.d/00-include-confd.sh
+              subPath: include-confd.sh
+              readOnly: true
+{{- end }}
 {{- if .Values.postgresql.tls.enabled }}
             - name: postgresql-tls
               mountPath: /etc/postgresql/tls
