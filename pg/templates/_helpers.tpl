@@ -1199,7 +1199,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Only when declared: postgresql.majorVersion is otherwise required just for extension
        paths, and an empty value has always rendered. A pre-16 server still refuses
        reserved_connections at startup, by name. */ -}}
-{{- if and (toString .Values.postgresql.majorVersion) (lt (atoi (toString .Values.postgresql.majorVersion)) 16) -}}
+{{- if and .Values.postgresql.majorVersion (lt (atoi (toString .Values.postgresql.majorVersion)) 16) -}}
 {{- fail (printf "postgresql.majorVersion=%q: the chart sets reserved_connections and grants pg_use_reserved_connections to pgpool's check role, both introduced in PostgreSQL 16. Use PostgreSQL 16 or newer." (toString .Values.postgresql.majorVersion)) -}}
 {{- end -}}
 {{- $su := atoi (include "pg.superuserReservedConnections" .) -}}
