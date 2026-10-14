@@ -99,6 +99,9 @@
 
 ### Changed
 
+- **pg-ha image 2.2.0 builds the agent with Go 1.26.9 and golang.org/x/net v0.60.0**, fixing
+  the standard-library and x/net vulnerabilities GO-2026-6599 through GO-2026-6617 (net/http,
+  net/textproto, crypto/tls, html/template) that Go 1.25 has no release for.
 - **Fresh standalone installs load conf.d settings at the first server start.** On a new volume
   `postgresql.conf` does not exist yet when the `setup-config` init container runs, so
   `include_dir` used to be appended by the postStart hook after PostgreSQL had started. Settings
