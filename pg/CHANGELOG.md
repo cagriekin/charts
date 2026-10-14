@@ -25,7 +25,12 @@
   resolved. Rename the chart value, or hand the role over with
   `COMMENT ON ROLE <name> IS 'managed by the pg chart'` (it is then converted). A name that
   collides with `postgresql.username`, `ha.username`, the monitoring user or a
-  `postgresql.roles[]` entry is refused at render time.
+  `postgresql.roles[]` entry is refused at render time. In HA the agent provisions them once the
+  node is observed as a primary (not on the promotion tick itself, while it may still be in
+  recovery). Provisioning turns `pg_stat_statements` tracking off for its own session before any
+  password or verifier is sent, so neither is recorded even with `track = all`. A marked role
+  moved from one kind to the other loses the other kind's privileges (`pg_monitor` and the
+  reserved slots, or `CREATE` on `public` in the `postgres` database).
 - **`app_user` becomes the owner of `postgresql.database`, unless that is `postgres` (the
   default).** The maintenance database keeps its owner: whoever owns it could drop it or set
   per-database settings that every superuser session there inherits. On `postgres`, `app_user`
@@ -45,6 +50,10 @@
   plus 3, plus `pgpool.reservedConnections` (7) with pgpool: 13 on a 3-node cluster with pgpool,
   so non-superuser logins get 87 of the default 100 `max_connections` instead of 97. Raise
   `max_connections` if a cluster already runs near the limit.
+- **HA: a fresh native initialisation refuses a missing or empty `/etc/postgresql/conf.d`.** The
+  chart mounts it on every install now (it carries `reserved-connections.conf`), so this only
+  affects a hand-edited StatefulSet or a broken ConfigMap mount; before, the agent initialised the
+  cluster without the include and the connection reserves were silently absent on every node.
 - **The pods roll once** (new configuration, environment and image), and so does pgpool. Each new
   pgpool pod waits in its `wait-check-role` init container until the agent on the primary (or the
   standalone postStart hook) has created `pgpool_check`. The old pgpool pods keep serving until
@@ -76,9 +85,13 @@
   before, a primary whose connections ran out for `LeaseDuration` was SIGQUIT'd and failed over as
   if wedged. The grace is bounded because a primary whose slots are all held by sessions stuck on
   hung storage refuses connections the same way; past it, the node counts as not running again
-  and the ordinary self-health step-down applies. A lease-holding standby waits up to
-  `2 x LeaseDuration` before promoting past a full peer whose position it cannot read, unless that
-  peer's fresh gossip shows it is not ahead. New gauges: `pg_ha_agent_local_saturated`,
+  and the ordinary self-health step-down applies. The grace runs from the FIRST refusal of an
+  episode, and only a successful probe ends the episode: timeouts between refusals neither count as
+  alive nor restart the clock, so a node alternating between refusals and timeouts cannot renew it
+  forever. A lease-holding standby waits up to `2 x LeaseDuration` before promoting past a full
+  peer whose position it cannot read, unless that peer's fresh gossip shows it is not ahead (only
+  when both positions are known). A full node gossips neither its last-checkpoint LSN nor its
+  checkpoint timeline, which can lag a promotion. New gauges: `pg_ha_agent_local_saturated`,
   `pg_ha_agent_peers_saturated`.
 
 ### Changed
@@ -92,6 +105,14 @@
   A script mounted into `/docker-entrypoint-initdb.d` now adds `include_dir` after `initdb` and
   before that first start; `setup-config` keeps covering every later start. HA installs are
   unaffected (the agent wires `include_dir` before starting PostgreSQL).
+
+- **The standalone postStart hook runs against the real server only.** On first boot the official
+  image starts a temporary server, socket-only, before it creates `postgresql.database`, and the
+  hook's socket `pg_isready` gate answered for it. The `postgresql.pgHba` step's `SHOW hba_file`
+  then failed (database not there yet) and the rules were silently skipped -- a fresh install could
+  come up without its declared pg_hba entries. The whole hook (pgHba, reload, managed roles) now
+  waits for loopback TCP and `postgresql.database` accepting a session, up to 300s, and fails
+  loudly if the server never gets there.
 
 - **pgpool's liveness and readiness probes ask pgpool over PCP instead of running `SELECT 1`
   through it.** A session through pgpool leaves a cached backend connection in one of its
