@@ -1843,6 +1843,17 @@ func TestBootstrapInitdbNativePropagatesFailure(t *testing.T) {
 	}
 }
 
+// confdFixture is a conf.d directory as the chart mounts it: never empty, it always carries
+// reserved-connections.conf.
+func confdFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "reserved-connections.conf"), []byte("superuser_reserved_connections = 5\nreserved_connections = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func newBootstrapTestAgent(t *testing.T, ex *initdbExec, mech string) *agent {
 	t.Helper()
 	return newBootstrapTestAgentWithPM(t, ex, mech, &fakePostmaster{})
@@ -1863,10 +1874,11 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
 			Namespace: "ns", MarkerName: "pg-primary",
 		},
-		base: "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
-		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:  &fakeDCS{leader: true},
-		mech: m,
+		base:     "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
+		confdDir: confdFixture(t),
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:      &fakeDCS{leader: true},
+		mech:     m,
 		// A real k8s client over a fake apiserver, so the highwater marker write this path makes
 		// is observable rather than swallowed by a nil kube.
 		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
@@ -2635,6 +2647,7 @@ func newPreloadTestAgent(t *testing.T, mech, pgdata, modulePath string) *agent {
 		cfg:              &config.Config{PGDATA: pgdata, Mechanism: mech},
 		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
 		repmgrModulePath: modulePath,
+		confdDir:         t.TempDir(), // no fragments: nothing in conf.d asks for a library
 	}
 }
 
@@ -4438,20 +4451,36 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
 	grace := a.bootstrapGrace()
-	if !a.trackPeerSaturation("pg-1", true, t0) {
+	if !a.trackPeerSaturation("pg-1", true, false, t0) {
 		t.Fatal("the first saturated probe must start the grace")
 	}
-	if !a.trackPeerSaturation("pg-1", true, t0.Add(grace-time.Second)) {
+	if !a.trackPeerSaturation("pg-1", true, false, t0.Add(grace-time.Second)) {
 		t.Error("still inside the grace")
 	}
-	if a.trackPeerSaturation("pg-1", true, t0.Add(grace)) {
+	if a.trackPeerSaturation("pg-1", true, false, t0.Add(grace)) {
 		t.Error("the grace must end after bootstrapGrace")
 	}
-	if a.trackPeerSaturation("pg-1", false, t0.Add(grace+time.Second)) {
+	if a.trackPeerSaturation("pg-1", false, true, t0.Add(grace+time.Second)) {
 		t.Error("an answering peer is never in the wait")
 	}
-	if !a.trackPeerSaturation("pg-1", true, t0.Add(2*grace)) {
+	if !a.trackPeerSaturation("pg-1", true, false, t0.Add(2*grace)) {
 		t.Error("a new saturation episode must start a fresh grace")
+	}
+}
+
+// Only a successful probe ends a peer's episode. A timeout between refusals is not saturation
+// (no wait on that tick) but must not restart the grace either, or a peer alternating between
+// refusals and timeouts would keep a lease-holding standby waiting forever.
+func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.bootstrapGrace()
+	a.trackPeerSaturation("pg-1", true, false, t0)
+	if a.trackPeerSaturation("pg-1", false, false, t0.Add(grace/2)) {
+		t.Error("a timeout tick is not saturated and must not wait")
+	}
+	if a.trackPeerSaturation("pg-1", true, false, t0.Add(grace)) {
+		t.Error("the timeout must not have restarted the grace: it ends bootstrapGrace after the FIRST refusal")
 	}
 }
 
@@ -4485,9 +4514,10 @@ func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
 			AppUser: "app_user", AppPassword: "pw",
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		metr:     observe.New(),
-		roleExec: ex,
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        ex,
+		managedRoleDone: map[pg.RoleKind]bool{},
 	}
 	for i := 0; i < 3; i++ {
 		a.ensureManagedRolesOnce(context.Background())
@@ -4512,13 +4542,14 @@ func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
 			AppUser: "app_user", AppPassword: "pässwörd ",
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		metr:     observe.New(),
-		roleExec: perm,
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        perm,
+		managedRoleDone: map[pg.RoleKind]bool{},
 	}
 	b.ensureManagedRolesOnce(context.Background())
 	b.ensureManagedRolesOnce(context.Background())
-	if !b.managedRoleDone[0].Load() {
+	if !b.managedRoleDone[pg.RoleApp] {
 		t.Error("a permanent failure must latch the role")
 	}
 	if perm.runs["app_user"] != 0 {
@@ -4544,9 +4575,10 @@ func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
 			AppUser: "app_user", AppPassword: "pw",
 			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
 		},
-		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		metr:     observe.New(),
-		roleExec: ex,
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        ex,
+		managedRoleDone: map[pg.RoleKind]bool{},
 	}
 	for i := 0; i < 3; i++ {
 		a.ensureManagedRolesOnce(context.Background())
@@ -4554,7 +4586,7 @@ func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
 	if ex.runs != 2 {
 		t.Errorf("want one attempt per role, then latched; got %d runs", ex.runs)
 	}
-	if !a.managedRoleDone[0].Load() || !a.managedRoleDone[1].Load() {
+	if !a.managedRoleDone[pg.RoleApp] || !a.managedRoleDone[pg.RolePgpoolCheck] {
 		t.Error("a foreign role must latch its slot")
 	}
 }
@@ -4585,19 +4617,73 @@ func TestObserveSaturationPastTheGraceIsNotAlive(t *testing.T) {
 func TestLocalSaturationGraceIsPerEpisode(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
-	a.trackLocalSaturation(true, t0)
+	a.trackLocalSaturation(true, false, t0)
 	if !a.localSaturationAlive(t0.Add(30 * time.Second)) {
 		t.Error("inside the grace a saturated node counts as alive")
 	}
 	if a.localSaturationAlive(t0.Add(2 * time.Minute)) {
 		t.Error("past the grace it must not")
 	}
-	a.trackLocalSaturation(false, t0.Add(3*time.Minute))
-	a.trackLocalSaturation(true, t0.Add(4*time.Minute))
+	a.trackLocalSaturation(false, true, t0.Add(3*time.Minute))
+	a.trackLocalSaturation(true, false, t0.Add(4*time.Minute))
 	if !a.localSaturationAlive(t0.Add(4*time.Minute + 30*time.Second)) {
 		t.Error("a new episode must start a fresh grace")
 	}
 	if a.localSaturationExpired {
 		t.Error("the expiry latch must reset when the node answers again")
+	}
+}
+
+// A primary on hung storage alternates between too_many_connections and timeouts. Only a
+// successful probe ends the episode, so the timeouts cannot renew SaturationGrace and keep
+// a node that should step down holding the Lease.
+func TestLocalSaturationGraceSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, false, t0)
+	a.trackLocalSaturation(false, false, t0.Add(g/4)) // timeout: neither saturated nor reachable
+	if a.localSaturationAlive(t0.Add(g / 4)) {
+		t.Error("a timeout tick is not proof of life")
+	}
+	a.trackLocalSaturation(true, false, t0.Add(g*3/4))
+	if !a.localSaturationAlive(t0.Add(g * 3 / 4)) {
+		t.Error("still inside the original grace")
+	}
+	a.trackLocalSaturation(true, false, t0.Add(g))
+	if a.localSaturationAlive(t0.Add(g)) {
+		t.Error("the grace runs from the FIRST refusal; the timeout in between must not have restarted it")
+	}
+}
+
+// Since 2.5.0 the chart always mounts conf.d (it carries reserved-connections.conf), so a
+// fresh native initdb refuses a missing or empty directory instead of initialising a cluster
+// with no connection reserves.
+func TestEnsureConfdIncludeRefusesAMissingOrEmptyMount(t *testing.T) {
+	for name, dir := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "absent"),
+		"empty":   t.TempDir(),
+	} {
+		a := &agent{cfg: &config.Config{PGDATA: t.TempDir()}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), confdDir: dir}
+		if err := a.ensureConfdInclude(); err == nil || !strings.Contains(err.Error(), "reserved-connections.conf") {
+			t.Errorf("%s conf.d: want a refusal naming reserved-connections.conf, got %v", name, err)
+		}
+	}
+	a := &agent{cfg: &config.Config{PGDATA: t.TempDir()}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := a.ensureConfdInclude(); err == nil {
+		t.Error("an unset conf.d directory must be refused")
+	}
+	pgdata := t.TempDir()
+	writePGDATAConf(t, pgdata, "max_connections = 100\n")
+	ok := &agent{cfg: &config.Config{PGDATA: pgdata}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), confdDir: confdFixture(t)}
+	if err := ok.ensureConfdInclude(); err != nil {
+		t.Fatalf("a populated conf.d must be wired in: %v", err)
+	}
+	conf, err := os.ReadFile(filepath.Join(pgdata, "postgresql.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(conf), "include_dir = '"+ok.confdDir+"'") {
+		t.Errorf("include_dir not written: %s", conf)
 	}
 }

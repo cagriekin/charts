@@ -323,11 +323,15 @@ type agent struct {
 	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
 	// flips true on success, so a transient failure retries the next primary tick.
 	rehashedManagedUsers atomic.Bool
-	// managedRoleDone latches, per managed role (app, pgpool check), once
+	// managedRoleDone latches, per managed role kind (app, pgpool check), once
 	// ensureManagedRolesOnce has provisioned it or hit a permanent error in this process.
-	managedRoleDone [2]atomic.Bool
+	// Keyed by kind, not by position in the role list, so adding or reordering roles cannot
+	// move a latch. Reconcile goroutine only.
+	managedRoleDone map[pg.RoleKind]bool
 	// roleExec runs the managed-role provisioning psql (pg.OSExec in production).
 	roleExec pg.StdinExec
+	// confdDir is the postgresql conf.d mount (chartConfdDir in production).
+	confdDir string
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -402,12 +406,14 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		// both), tolerating a transient stall before declaring the primary wedged.
 		health:             &selfHealthTracker{grace: cfg.LeaseDuration},
 		pgBindir:           pgBindir,
+		confdDir:           chartConfdDir,
 		pgControlDataBin:   pgBindir + "/pg_controldata",
 		repmgrModulePath:   filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
 		base:               podname.Base(cfg.PodName),
 		bootAt:             time.Now(),
 		peersSeen:          map[string]bool{},
 		peerSaturatedSince: map[string]time.Time{},
+		managedRoleDone:    map[pg.RoleKind]bool{},
 		// One slot: a second concurrent node-local operation waits on the channel rather
 		// than queueing up behind an unbounded backlog of restarts.
 		intents: make(chan intentRequest, 1),
@@ -873,7 +879,12 @@ func (a *agent) tick(ctx context.Context) {
 	// it is a primary-only convergence step.
 	if err == nil && (dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary) {
 		a.rehashManagedUsersOnce(ctx)
-		a.ensureManagedRolesOnce(ctx)
+		// StayPrimary only: on the Promote tick pg_promote has been requested but the node may
+		// still be in recovery, so ALTER ROLE fails read-only and every failover logged a
+		// provisioning failure. The next tick observes the primary and provisions.
+		if dec.Action == reconcile.StayPrimary {
+			a.ensureManagedRolesOnce(ctx)
+		}
 		// Same reason, same place (#288 review, second pass). topologyTick is PURELY
 		// observational -- gauges only -- and it makes an apiserver pod LIST plus a psql query,
 		// both hangable. Inside act() it held opMu for its own fenceBudget() ON TOP of the
@@ -1016,7 +1027,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// so a standby cloned from a restored primary correctly reports none of its own.
 		RestoredAt: a.localRestoredAt(),
 	}
-	a.trackLocalSaturation(ls.Saturated, time.Now())
+	a.trackLocalSaturation(ls.Saturated, ls.Running, time.Now())
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
 	// to a stopped node (without this a fenced primary-state node has no timeline,
@@ -1025,13 +1036,16 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		if cd, err := a.readControlData(ctx); err != nil {
 			a.log.Warn("read pg_controldata", "err", err)
 		} else {
-			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 			ls.InRecovery = cd.InRecovery
-			// The checkpoint LSN stands in for a STOPPED node's position. A saturated node is
-			// running and its real position is past the last checkpoint, so gossiping that
-			// stale value would let a promoting holder read it as "not ahead" and promote past
-			// a standby that holds more WAL (saturatedPeerBlockingPromote). Leave it unknown.
+			// The checkpoint timeline and LSN stand in for a STOPPED node's position. A
+			// saturated node is running and its real position is past the last checkpoint --
+			// the timeline too, which pg_control_checkpoint reports only after the first
+			// checkpoint following a promotion -- so gossiping either would let a promoting
+			// holder rank it on stale data and promote past a node that is ahead (timelines
+			// compare first). Leave both unknown. InRecovery is still taken: self-health keys
+			// on it.
 			if !ls.Saturated {
+				ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 				ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK
 			}
 		}
@@ -1133,7 +1147,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 		name, ps := pr.ps.Name, pr.ps
 		probed[name] = true
-		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, now)
+		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, ps.Reachable, now)
 		if ps.Saturated {
 			saturatedPeers++
 		}
@@ -1311,15 +1325,19 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	return o
 }
 
-// trackLocalSaturation publishes the local saturation gauge, records when the episode
-// began, and logs transitions.
-func (a *agent) trackLocalSaturation(saturated bool, now time.Time) {
+// trackLocalSaturation publishes the local saturation gauge and tracks the saturation
+// EPISODE. The episode starts at the first too_many_connections refusal and ends only on
+// positive evidence -- a probe that succeeds (reachable). Any other failure (a timeout, a
+// refused connection) does not end it: a primary on hung storage alternates between
+// refusals and timeouts, and restarting the clock on every timeout would renew
+// SaturationGrace forever and keep the Lease on a node that should step down.
+func (a *agent) trackLocalSaturation(saturated, reachable bool, now time.Time) {
 	a.metr.SetLocalSaturated(saturated)
-	switch {
-	case saturated && !a.localSaturated:
+	if saturated && a.localSaturatedSince.IsZero() {
 		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) for up to the saturation grace, but unobservable until a slot frees", "grace", a.cfg.SaturationGrace)
 		a.localSaturatedSince = now
-	case !saturated && a.localSaturated:
+	}
+	if reachable && !a.localSaturatedSince.IsZero() {
 		a.log.Info("local postgres accepts the agent's connections again")
 		a.localSaturatedSince = time.Time{}
 		a.localSaturationExpired = false
@@ -1347,18 +1365,23 @@ func (a *agent) localSaturationAlive(now time.Time) bool {
 	return false
 }
 
-// trackPeerSaturation records a peer's saturation episode and reports whether it is still
-// inside the grace during which a lease-holding standby waits rather than promote past it
-// (reconcile.PeerState.SaturatedWait). The grace is bootstrapGrace, 2x LeaseDuration: long
-// enough to ride out a connection spike, bounded because the saturated node's own agent is
-// just as blind to it and cannot take over.
-func (a *agent) trackPeerSaturation(name string, saturated bool, now time.Time) bool {
+// trackPeerSaturation records a peer's saturation episode and reports whether it is
+// saturated now and still inside the grace during which a lease-holding standby waits
+// rather than promote past it (reconcile.PeerState.SaturatedWait). The grace is
+// bootstrapGrace, 2x LeaseDuration: long enough to ride out a connection spike, bounded
+// because the saturated node's own agent is just as blind to it and cannot take over.
+// As for the local node, only a successful probe (reachable) ends the episode: a timeout
+// between refusals must neither restart the grace nor, on its own tick, count as saturated.
+func (a *agent) trackPeerSaturation(name string, saturated, reachable bool, now time.Time) bool {
 	since, was := a.peerSaturatedSince[name]
-	if !saturated {
+	if reachable {
 		if was {
 			a.log.Info("peer accepts the agent's connections again", "peer", name)
 			delete(a.peerSaturatedSince, name)
 		}
+		return false
+	}
+	if !saturated {
 		return false
 	}
 	if !was {
@@ -2499,13 +2522,20 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 // If it overruns, the include is silently absent and every postgresql.configuration / TLS /
 // pgbackrest setting is missing -- and standbys clone that same config.
 //
-// Presence of the directory is a faithful proxy for "some conf.d feature is enabled": the chart
-// mounts it only then. setup-config remains the authority on every later boot, including
-// removal, and EnsureConfdInclude converges either way.
+// The chart mounts conf.d on every install since 2.5.0 -- it always carries
+// reserved-connections.conf, which the agent's own reconnects and pgpool's checks depend on
+// -- so a missing or empty directory is a broken mount (a hand-edited StatefulSet, a
+// ConfigMap/volume problem), not "no conf.d feature enabled". Initialising without the
+// include would bring the cluster up with no connection reserves, silently, and standbys
+// clone that config. Refuse instead. setup-config remains the authority on every later boot,
+// and EnsureConfdInclude converges either way.
 func (a *agent) ensureConfdInclude() error {
-	entries, err := os.ReadDir(confdDir)
+	if a.confdDir == "" {
+		return errors.New("bootstrap initdb: the conf.d directory is not configured")
+	}
+	entries, err := os.ReadDir(a.confdDir)
 	if os.IsNotExist(err) {
-		return nil // the chart mounts this only when a conf.d feature is enabled
+		return fmt.Errorf("bootstrap initdb: %s does not exist; the chart always mounts the postgresql conf.d ConfigMap there (it carries reserved-connections.conf), so the mount is missing", a.confdDir)
 	}
 	if err != nil {
 		// NOT the same as "the feature is off" (#288 review). A mount or permission problem here
@@ -2513,15 +2543,15 @@ func (a *agent) ensureConfdInclude() error {
 		// postgresql.configuration / TLS / audit / archive_mode setting silently absent, cloned
 		// to every standby -- and the later repair appends include_dir AFTER the agent's own
 		// include, inverting the precedence this function is ordered to protect.
-		return fmt.Errorf("bootstrap initdb: read %s: %w", confdDir, err)
+		return fmt.Errorf("bootstrap initdb: read %s: %w", a.confdDir, err)
 	}
 	if len(entries) == 0 {
-		return nil
+		return fmt.Errorf("bootstrap initdb: %s is empty; the chart's postgresql conf.d ConfigMap always carries reserved-connections.conf, so the mount is broken", a.confdDir)
 	}
-	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
+	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), a.confdDir, true); err != nil {
 		return fmt.Errorf("bootstrap initdb: ensure the conf.d include: %w", err)
 	}
-	a.log.Info("wrote the conf.d include for a fresh native install", "dir", confdDir)
+	a.log.Info("wrote the conf.d include for a fresh native install", "dir", a.confdDir)
 	return nil
 }
 
@@ -2766,10 +2796,11 @@ func (a *agent) waitForPrimaryTimeline(ctx context.Context, budget time.Duration
 	}
 }
 
-// confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
-// pgbackrest fragments. Mounted only when one of those features is on, which is what makes its
-// presence a usable signal (#288).
-const confdDir = "/etc/postgresql/conf.d"
+// chartConfdDir is where the chart mounts the postgresql conf.d ConfigMap: the connection
+// reserves plus the operator's postgresql.configuration / TLS / audit / pgbackrest fragments.
+// Mounted on every install since 2.5.0. The agent reads it through agent.confdDir, which
+// newAgent sets to this, so tests can point it elsewhere.
+const chartConfdDir = "/etc/postgresql/conf.d"
 
 // entrypointPath is the image's entrypoint, invoked with an explicit mode. Fixed rather than
 // derived: the agent runs inside that image by construction (#288).
@@ -2874,13 +2905,13 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 // pgpool's init container waits until the check role can log in, so until this converges
 // a new pgpool pod stays in Init -- that, and the log line here, are where a failure shows.
 func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
-	for i, r := range []pg.ManagedRole{
+	for _, r := range []pg.ManagedRole{
 		{Name: a.cfg.AppUser, Password: a.cfg.AppPassword, Kind: pg.RoleApp},
 		{Name: a.cfg.PgpoolCheckUser, Password: a.cfg.PgpoolCheckPassword, Kind: pg.RolePgpoolCheck},
 	} {
 		// Latched per role: one role's transient failure must not re-run (and re-log) a role
 		// that already converged or failed permanently.
-		if a.managedRoleDone[i].Load() {
+		if a.managedRoleDone[r.Kind] {
 			continue
 		}
 		// Heartbeat across the call: rctx allows 30s, twice the /healthz staleness threshold on
@@ -2894,13 +2925,13 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		cancel()
 		switch {
 		case err == nil:
-			a.managedRoleDone[i].Store(true)
+			a.managedRoleDone[r.Kind] = true
 			a.log.Info("managed role provisioned", "role", r.Name, "kind", r.Kind)
 		case errors.Is(err, pg.ErrRoleNotManaged):
-			a.managedRoleDone[i].Store(true)
+			a.managedRoleDone[r.Kind] = true
 			a.log.Error("managed role not provisioned: a role of that name already exists and was not created by the chart; rename the chart value, or hand the role over with COMMENT ON ROLE <name> IS 'managed by the pg chart' and restart the agent", "role", r.Name, "err", err)
 		case errors.Is(err, pg.ErrNeedsSASLprep):
-			a.managedRoleDone[i].Store(true)
+			a.managedRoleDone[r.Kind] = true
 			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)
 		default:
 			a.log.Warn("managed role provisioning failed (retries next primary tick)", "role", r.Name, "err", err)
@@ -3256,9 +3287,12 @@ func (a *agent) assertPreloadedLibsPresent() error {
 		filepath.Join(a.cfg.PGDATA, "postgresql.conf"),
 		filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf"),
 	}
-	fragments, err := filepath.Glob(filepath.Join(confdDir, "*.conf"))
+	if a.confdDir == "" {
+		return errors.New("boot: the conf.d directory is not configured")
+	}
+	fragments, err := filepath.Glob(filepath.Join(a.confdDir, "*.conf"))
 	if err != nil {
-		return fmt.Errorf("boot: list %s: %w", confdDir, err)
+		return fmt.Errorf("boot: list %s: %w", a.confdDir, err)
 	}
 	paths = append(paths, fragments...)
 	// An operator-set dynamic_library_path disarms the refusal entirely. PostgreSQL resolves
@@ -3507,9 +3541,9 @@ func (a *agent) verifyTLSActive(ctx context.Context) {
 		a.log.Error("postgresql.tls.enabled is set but this server reports `ssl = off` -- clients are being served in PLAINTEXT. "+
 			"The usual cause is that PGDATA/postgresql.conf carries no `include_dir` for the chart's conf.d, so tls.conf was never read (#335); "+
 			"an `ssl` set in postgresql.configuration or via ALTER SYSTEM does the same. "+
-			"Fix: check `SHOW config_file` and that the file ends with include_dir = '"+confdDir+"', then reload -- `ssl` is a sighup parameter. "+
+			"Fix: check `SHOW config_file` and that the file ends with include_dir = '"+a.confdDir+"', then reload -- `ssl` is a sighup parameter. "+
 			"This pod is failing its readiness probe until then, so it serves no client traffic",
-			"confd", confdDir)
+			"confd", a.confdDir)
 	}
 }
 

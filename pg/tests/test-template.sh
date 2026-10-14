@@ -1822,6 +1822,8 @@ assert_contains "managed roles: the hook guards the public-schema grant like the
 assert_contains "managed roles: roles.go guards the public-schema grant" "$(cat "${roles_go}")" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
 # The ownership marker and the refusal of an unmarked same-named role must match too.
 for needle in "v_marker TEXT := 'managed by the pg chart';" \
+  "SET pg_stat_statements.track = 'none';" \
+  "SET pg_stat_statements.track_utility = off;" \
   "RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %'"; do
   assert_contains "managed roles: roles.go carries: ${needle:0:60}" "$(cat "${roles_go}")" "${needle}"
   assert_contains "managed roles: the hook carries: ${needle:0:60}" "${standalone_hook}" "${needle}"

@@ -224,10 +224,22 @@ holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.hold
 
 if [[ "${holder}" == "${POD0}" ]]; then
   echo "  Lease is on ${POD0}; moving it to ${POD1} first..."
+  park_uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
   kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   for _ in $(seq 1 30); do
     holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
     [[ "${holder}" == "${POD1}" ]] && break
+    sleep 5
+  done
+  # Wait for the REPLACEMENT ${POD0}, by uid. A label-selected readiness count can be satisfied
+  # by the old, still-terminating instance (it stays Ready through its grace period), and the
+  # kubectl exec below then lands on a pod that is going away: the data directory is never
+  # emptied and the disk-loss scenario silently tests nothing (observed: "All 2 pod(s) ready
+  # (0s elapsed)" followed by an empty exec result).
+  for _ in $(seq 1 60); do
+    uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+    ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo "")
+    [[ -n "${uid}" && "${uid}" != "${park_uid}" && "${ready}" == "true" ]] && break
     sleep 5
   done
   wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300 || true

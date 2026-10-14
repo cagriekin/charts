@@ -39,7 +39,11 @@ type ManagedRole struct {
 // someone else: converting it would silently demote it and reset its password, so the run
 // stops instead and says how to rename the value or hand the role over. The app branch
 // revokes the check role's memberships: a marked role renamed from pgpool.checkUser to
-// postgresql.app would otherwise keep pg_monitor and the reserved-connection slots. The password travels exactly as rehashSQL's does (see there): a SCRAM
+// postgresql.app would otherwise keep pg_monitor and the reserved-connection slots; the
+// check branch likewise revokes CREATE on public in the maintenance database, which the
+// app role holds there. pg_stat_statements tracking is turned off for the session before
+// anything carrying the secret is sent (a placeholder GUC when the extension is not
+// loaded; superuser-settable when it is). The password travels exactly as rehashSQL's does (see there): a SCRAM
 // verifier computed in Go, passed through the environment, hoisted into a session GUC after
 // statement logging is lowered, and quoted with format(%I, %L). VERBOSITY terse keeps the
 // dynamic statement -- verifier included -- out of psql's CONTEXT lines on failure.
@@ -49,6 +53,8 @@ SET log_statement = 'none';
 SET log_min_duration_statement = -1;
 SET log_min_error_statement = 'panic';
 SET client_min_messages = 'warning';
+SET pg_stat_statements.track = 'none';
+SET pg_stat_statements.track_utility = off;
 SET myvars.role_name = :'r';
 SET myvars.role_secret = :'role_secret';
 SET myvars.role_kind = :'k';
@@ -70,6 +76,10 @@ BEGIN
   EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', v_name, v_secret);
   IF v_kind = 'pgpool-check' THEN
     EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
+    IF v_db = 'postgres' AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public')
+       AND has_schema_privilege(v_name, 'public', 'CREATE') THEN
+      EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', v_name);
+    END IF;
   ELSIF v_kind = 'app' THEN
     IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
