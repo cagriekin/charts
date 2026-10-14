@@ -386,10 +386,15 @@ spec:
           # Liveness: PCP answers and at least one backend is not down. That still catches
           # the #122 wedge -- a pgpool that accepts TCP but rejects every session with "all
           # backend nodes are down" -- and restarts it with a fresh status file.
-          # Readiness: PCP answers and node 0 -- the primary, the write path -- is up or
-          # waiting. A read backend that is detached or lagging must not make the proxy
-          # unready (#361); the re-attach loop brings it back. The PCP credentials are the
-          # .pcppass init-config writes for the re-attach loop.
+          # Readiness: PCP answers, node 0 -- the primary, the write path -- is up or
+          # waiting, and at least one pgpool child is free ("Wait for connection" in
+          # pcp_proc_info -a -v). A read backend that is detached or lagging must not make the
+          # proxy unready (#361); the re-attach loop brings it back. The free-child check is
+          # the part of the old session probe worth keeping: with every child busy or hung,
+          # new sessions queue until they time out, so the pod should leave the Service
+          # (readiness only -- liveness does not restart a pgpool that is merely saturated).
+          # "Idle" is a child still holding a connected client, so it does not count. The PCP
+          # credentials are the .pcppass init-config writes for the re-attach loop.
           livenessProbe:
             exec:
               command:
@@ -409,7 +414,9 @@ spec:
                 - -c
                 - |
                   info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w) || exit 1
-                  printf '%s\n' "$info" | awk 'NR == 1 { exit !($5 == "up" || $5 == "waiting") } END { if (NR == 0) exit 1 }'
+                  printf '%s\n' "$info" | awk 'NR == 1 { exit !($5 == "up" || $5 == "waiting") } END { if (NR == 0) exit 1 }' || exit 1
+                  procs=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_proc_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w -a -v) || exit 1
+                  printf '%s\n' "$procs" | grep -q '^Status *: Wait for connection'
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

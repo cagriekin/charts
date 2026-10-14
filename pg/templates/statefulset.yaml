@@ -13,6 +13,7 @@
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateRoleNames" . }}
 {{- include "pg.validateManagedRoles" . }}
+{{- include "pg.validateExistingSecretKeys" . }}
 {{- include "pg.validateConnectionReserves" . }}
 {{- include "pg.validatePgHba" . }}
 {{- include "pg.validateExtraPassthrough" . }}
@@ -1174,7 +1175,35 @@ spec:
                                out of the error CONTEXT. A failure fails the hook: the kubelet
                                restarts the container and records the message in a
                                FailedPostStartHook event, where it is visible, instead of pgpool
-                               waiting forever on a role that was never created. */}}
+                               waiting forever on a role that was never created.
+
+                               It must not run against docker-entrypoint's TEMPORARY first-boot
+                               server. That server answers pg_isready on the socket before the
+                               entrypoint has created postgresql.database, and is stopped right
+                               after: a role run against it fails, this hook exits 1, and the
+                               kubelet kills the container mid-initialisation -- on the restart
+                               PGDATA exists, init is skipped, and a non-default database is never
+                               created. The temporary server listens on no TCP address
+                               (listen_addresses=''), while the real one always listens on
+                               loopback (pg.validateListenAddresses requires it), so wait for
+                               127.0.0.1 to answer and for postgresql.database to accept a
+                               session. pg_isready gets -U like every call here: the container runs
+                               as a uid with no passwd entry, and without -U pg_isready cannot name
+                               a user and reports "no attempt" forever. Bounded: a server that
+                               never gets there fails the hook
+                               with a message rather than holding the container forever. */}}
+                        real_server=""
+                        for _ in $(seq 1 120); do
+                          if pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q && psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1" > /dev/null 2>&1; then
+                            real_server=1
+                            break
+                          fi
+                          sleep 1
+                        done
+                        if [ -z "$real_server" ]; then
+                          echo "postStart: the server did not come up on 127.0.0.1 with database $POSTGRES_DB within 120s; managed roles ($APP_USER, $PGPOOL_CHECK_USER) not provisioned" >&2
+                          exit 1
+                        fi
                         if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 \
                              -v r_app="$APP_USER" -v r_check="$PGPOOL_CHECK_USER" -v d="$POSTGRES_DB" <<'SQL'
                     \set VERBOSITY terse

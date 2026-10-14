@@ -88,8 +88,10 @@
   children, whatever the role. On a node at `max_connections` that connection came out of a
   reserve and stayed there: the probes logged in as the superuser and so took
   `superuser_reserved_connections` slots from the agent. Now readiness requires node 0 (the
-  primary, the write path) to be up or waiting, and liveness fails only when PCP stops answering
-  or every backend is marked down (the #122 wedge). A detached read backend still never makes
+  primary, the write path) to be up or waiting and at least one pgpool child to be free
+  (`pcp_proc_info`, still no session), so a pgpool whose children are all busy or hung leaves the
+  Service as before; liveness fails only when PCP stops answering or every backend is marked down
+  (the #122 wedge), and never restarts a pgpool that is merely saturated. A detached read backend still never makes
   pgpool unready (#361). The pgpool metrics exporter logs in as `pgpool_check` instead of the
   superuser for the same reason: its one session (pgpool2_exporter caps its pool at one
   connection) makes pgpool connect to every backend, and those connections now come from

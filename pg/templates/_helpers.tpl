@@ -1110,6 +1110,32 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end -}}
 
+{{- /* postgresql.existingSecret must carry the managed roles' password keys. The keys
+       default to app-password / pgpool-check-password, so `required` never fires, and a
+       Secret without them only fails at rollout: every new postgresql and pgpool pod sits in
+       CreateContainerConfigError. When Helm can see the Secret (install/upgrade against a
+       cluster), refuse the render instead, naming the missing keys. lookup returns nothing
+       under helm template / --dry-run and for a Secret that does not exist yet; there is
+       nothing to inspect then, and the rollout reports it as before. */ -}}
+{{- define "pg.validateExistingSecretKeys" -}}
+{{- if .Values.postgresql.existingSecret.enabled -}}
+{{- $name := include "pg.secretName" . -}}
+{{- $secret := lookup "v1" "Secret" .Release.Namespace $name -}}
+{{- if $secret -}}
+{{- $missing := list -}}
+{{- range $key := list (include "pg.secretAppPasswordKey" .) (include "pg.secretPgpoolCheckPasswordKey" .) -}}
+{{- /* A Secret with no data at all has no keys, so every key is missing. */ -}}
+{{- if or (not $secret.data) (not (hasKey $secret.data $key)) -}}
+{{- $missing = append $missing $key -}}
+{{- end -}}
+{{- end -}}
+{{- if $missing -}}
+{{- fail (printf "postgresql.existingSecret %q has no %s key(s). Since chart 2.5.0 it must carry the passwords of the application role (postgresql.app) and pgpool's check role (pgpool.checkUser); without them every postgresql and pgpool pod fails with CreateContainerConfigError. Add the key(s), or point postgresql.existingSecret.appPasswordKey / pgpoolCheckPasswordKey at existing ones." $name (join ", " $missing)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* Connection reserves. PostgreSQL refuses a NEW connection once max_connections is
        used up, which used to blind the agent: a reconnect to a full node failed, and a full
        primary was then indistinguishable from a dead one. Three pools instead of one:

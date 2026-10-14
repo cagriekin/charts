@@ -297,3 +297,70 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
           pattern: "REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?IF current_setting\\('myvars\\.db'\\) = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
+
+  # --- existingSecret must carry the managed roles' keys; checked when lookup can see it ---
+  - it: an existingSecret without the managed roles' keys is refused at render
+    template: templates/statefulset.yaml
+    set:
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: creds
+    kubernetesProvider:
+      scheme:
+        "v1/Secret":
+          gvr:
+            version: "v1"
+            resource: "secrets"
+          namespaced: true
+      objects:
+        - kind: Secret
+          apiVersion: v1
+          metadata:
+            name: creds
+            namespace: NAMESPACE
+          data:
+            username: dXNlcg==
+            password: cHc=
+            database: ZGI=
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.existingSecret "creds" has no app-password, pgpool-check-password key\(s\)'
+
+  - it: an existingSecret carrying the managed roles' keys renders
+    template: templates/statefulset.yaml
+    set:
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: creds
+    kubernetesProvider:
+      scheme:
+        "v1/Secret":
+          gvr:
+            version: "v1"
+            resource: "secrets"
+          namespaced: true
+      objects:
+        - kind: Secret
+          apiVersion: v1
+          metadata:
+            name: creds
+            namespace: NAMESPACE
+          data:
+            username: dXNlcg==
+            password: cHc=
+            database: ZGI=
+            app-password: cHc=
+            pgpool-check-password: cHc=
+    asserts:
+      - notFailedTemplate: {}
+
+  # The standalone hook waits for the REAL server (loopback TCP) before provisioning roles:
+  # docker-entrypoint's first-boot server listens only on the socket. pg_isready needs -U --
+  # the container's uid has no passwd entry, and without it pg_isready reports "no attempt".
+  - it: the standalone hook waits for the real server on loopback before provisioning roles
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q && psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -tAc "SELECT 1"[\s\S]*did not come up on 127\.0\.0\.1[\s\S]*if ! psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1'

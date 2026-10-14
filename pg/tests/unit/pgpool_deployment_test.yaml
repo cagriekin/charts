@@ -94,7 +94,8 @@ tests:
   # The probes ask pgpool over PCP and open no PostgreSQL session: a session through pgpool
   # leaves a cached backend connection behind, which on a full node comes out of a reserve.
   # Readiness follows node 0 (the write path) only, so a detached read backend never makes
-  # the proxy unready (#361); liveness fails only when every backend is down (#122).
+  # the proxy unready (#361), and requires a free pgpool child; liveness fails only when PCP
+  # stops answering or every backend is down (#122), never for a merely saturated pgpool.
   - it: both probes use PCP and open no PostgreSQL session
     template: templates/pgpool-deployment.yaml
     set:
@@ -105,10 +106,13 @@ tests:
           pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*\$5 != "" && \$5 != "down" \{ live = 1 \}'
       - matchRegex:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
-          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*NR == 1 \{ exit !\(\$5 == "up" \|\| \$5 == "waiting"\) \}'
+          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*NR == 1 \{ exit !\(\$5 == "up" \|\| \$5 == "waiting"\) \}[\s\S]*pcp_proc_info -h 127\.0\.0\.1 -p 9898 [^\n]* -w -a -v\) \|\| exit 1\n.*grep -q .\^Status \*: Wait for connection.'
       - notMatchRegex:
           path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
           pattern: psql
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: pcp_proc_info
       - notMatchRegex:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
           pattern: psql
