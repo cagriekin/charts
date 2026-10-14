@@ -206,6 +206,16 @@ func (l *loader) str(key string) string {
 	return v
 }
 
+// trimmedStr is str for identifiers that are trimmed before use: a whitespace-only value
+// counts as missing rather than slipping past the check as an empty name.
+func (l *loader) trimmedStr(key string) string {
+	v := strings.TrimSpace(l.get(key))
+	if v == "" {
+		l.missing = append(l.missing, key)
+	}
+	return v
+}
+
 func (l *loader) dur(key string) time.Duration {
 	v := l.get(key)
 	if v == "" {
@@ -292,9 +302,9 @@ func Load(get func(string) string) (*Config, error) {
 		DCSBackend:        l.str("DCS_BACKEND"),
 		PgHbaPeerCIDR:     l.str("POD_CIDR"),
 
-		AppUser:             strings.TrimSpace(l.str("APP_USER")),
+		AppUser:             l.trimmedStr("APP_USER"),
 		AppPassword:         l.str("APP_PASSWORD"),
-		PgpoolCheckUser:     strings.TrimSpace(l.str("PGPOOL_CHECK_USER")),
+		PgpoolCheckUser:     l.trimmedStr("PGPOOL_CHECK_USER"),
 		PgpoolCheckPassword: l.str("PGPOOL_CHECK_PASSWORD"),
 	}
 	// User pg_hba rules (optional), newline-separated; the agent places them above
@@ -310,7 +320,7 @@ func Load(get func(string) string) (*Config, error) {
 	c.TLSEnabled = boolEnv(get("TLS_ENABLED"))
 	c.TLSRequireSSL = boolEnv(get("TLS_REQUIRE_SSL"))
 	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
-	c.PostgresUser = strings.TrimSpace(l.str("POSTGRES_USER"))
+	c.PostgresUser = l.trimmedStr("POSTGRES_USER")
 	c.MonitoringUser = strings.TrimSpace(get("MONITORING_USER"))
 
 	// md5->scram re-hash inputs (#199). Optional -- the agent runs the re-hash on
@@ -318,7 +328,7 @@ func Load(get func(string) string) (*Config, error) {
 	// container env (the chart's postStart used them), so no new secret is exposed.
 	c.MigrateLegacyMd5Users = boolEnv(get("MIGRATE_LEGACY_MD5_USERS"))
 	c.PostgresPassword = get("POSTGRES_PASSWORD")
-	c.PostgresDB = strings.TrimSpace(l.str("POSTGRES_DB"))
+	c.PostgresDB = l.trimmedStr("POSTGRES_DB")
 
 	// Cascading replication (issue #29). Optional -- absent/empty means off.
 	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))

@@ -274,6 +274,14 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 		if !reused || kind != QueryRead || ctx.Err() != nil {
 			return "", err
 		}
+		// Close may have started while the query ran; a redial now would open a session it
+		// never terminates.
+		c.mu.Lock()
+		closed := c.isClosed
+		c.mu.Unlock()
+		if closed {
+			return "", err
+		}
 	}
 }
 

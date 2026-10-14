@@ -2865,8 +2865,6 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 // pgpool's init container waits until the check role can log in, so until this converges
 // a new pgpool pod stays in Init -- that, and the log line here, are where a failure shows.
 func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
-	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	for i, r := range []pg.ManagedRole{
 		{Name: a.cfg.AppUser, Password: a.cfg.AppPassword, Kind: pg.RoleApp},
 		{Name: a.cfg.PgpoolCheckUser, Password: a.cfg.PgpoolCheckPassword, Kind: pg.RolePgpoolCheck},
@@ -2878,10 +2876,13 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		}
 		// Heartbeat across the call: rctx allows 30s, twice the /healthz staleness threshold on
 		// chart defaults, and an ALTER ROLE queued behind a lock would otherwise get the
-		// primary's agent liveness-killed.
+		// primary's agent liveness-killed. One budget per role, so a role stuck on a lock does
+		// not leave the other an already-expired deadline.
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err := a.beatDuring(func() error {
 			return pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
 		})
+		cancel()
 		switch {
 		case err == nil:
 			a.managedRoleDone[i].Store(true)

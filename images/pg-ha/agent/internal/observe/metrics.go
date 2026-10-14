@@ -240,7 +240,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_recovery_starts_total", "Recovery-mode (read-only WAL replay) starts at cold boot.", "counter", m.recoveryStarts.Load()},
 		{"pg_ha_agent_marker_tamper_suspected_total", "Ticks on which the primary marker looked forged or corrupt (implausible/unparseable highwater); a non-zero rate means automatic promotion may be frozen.", "counter", m.markerTamper.Load()},
 		{"pg_ha_agent_tls_inactive", "1 while postgresql.tls.enabled is set and the running postmaster reports `ssl = off` -- clients are being served in plaintext. Always 0 when TLS was never requested.", "gauge", m.tlsInactive.Load()},
-		{"pg_ha_agent_local_saturated", "1 while the local postgres refuses the agent's connections with too_many_connections (max_connections exhausted). The node is alive but the agent cannot observe it; self-health step-down is suppressed while this holds.", "gauge", m.localSaturated.Load()},
+		{"pg_ha_agent_local_saturated", "1 while the local postgres refuses the agent's connections with too_many_connections (max_connections exhausted). The node is alive but the agent cannot observe it; self-health step-down is suppressed for up to ha.agent.saturationGrace from the start of the episode.", "gauge", m.localSaturated.Load()},
 		{"pg_ha_agent_peers_saturated", "Peers currently refusing this agent's connections with too_many_connections (max_connections exhausted).", "gauge", m.peersSaturated.Load()},
 		{"pg_ha_agent_control_requests_total", "Authenticated control-API requests.", "counter", m.controlRequests.Load()},
 		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},

@@ -795,3 +795,15 @@ func TestLoadManagedRoles(t *testing.T) {
 		t.Errorf("managed roles not loaded: %+v", c)
 	}
 }
+
+// A whitespace-only value is as missing as an empty one: these are trimmed BEFORE the
+// required check, so the agent fails at boot instead of failing role provisioning forever.
+func TestLoadTrimmedRequiredValuesRejectWhitespace(t *testing.T) {
+	for _, key := range []string{"APP_USER", "PGPOOL_CHECK_USER", "POSTGRES_USER", "POSTGRES_DB"} {
+		m := fullEnv()
+		m[key] = "  \t "
+		if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("whitespace-only %s must fail as missing, got %v", key, err)
+		}
+	}
+}
