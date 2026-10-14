@@ -86,11 +86,14 @@
   if wedged. The grace is bounded because a primary whose slots are all held by sessions stuck on
   hung storage refuses connections the same way; past it, the node counts as not running again
   and the ordinary self-health step-down applies. The grace runs from the FIRST refusal of an
-  episode, and only a successful probe ends the episode: timeouts between refusals neither count as
-  alive nor restart the clock, so a node alternating between refusals and timeouts cannot renew it
-  forever. A lease-holding standby waits up to `2 x LeaseDuration` before promoting past a full
-  peer whose position it cannot read, unless that peer's fresh gossip shows it is not ahead (only
-  when both positions are known). A full node gossips neither its last-checkpoint LSN nor its
+  episode, and the episode ends only on positive evidence: a successful probe, or a restart (the
+  local postmaster no longer running; for a peer, a refused TCP connection). Timeouts between
+  refusals neither count as alive nor restart the clock, so a node alternating between refusals
+  and timeouts cannot renew it forever. A lease-holding standby that stays full past the grace
+  releases the Lease instead of waiting for a free slot. A lease-holding standby waits up to
+  `2 x LeaseDuration` before promoting past a full peer whose position it cannot read, including
+  on ticks where that peer times out instead of refusing, unless that peer's fresh gossip shows it
+  is not ahead (only when both positions are known). A full node gossips neither its last-checkpoint LSN nor its
   checkpoint timeline, which can lag a promotion. New gauges: `pg_ha_agent_local_saturated`,
   `pg_ha_agent_peers_saturated`.
 
