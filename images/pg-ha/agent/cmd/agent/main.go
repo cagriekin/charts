@@ -3448,10 +3448,10 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// defaults) -- at which point the kubelet SIGKILLs PID 1 and the postmaster it supervises.
 	// verifyTLSActive, three lines up in the same tick, is bounded by Prober.Timeout (10s), and
 	// RecoveryTimelines below is bounded by the same 10s: beating only after that read left a
-	// 20s hole -- past the threshold -- reachable whenever the two throttles (60s and 15s)
-	// coincide, which is every fourth check, not a theoretical case. It also covers the early
-	// return below, which is the COMMON path (a caught-up standby has nothing to repair) and
-	// previously beat not at all no matter how long the read took.
+	// 20s hole -- past the threshold -- whenever both run in the same tick, which is every
+	// minute. It also covers the early return below, which is the COMMON path (a caught-up
+	// standby has nothing to repair) and previously beat not at all no matter how long the read
+	// took.
 	a.metr.Beat()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {

@@ -89,7 +89,7 @@
   hung storage refuses connections the same way; past it, the node counts as not running again
   and the ordinary self-health step-down applies. The grace runs from the FIRST refusal of an
   episode, and the episode ends only on positive evidence: a successful probe, or a restart (the
-  local postmaster no longer running; for a peer, a refused TCP connection). Timeouts between
+  local postmaster no longer running; for a peer, every TCP connection attempt refused). Timeouts between
   refusals neither count as alive nor restart the clock, so a node alternating between refusals
   and timeouts cannot renew it forever. A lease-holding standby that stays full past the grace
   releases the Lease instead of waiting for a free slot. A lease-holding standby waits up to

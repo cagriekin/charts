@@ -691,9 +691,30 @@ func IsTooManyConnections(err error) bool {
 }
 
 // IsConnRefused reports whether err is a refused TCP connection: no process is
-// listening on the port.
+// listening on the port. pgconn joins the errors of every address and TLS/plaintext
+// attempt it made, so a joined error counts only when EVERY attempt was refused: one
+// refused address (an IPv6 record on an IPv4-only listener) next to a timeout or a
+// too_many_connections refusal is not evidence that the postmaster exited.
 func IsConnRefused(err error) bool {
-	return errors.Is(err, syscall.ECONNREFUSED)
+	for err != nil {
+		if multi, ok := err.(interface{ Unwrap() []error }); ok {
+			errs := multi.Unwrap()
+			if len(errs) == 0 {
+				return false
+			}
+			for _, e := range errs {
+				if !IsConnRefused(e) {
+					return false
+				}
+			}
+			return true
+		}
+		if errno, ok := err.(syscall.Errno); ok {
+			return errno == syscall.ECONNREFUSED
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
@@ -757,7 +778,8 @@ func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
 	inRec, reachable, err := p.InRecovery(ctx, ci)
 	if err != nil {
 		ns.Saturated = IsTooManyConnections(err)
-		ns.ConnRefused = IsConnRefused(err)
+		// A 53300 from any attempt proves the postmaster is up, whatever else was refused.
+		ns.ConnRefused = !ns.Saturated && IsConnRefused(err)
 		return ns
 	}
 	if !reachable {

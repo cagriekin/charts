@@ -1018,10 +1018,15 @@ func TestIsConnRefused(t *testing.T) {
 	if !IsConnRefused(refused) {
 		t.Error("a wrapped ECONNREFUSED must be recognised")
 	}
+	if !IsConnRefused(errors.Join(refused, refused)) {
+		t.Error("every joined attempt refused must be recognised")
+	}
 	for _, err := range []error{
 		&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)},
 		&pgconn.PgError{Code: sqlstateTooManyConnections},
 		context.DeadlineExceeded,
+		errors.Join(refused, &pgconn.PgError{Code: sqlstateTooManyConnections}),
+		errors.Join(refused, context.DeadlineExceeded),
 	} {
 		if IsConnRefused(err) {
 			t.Errorf("%v must not read as a refused connection", err)
