@@ -1,14 +1,14 @@
 # --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
-# Digest-pinned (manifest-list digest, multi-arch). go1.25.12 carries the patched
-# stdlib (crypto/tls GO-2026-5856 ECH leak, plus net/textproto, mime, crypto/x509,
-# html/template, net) the agent links.
-# Refresh with: docker buildx imagetools inspect golang:1.25-bookworm
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm@sha256:ea341baa9bd5ba6784f6d7161ace70544349a6242d54d34a0fbfd2c4d51c9d58 AS agent-build
+# Digest-pinned (manifest-list digest, multi-arch). go1.26.9 carries the patched
+# stdlib (net/http, net/textproto, crypto/tls, html/template: GO-2026-6599..6617) the
+# agent links; 1.25 has no fixed release.
+# Refresh with: docker buildx imagetools inspect golang:1.26.9-bookworm
+FROM --platform=$BUILDPLATFORM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS agent-build
 ARG TARGETARCH
 # The digest pin above is only binding while THIS toolchain is the one that builds. With
 # GOPROXY=off gone (#333), Go's default GOTOOLCHAIN=auto would silently download and run a
 # newer toolchain over the network the moment go.mod's `go`/`toolchain` directive is bumped
-# past 1.25.0, or a dependency requires one -- linking a stdlib nobody pinned or reviewed,
+# past 1.26.0, or a dependency requires one -- linking a stdlib nobody pinned or reviewed,
 # and quietly retiring the patched-stdlib claim in the header comment above. `local` makes
 # that a hard build failure instead, which is what the vendored build used to get for free.
 ENV GOTOOLCHAIN=local

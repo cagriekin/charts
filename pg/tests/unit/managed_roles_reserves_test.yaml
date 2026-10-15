@@ -1,0 +1,418 @@
+suite: connection reserves and chart-managed roles
+release:
+  name: test-pg
+tests:
+  # --- reserved-connections.conf: sized from the topology, always rendered ---
+  - it: HA without pgpool reserves one superuser slot per node plus 3, none for pgpool
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.replicaCount: 2
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 6\n\s*reserved_connections = 0'
+
+  - it: HA with pgpool reserves pgpool.reservedConnections for the check role
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 3
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 5\n\s*reserved_connections = 7'
+
+  - it: pgpool replicas beyond what reservedConnections covers are refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 4
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=4 needs at least 9'
+
+  - it: with metrics the exporter counts, so 3 replicas need 10 reserved connections
+    template: templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+      pgpool.replicaCount: 3
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=3 needs at least 10 \(per replica a health check and a streaming check and the metrics exporter, plus 1\)'
+
+  - it: with metrics the default covers 2 pgpool replicas
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+      pgpool.replicaCount: 2
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'reserved_connections = 7'
+
+  - it: raising reservedConnections admits more pgpool replicas
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 4
+      pgpool.reservedConnections: 9
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'reserved_connections = 9'
+
+  - it: standalone keeps PostgreSQL's 3 superuser slots
+    template: templates/postgresql-configmap.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 3\n\s*reserved_connections = 7'
+
+  - it: a non-positive saturationGrace is refused
+    template: templates/statefulset.yaml
+    set:
+      ha.agent.saturationGrace: 0s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ha\.agent\.saturationGrace is "0s": it must be a positive duration'
+
+  - it: the agent receives SATURATION_GRACE
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SATURATION_GRACE
+            value: 2m
+
+  # --- reserve guards ---
+  - it: superuser_reserved_connections in postgresql.configuration is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.configuration.superuser_reserved_connections: "10"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.configuration\.superuser_reserved_connections is set, but the chart owns the connection reserves'
+
+  - it: reserved_connections is refused whatever its case
+    template: templates/statefulset.yaml
+    set:
+      postgresql.configuration.Reserved_Connections: "2"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.configuration\.Reserved_Connections is set, but the chart owns the connection reserves'
+
+  - it: a max_connections the reserves would exhaust is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.configuration.max_connections: "12"
+      pgpool.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'max_connections is 12, but the chart reserves 5 superuser slots .* and 7 for pgpool''s checks'
+
+  - it: a max_connections just above the reserves renders
+    template: templates/statefulset.yaml
+    set:
+      postgresql.configuration.max_connections: "13"
+      pgpool.enabled: true
+    asserts:
+      - notFailedTemplate: {}
+
+  - it: PostgreSQL before 16 is refused (reserved_connections, pg_use_reserved_connections)
+    template: templates/statefulset.yaml
+    set:
+      postgresql.majorVersion: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'both introduced in PostgreSQL 16'
+
+  # --- managed role names ---
+  - it: an application role named like the superuser is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.username: dbadmin
+      postgresql.app.username: dbadmin
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.app\.username is "dbadmin", which collides with postgresql\.username'
+
+  - it: an application role named postgres is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.app.username: postgres
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.app\.username is "postgres", which collides with'
+
+  - it: a check role named like the replication role is refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.checkUser.username: repmgr
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.checkUser\.username is "repmgr", which collides with ha\.username'
+
+  - it: a check role named like a postgresql.roles entry is refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.checkUser.username: reporting
+      postgresql.roles:
+        - name: reporting
+    asserts:
+      - failedTemplate: {}
+
+  - it: a check role named all (the pg_hba wildcard) is refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.checkUser.username: all
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.checkUser\.username is "all", a reserved name'
+
+  - it: an application role with a name PostgreSQL reserves is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.app.username: pg_app
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.app\.username is "pg_app", a reserved name'
+
+  - it: the two managed roles must differ
+    template: templates/statefulset.yaml
+    set:
+      postgresql.app.username: shared
+      pgpool.checkUser.username: shared
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.app\.username and pgpool\.checkUser\.username are both "shared"'
+
+  # --- the roles reach the postgresql container ---
+  - it: the postgresql container carries both managed roles and their Secret keys
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: APP_USER
+            value: app_user
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: APP_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: test-pg
+                key: app-password
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGPOOL_CHECK_USER
+            value: pgpool_check
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGPOOL_CHECK_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: test-pg
+                key: pgpool-check-password
+
+  - it: existingSecret reads the managed passwords from the configured keys
+    template: templates/statefulset.yaml
+    set:
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: creds
+      postgresql.existingSecret.appPasswordKey: app-pw
+      postgresql.existingSecret.pgpoolCheckPasswordKey: check-pw
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: APP_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: creds
+                key: app-pw
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGPOOL_CHECK_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: creds
+                key: check-pw
+
+  - it: the generated Secret carries both managed passwords
+    template: templates/secret.yaml
+    asserts:
+      - exists:
+          path: data["app-password"]
+      - exists:
+          path: data["pgpool-check-password"]
+
+  - it: standalone provisions the managed roles from the postStart hook
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: '\\getenv app_pw APP_PASSWORD[\s\S]*SET log_statement = ''none''[\s\S]*SET myvars\.app_pw[\s\S]*ALTER ROLE %I WITH LOGIN NOSUPERUSER[\s\S]*GRANT pg_monitor, pg_use_reserved_connections[\s\S]*ALTER DATABASE %I OWNER TO %I'
+
+  # --- pgpool uses the check role and knows both new logins ---
+  - it: pgpool's checks log in as the check role, not the superuser
+    template: templates/pgpool-configmap.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: "sr_check_user = '__CHECK_USER__'"
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: "health_check_user = '__CHECK_USER__'"
+      - matchRegex:
+          path: data["pool_passwd"]
+          pattern: '__CHECK_USER__:TEXT__CHECK_PASSWORD__\n__APP_USER__:TEXT__APP_PASSWORD__'
+
+  # --- postgresql.database ownership: the maintenance database keeps its owner ---
+  - it: a databases[] entry may keep postgres owned by the superuser (the chart leaves it alone)
+    template: templates/databases-roles-job.yaml
+    set:
+      postgresql.databases:
+        - name: postgres
+          owner: postgres
+    asserts:
+      - notFailedTemplate: {}
+
+  - it: a databases[] entry giving a non-default postgresql.database another owner is refused
+    template: templates/databases-roles-job.yaml
+    set:
+      postgresql.database: appdb
+      postgresql.databases:
+        - name: appdb
+          owner: postgres
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.databases\[appdb\]\.owner is "postgres", but "appdb" is postgresql\.database, which the chart assigns to the application role "app_user"'
+
+  - it: the standalone hook grants instead of transferring ownership of postgres
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: "REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?IF current_setting\\('myvars\\.db'\\) = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
+
+  # --- existingSecret must carry the managed roles' keys; checked when lookup can see it ---
+  - it: an existingSecret without the managed roles' keys is refused at render
+    template: templates/statefulset.yaml
+    set:
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: creds
+    kubernetesProvider:
+      scheme:
+        "v1/Secret":
+          gvr:
+            version: "v1"
+            resource: "secrets"
+          namespaced: true
+      objects:
+        - kind: Secret
+          apiVersion: v1
+          metadata:
+            name: creds
+            namespace: NAMESPACE
+          data:
+            username: dXNlcg==
+            password: cHc=
+            database: ZGI=
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.existingSecret "creds" has no app-password, pgpool-check-password key\(s\)'
+
+  - it: an existingSecret carrying the managed roles' keys renders
+    template: templates/statefulset.yaml
+    set:
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: creds
+    kubernetesProvider:
+      scheme:
+        "v1/Secret":
+          gvr:
+            version: "v1"
+            resource: "secrets"
+          namespaced: true
+      objects:
+        - kind: Secret
+          apiVersion: v1
+          metadata:
+            name: creds
+            namespace: NAMESPACE
+          data:
+            username: dXNlcg==
+            password: cHc=
+            database: ZGI=
+            app-password: cHc=
+            pgpool-check-password: cHc=
+    asserts:
+      - notFailedTemplate: {}
+
+  # The standalone hook waits for the REAL server (loopback TCP) before provisioning roles:
+  # docker-entrypoint's first-boot server listens only on the socket. pg_isready needs -U --
+  # the container's uid has no passwd entry, and without it pg_isready reports "no attempt".
+  - it: the whole standalone hook is gated on the real server on loopback (pgHba, reload, roles)
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: '^real_server=""\nfor i in \$\(seq 1 300\); do\n  if pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q && psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -tAc "SELECT 1"[\s\S]*if ! psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1[\s\S]*did not come up on 127\.0\.0\.1 with database \$POSTGRES_DB within 300s'
+
+  # Standalone first boot: include_dir goes in through docker-entrypoint-initdb.d, before the
+  # first real start, so postmaster-level conf.d settings (reserved_connections) are live from
+  # the start; the postStart hook no longer appends it after the server is up.
+  - it: standalone mounts the include-confd script into docker-entrypoint-initdb.d
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: postgresql-config
+            mountPath: /docker-entrypoint-initdb.d/00-include-confd.sh
+            subPath: include-confd.sh
+            readOnly: true
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'echo "include_dir'
+
+  - it: the standalone ConfigMap carries the include-confd script
+    template: templates/postgresql-configmap.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: data["include-confd.sh"]
+          pattern: 'grep -q "\^include_dir = ''/etc/postgresql/conf\.d''" "\$PGDATA/postgresql\.conf"[\s\S]*echo "include_dir = ''/etc/postgresql/conf\.d''" >> "\$PGDATA/postgresql\.conf"'
+
+  - it: HA neither carries nor mounts the include-confd script (the agent wires include_dir)
+    template: templates/postgresql-configmap.yaml
+    asserts:
+      - notExists:
+          path: data["include-confd.sh"]

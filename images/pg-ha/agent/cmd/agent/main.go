@@ -147,6 +147,8 @@ type agent struct {
 	mech   mechanism.Mechanism
 	sup    *process.Supervisor
 	prober *pg.Prober
+	// conns is the prober's transport, held here so shutdown can terminate the sessions.
+	conns  *pg.ConnCache
 	metr   *observe.Metrics
 	health *selfHealthTracker
 	// Major-versioned locations of the server binaries this image bundles, derived
@@ -162,6 +164,19 @@ type agent struct {
 	// lifetime. Once all have, the cold-boot wait never applies again -- so a
 	// steady-state failover is not delayed by a recent agent/pod restart.
 	peersSeen map[string]bool
+	// peerSaturatedSince records when each peer was first seen refusing connections with
+	// too_many_connections in its current episode; cleared when it answers or refuses TCP
+	// connections. Bounds PeerState.SaturatedWait. Reconcile goroutine only.
+	peerSaturatedSince map[string]time.Time
+	// localSaturated is this tick's local saturation result; localSaturationAlive counts
+	// only a tick that is saturated now, so a timeout between refusals does not.
+	localSaturated bool
+	// localSaturatedSince is when the current local saturation episode began; zero when
+	// the local node is not saturated. Bounds how long saturation counts as alive.
+	localSaturatedSince time.Time
+	// localSaturationExpired latches the one log line for an episode that outlived
+	// cfg.SaturationGrace.
+	localSaturationExpired bool
 	// rewindFailures counts CONSECUTIVE non-divergence pg_rewind failures against
 	// rewindFailureTarget, so a persistently unrewindable node still recovers (#298 review).
 	// Classification is fail-safe -- anything that is not provably divergence is retried
@@ -287,12 +302,11 @@ type agent struct {
 	tlsCheckedAt       time.Time
 	tlsInactiveLatched bool
 
-	// durableTLNextAt throttles the restartpoint that keeps a standby's control-file timeline
-	// current (#298). Same shape as tlsCheckedAt, but stored as the NEXT due time rather than
-	// the last check, so a restartpoint that did not advance the timeline can back itself off
-	// (durableTLNoAdvanceInterval) without a second field. The condition it repairs changes
-	// only when this node follows a new timeline, and the steady-state check is one SQL round
-	// trip.
+	// durableTLNextAt backs off the restartpoint that keeps a standby's control-file timeline
+	// current (#298) after one that failed or did not advance the timeline
+	// (durableTLNoAdvanceInterval); zero when no backoff is in force. Only the CHECKPOINT is
+	// throttled: the timeline read runs every tick, so the first tick that sees the streamed
+	// timeline ahead repairs it at once.
 	durableTLNextAt time.Time
 
 	// Control API (#276), present only when it is enabled. intents carries node-local
@@ -308,6 +322,15 @@ type agent struct {
 	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
 	// flips true on success, so a transient failure retries the next primary tick.
 	rehashedManagedUsers atomic.Bool
+	// managedRoleDone latches, per managed role kind (app, pgpool check), once
+	// ensureManagedRolesOnce has provisioned it or hit a permanent error in this process.
+	// Keyed by kind, not by position in the role list, so adding or reordering roles cannot
+	// move a latch. Reconcile goroutine only.
+	managedRoleDone map[pg.RoleKind]bool
+	// roleExec runs the managed-role provisioning psql (pg.OSExec in production).
+	roleExec pg.StdinExec
+	// confdDir is the postgresql conf.d mount (chartConfdDir in production).
+	confdDir string
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -362,24 +385,34 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		return nil, err
 	}
 	mech := newMechanism(cfg, pgBindir)
+	conns := pg.NewConnCache()
+	prober, err := pg.NewProber(conns)
+	if err != nil {
+		return nil, err
+	}
 	return &agent{
-		cfg:    cfg,
-		log:    log,
-		dcs:    d,
-		kube:   kube,
-		mech:   mech,
-		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
-		prober: pg.NewProber(),
-		metr:   observe.New(),
+		cfg:      cfg,
+		log:      log,
+		dcs:      d,
+		kube:     kube,
+		mech:     mech,
+		sup:      process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
+		prober:   prober,
+		roleExec: pg.OSExec{},
+		conns:    conns,
+		metr:     observe.New(),
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
-		health:           &selfHealthTracker{grace: cfg.LeaseDuration},
-		pgBindir:         pgBindir,
-		pgControlDataBin: pgBindir + "/pg_controldata",
-		repmgrModulePath: filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
-		base:             podname.Base(cfg.PodName),
-		bootAt:           time.Now(),
-		peersSeen:        map[string]bool{},
+		health:             &selfHealthTracker{grace: cfg.LeaseDuration},
+		pgBindir:           pgBindir,
+		confdDir:           chartConfdDir,
+		pgControlDataBin:   pgBindir + "/pg_controldata",
+		repmgrModulePath:   filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
+		base:               podname.Base(cfg.PodName),
+		bootAt:             time.Now(),
+		peersSeen:          map[string]bool{},
+		peerSaturatedSince: map[string]time.Time{},
+		managedRoleDone:    map[pg.RoleKind]bool{},
 		// One slot: a second concurrent node-local operation waits on the channel rather
 		// than queueing up behind an unbounded backlog of restarts.
 		intents: make(chan intentRequest, 1),
@@ -597,6 +630,12 @@ func (a *agent) run() {
 			if c, ok := a.dcs.(io.Closer); ok {
 				_ = c.Close()
 			}
+			// Last, after the demote and the lease release, which may still probe.
+			cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := a.conns.Close(cctx); err != nil {
+				a.log.Warn("shutdown: some SQL sessions could not be closed cleanly", "err", err)
+			}
+			ccancel()
 			return
 		case <-ticker.C:
 			a.tick(ctx)
@@ -839,6 +878,12 @@ func (a *agent) tick(ctx context.Context) {
 	// it is a primary-only convergence step.
 	if err == nil && (dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary) {
 		a.rehashManagedUsersOnce(ctx)
+		// StayPrimary only: on the Promote tick pg_promote has been requested but the node may
+		// still be in recovery, so ALTER ROLE fails read-only and every failover logged a
+		// provisioning failure. The next tick observes the primary and provisions.
+		if dec.Action == reconcile.StayPrimary {
+			a.ensureManagedRolesOnce(ctx)
+		}
 		// Same reason, same place (#288 review, second pass). topologyTick is PURELY
 		// observational -- gauges only -- and it makes an apiserver pod LIST plus a psql query,
 		// both hangable. Inside act() it held opMu for its own fenceBudget() ON TOP of the
@@ -969,6 +1014,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	ls := reconcile.LocalState{
 		HasData:    process.HasData(a.cfg.PGDATA),
 		Running:    local.Reachable,
+		Saturated:  local.Saturated,
 		InRecovery: local.Role == pg.RoleStandby,
 		Timeline:   local.Timeline,
 		TimelineOK: local.TimelineOK,
@@ -980,6 +1026,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// so a standby cloned from a restored primary correctly reports none of its own.
 		RestoredAt: a.localRestoredAt(),
 	}
+	a.trackLocalSaturation(ls.Saturated, ls.Running, a.sup.Running(), time.Now())
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
 	// to a stopped node (without this a fenced primary-state node has no timeline,
@@ -988,9 +1035,20 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		if cd, err := a.readControlData(ctx); err != nil {
 			a.log.Warn("read pg_controldata", "err", err)
 		} else {
-			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 			ls.InRecovery = cd.InRecovery
-			ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK // checkpoint LSN: position for gossip ranking while stopped
+			// The checkpoint timeline and LSN stand in for a STOPPED node's position. A
+			// saturated node is running and its real position is past the last checkpoint --
+			// the timeline too, which pg_control_checkpoint reports only after the first
+			// checkpoint following a promotion -- so gossiping either would let a promoting
+			// holder rank it on stale data and promote past a node that is ahead (timelines
+			// compare first). Leave both unknown. InRecovery is still taken: self-health keys
+			// on it. Keyed on the EPISODE, not this tick: a timeout tick between refusals is
+			// the same running node, and gossiping its stale checkpoint position there would
+			// let saturatedPeerBlockingPromote settle on it and promote past this node.
+			if !ls.Saturated && a.localSaturatedSince.IsZero() {
+				ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
+				ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK
+			}
 		}
 	}
 	// The Lease holderIdentity is DCS state a namespace writer can forge, and it flows
@@ -1057,8 +1115,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// promote-distance and role-label logic downstream reads this slice, and a peer order that
 	// varied with which probe returned first would make two identical clusters disagree.
 	type peerProbe struct {
-		ps  reconcile.PeerState
-		set bool
+		ps      reconcile.PeerState
+		refused bool
+		set     bool
 	}
 	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a negative
 	// value reaches here and `make` with a negative length PANICS -- which for PID 1 is a
@@ -1074,18 +1133,26 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		go func(i int, name string) {
 			defer pwg.Done()
 			ns := a.prober.Probe(ctx, a.peerConn(name))
-			probes[i] = peerProbe{set: true, ps: reconcile.PeerState{
-				Name: name, Reachable: ns.Reachable, Role: ns.Role,
+			probes[i] = peerProbe{set: true, refused: ns.ConnRefused, ps: reconcile.PeerState{
+				Name: name, Reachable: ns.Reachable, Saturated: ns.Saturated, Role: ns.Role,
 				Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
 			}}
 		}(i, name)
 	}
 	pwg.Wait()
+	now := time.Now()
+	saturatedPeers := 0
+	probed := make(map[string]bool, len(probes))
 	for _, pr := range probes {
 		if !pr.set {
 			continue
 		}
 		name, ps := pr.ps.Name, pr.ps
+		probed[name] = true
+		ps.SaturatedWait = a.trackPeerSaturation(name, ps.Saturated, ps.Reachable, pr.refused, now)
+		if ps.Saturated {
+			saturatedPeers++
+		}
 		// An unreachable peer with fresh gossip contributes its self-reported
 		// position to the election (it is never a rewind/follow target -- only the
 		// release/handoff decision uses it).
@@ -1105,6 +1172,14 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 		o.Peers = append(o.Peers, ps)
 	}
+	// A peer that left the probe set (scale-down) must not carry its old episode start into
+	// a later one, which would skip the SaturatedWait grace on its first saturated probe.
+	for name := range a.peerSaturatedSince {
+		if !probed[name] {
+			delete(a.peerSaturatedSince, name)
+		}
+	}
+	a.metr.SetPeersSaturated(saturatedPeers)
 	// Bounded for the same reason as the gossip read above (#298 review); the marker
 	// is re-read every tick, so a deadline miss self-heals.
 	mctx, mcancel := context.WithTimeout(ctx, a.fenceBudget())
@@ -1219,7 +1294,15 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// fire an unwanted ReleaseLease failover the moment pause is lifted. On resume a
 	// still-stopped node is then treated as a startup, not a regression.
 	shouldServe := o.HoldLease && !o.Paused && o.Local.HasData && !o.Local.InRecovery
-	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
+	// A too_many_connections refusal counts as running here, within SaturationGrace: it
+	// proves the postmaster is alive and forking backends, and the step-down this tracker
+	// drives (SIGQUIT the primary, release the Lease) is for a frozen node. Treating a full
+	// primary as wedged would turn a connection storm into a write outage plus a failover;
+	// the bound keeps a primary whose slots are all held by sessions stuck on hung storage
+	// from holding the Lease forever (see localSaturationAlive).
+	now = time.Now()
+	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running || a.localSaturationAlive(now), now)
+	o.LocalSaturationExpired = a.localSaturationEpisodeExpired(now)
 	// PeersPending: the holder waits (does not promote/resume) only during a true
 	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)
 	// records peers ever SQL-reachable; once all have been seen, the wait never
@@ -1243,6 +1326,101 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// FROM it (which would deadlock-by-delay the bootstrap).
 	o.PeersPending = o.Marker.Present && anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
 	return o
+}
+
+// trackLocalSaturation publishes the local saturation gauge and tracks the saturation
+// EPISODE. The episode starts at the first too_many_connections refusal and ends only on
+// positive evidence: a probe that succeeds (reachable), or the supervised postmaster no
+// longer running (processAlive false), so the next refusal is a new server's and starts a
+// fresh grace. A failed probe does not end it: a primary on hung storage alternates between
+// refusals and timeouts, and restarting the clock on every timeout would renew
+// SaturationGrace forever and keep the Lease on a node that should step down.
+func (a *agent) trackLocalSaturation(saturated, reachable, processAlive bool, now time.Time) {
+	a.metr.SetLocalSaturated(saturated)
+	if !processAlive && !a.localSaturatedSince.IsZero() {
+		a.log.Info("local postmaster is not running; ending the saturation episode")
+		a.localSaturatedSince = time.Time{}
+		a.localSaturationExpired = false
+	}
+	if saturated && a.localSaturatedSince.IsZero() {
+		a.log.Warn("local postgres is refusing the agent's connections: max_connections exhausted; treating it as alive (no self-health step-down) for up to the saturation grace, but unobservable until a slot frees", "grace", a.cfg.SaturationGrace)
+		a.localSaturatedSince = now
+	}
+	if reachable && !a.localSaturatedSince.IsZero() {
+		a.log.Info("local postgres accepts the agent's connections again")
+		a.localSaturatedSince = time.Time{}
+		a.localSaturationExpired = false
+	}
+	a.localSaturated = saturated
+}
+
+// localSaturationAlive reports whether the local saturation episode still counts as
+// proof of life: only within cfg.SaturationGrace of its start. A primary whose storage
+// hangs fills every slot with stuck sessions and then refuses each new connection at
+// once, so without the bound it would read as alive forever, keep the Lease, and never
+// fail over. Past the grace it counts as not running and the ordinary self-health
+// step-down applies (after its own LeaseDuration grace).
+func (a *agent) localSaturationAlive(now time.Time) bool {
+	if !a.localSaturated {
+		return false
+	}
+	if now.Sub(a.localSaturatedSince) < a.cfg.SaturationGrace {
+		return true
+	}
+	if !a.localSaturationExpired {
+		a.log.Warn("local postgres has refused the agent's connections for longer than the saturation grace; no longer treating it as alive, so self-health may step it down", "grace", a.cfg.SaturationGrace, "since", a.localSaturatedSince)
+		a.localSaturationExpired = true
+	}
+	return false
+}
+
+// localSaturationEpisodeExpired reports whether the local saturation episode has lasted
+// past cfg.SaturationGrace. Unlike localSaturationAlive it holds across the failed probes
+// between refusals, because the episode does: it is what lets a lease-holding standby that
+// stays saturated release the Lease (reconcile.Observation.LocalSaturationExpired).
+func (a *agent) localSaturationEpisodeExpired(now time.Time) bool {
+	return !a.localSaturatedSince.IsZero() && now.Sub(a.localSaturatedSince) >= a.cfg.SaturationGrace
+}
+
+// trackPeerSaturation records a peer's saturation episode and reports whether a
+// lease-holding standby must still wait rather than promote past it
+// (reconcile.PeerState.SaturatedWait). A too_many_connections refusal starts an episode;
+// it ends only on positive evidence: a successful probe (reachable), or a refused TCP
+// connection (refused), which means nothing is listening, so the peer's postmaster exited
+// and a later refusal belongs to a new server. While an episode is active, any other failed probe
+// keeps the wait in force until the grace runs out: a full peer alternating between refusals
+// and timeouts is just as alive, and just as possibly ahead, on its timeout ticks -- letting
+// those ticks through would promote past it and discard its WAL (invariant 8). This is the
+// opposite of the local rule (localSaturationAlive), where uncertainty leans toward the
+// self-health step-down; for a peer it leans toward not promoting. The grace is
+// cfg.SaturationGrace from the first refusal, the same bound the saturated node applies to
+// itself: long enough to ride out a connection spike, bounded because the saturated node's own
+// agent is just as blind to it and cannot take over.
+func (a *agent) trackPeerSaturation(name string, saturated, reachable, refused bool, now time.Time) bool {
+	since, active := a.peerSaturatedSince[name]
+	if reachable {
+		if active {
+			a.log.Info("peer accepts the agent's connections again", "peer", name)
+			delete(a.peerSaturatedSince, name)
+		}
+		return false
+	}
+	if refused {
+		if active {
+			a.log.Info("peer refuses TCP connections (postmaster not running); ending its saturation episode", "peer", name)
+			delete(a.peerSaturatedSince, name)
+		}
+		return false
+	}
+	if !active {
+		if !saturated {
+			return false // an unreachable peer outside an episode is the ordinary unreachable case
+		}
+		a.log.Warn("peer is refusing the agent's connections: max_connections exhausted; treating it as alive with an unknown position", "peer", name)
+		since = now
+		a.peerSaturatedSince[name] = since
+	}
+	return now.Sub(since) < a.cfg.SaturationGrace
 }
 
 // observeStandbyStall sets Observation.StandbyStalled when this node has been a running standby
@@ -2375,13 +2553,20 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 // If it overruns, the include is silently absent and every postgresql.configuration / TLS /
 // pgbackrest setting is missing -- and standbys clone that same config.
 //
-// Presence of the directory is a faithful proxy for "some conf.d feature is enabled": the chart
-// mounts it only then. setup-config remains the authority on every later boot, including
-// removal, and EnsureConfdInclude converges either way.
+// The chart mounts conf.d on every install since 2.5.0 -- it always carries
+// reserved-connections.conf, which the agent's own reconnects and pgpool's checks depend on
+// -- so a missing or empty directory is a broken mount (a hand-edited StatefulSet, a
+// ConfigMap/volume problem), not "no conf.d feature enabled". Initialising without the
+// include would bring the cluster up with no connection reserves, silently, and standbys
+// clone that config. Refuse instead. setup-config remains the authority on every later boot,
+// and EnsureConfdInclude converges either way.
 func (a *agent) ensureConfdInclude() error {
-	entries, err := os.ReadDir(confdDir)
+	if a.confdDir == "" {
+		return errors.New("bootstrap initdb: the conf.d directory is not configured")
+	}
+	entries, err := os.ReadDir(a.confdDir)
 	if os.IsNotExist(err) {
-		return nil // the chart mounts this only when a conf.d feature is enabled
+		return fmt.Errorf("bootstrap initdb: %s does not exist; the chart always mounts the postgresql conf.d ConfigMap there (it carries reserved-connections.conf), so the mount is missing", a.confdDir)
 	}
 	if err != nil {
 		// NOT the same as "the feature is off" (#288 review). A mount or permission problem here
@@ -2389,15 +2574,15 @@ func (a *agent) ensureConfdInclude() error {
 		// postgresql.configuration / TLS / audit / archive_mode setting silently absent, cloned
 		// to every standby -- and the later repair appends include_dir AFTER the agent's own
 		// include, inverting the precedence this function is ordered to protect.
-		return fmt.Errorf("bootstrap initdb: read %s: %w", confdDir, err)
+		return fmt.Errorf("bootstrap initdb: read %s: %w", a.confdDir, err)
 	}
 	if len(entries) == 0 {
-		return nil
+		return fmt.Errorf("bootstrap initdb: %s is empty; the chart's postgresql conf.d ConfigMap always carries reserved-connections.conf, so the mount is broken", a.confdDir)
 	}
-	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
+	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), a.confdDir, true); err != nil {
 		return fmt.Errorf("bootstrap initdb: ensure the conf.d include: %w", err)
 	}
-	a.log.Info("wrote the conf.d include for a fresh native install", "dir", confdDir)
+	a.log.Info("wrote the conf.d include for a fresh native install", "dir", a.confdDir)
 	return nil
 }
 
@@ -2642,10 +2827,11 @@ func (a *agent) waitForPrimaryTimeline(ctx context.Context, budget time.Duration
 	}
 }
 
-// confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
-// pgbackrest fragments. Mounted only when one of those features is on, which is what makes its
-// presence a usable signal (#288).
-const confdDir = "/etc/postgresql/conf.d"
+// chartConfdDir is where the chart mounts the postgresql conf.d ConfigMap: the connection
+// reserves plus the operator's postgresql.configuration / TLS / audit / pgbackrest fragments.
+// Mounted on every install since 2.5.0. The agent reads it through agent.confdDir, which
+// newAgent sets to this, so tests can point it elsewhere.
+const chartConfdDir = "/etc/postgresql/conf.d"
 
 // entrypointPath is the image's entrypoint, invoked with an explicit mode. Fixed rather than
 // derived: the agent runs inside that image by construction (#288).
@@ -2739,6 +2925,51 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 	}
 }
 
+// ensureManagedRolesOnce provisions the chart's non-superuser login roles -- the
+// application role and pgpool's check role -- on this node once it is serving read-write.
+// Standbys get them by replication. Each role runs at most once per process, latching on
+// success so a transient failure retries on the next primary tick, and on a permanent
+// failure (a password the agent cannot hash) so it is reported once instead of every tick.
+// The latch is per role, so one role's retries never repeat the other. Outside
+// opMu and the fence budget for the same reason as the re-hash above.
+//
+// pgpool's init container waits until the check role can log in, so until this converges
+// a new pgpool pod stays in Init -- that, and the log line here, are where a failure shows.
+func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
+	for _, r := range []pg.ManagedRole{
+		{Name: a.cfg.AppUser, Password: a.cfg.AppPassword, Kind: pg.RoleApp},
+		{Name: a.cfg.PgpoolCheckUser, Password: a.cfg.PgpoolCheckPassword, Kind: pg.RolePgpoolCheck},
+	} {
+		// Latched per role: one role's transient failure must not re-run (and re-log) a role
+		// that already converged or failed permanently.
+		if a.managedRoleDone[r.Kind] {
+			continue
+		}
+		// Heartbeat across the call: rctx allows 30s, twice the /healthz staleness threshold on
+		// chart defaults, and an ALTER ROLE queued behind a lock would otherwise get the
+		// primary's agent liveness-killed. One budget per role, so a role stuck on a lock does
+		// not leave the other an already-expired deadline.
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := a.beatDuring(func() error {
+			return pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
+		})
+		cancel()
+		switch {
+		case err == nil:
+			a.managedRoleDone[r.Kind] = true
+			a.log.Info("managed role provisioned", "role", r.Name, "kind", r.Kind)
+		case errors.Is(err, pg.ErrRoleNotManaged):
+			a.managedRoleDone[r.Kind] = true
+			a.log.Error("managed role not provisioned: a role of that name already exists and was not created by the chart; rename the chart value, or hand the role over with COMMENT ON ROLE <name> IS 'managed by the pg chart' and restart the agent", "role", r.Name, "err", err)
+		case errors.Is(err, pg.ErrNeedsSASLprep):
+			a.managedRoleDone[r.Kind] = true
+			a.log.Error("managed role cannot be provisioned: its password needs SASLprep normalisation, which the agent does not implement; set an ASCII password in the Secret", "role", r.Name, "err", err)
+		default:
+			a.log.Warn("managed role provisioning failed (retries next primary tick)", "role", r.Name, "err", err)
+		}
+	}
+}
+
 // writePgHba assembles and writes the pg_hba.conf the agent owns in agent mode
 // (loopback + the pod CIDR, no legacy 0.0.0.0/0 md5; user POSTGRESQL_PGHBA rules
 // inserted above the network catch-alls, #144). It replaces the image's initdb
@@ -2749,7 +2980,7 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 // (#199). md5 transparently authenticates SCRAM-stored passwords too, so this is
 // compat, not a downgrade, and the pod CIDR is trusted.
 func (a *agent) writePgHba() error {
-	content := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
+	content, err := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
 		ReplicationUser: a.cfg.RepmgrUser,
 		PeerCIDR:        a.cfg.PgHbaPeerCIDR,
 		ExtraRules:      a.cfg.PgHbaRules,
@@ -2757,8 +2988,12 @@ func (a *agent) writePgHba() error {
 		ClientCertAuth:  a.cfg.TLSClientCertAuth,
 		PostgresUser:    a.cfg.PostgresUser,
 		MonitoringUser:  a.cfg.MonitoringUser,
+		PgpoolCheckUser: a.cfg.PgpoolCheckUser,
 		MD5Fallback:     true,
 	})
+	if err != nil {
+		return err
+	}
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
 
@@ -3087,9 +3322,12 @@ func (a *agent) assertPreloadedLibsPresent() error {
 		filepath.Join(a.cfg.PGDATA, "postgresql.conf"),
 		filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf"),
 	}
-	fragments, err := filepath.Glob(filepath.Join(confdDir, "*.conf"))
+	if a.confdDir == "" {
+		return errors.New("boot: the conf.d directory is not configured")
+	}
+	fragments, err := filepath.Glob(filepath.Join(a.confdDir, "*.conf"))
 	if err != nil {
-		return fmt.Errorf("boot: list %s: %w", confdDir, err)
+		return fmt.Errorf("boot: list %s: %w", a.confdDir, err)
 	}
 	paths = append(paths, fragments...)
 	// An operator-set dynamic_library_path disarms the refusal entirely. PostgreSQL resolves
@@ -3150,27 +3388,15 @@ const (
 	slotPrecreateBackoff  = 3 * time.Second
 )
 
-// durableTLInterval throttles the restartpoint check. Generous, because the condition it
-// repairs arises only when this node starts following a new timeline.
-// 15s, not a minute (#298, found by re-running the failover suite). The stamp is taken BEFORE the
-// comparison -- deliberately, so a failing read cannot spin -- which means the FIRST tick after a
-// boot consumes the whole interval, and at that moment the node has usually not started streaming
-// the new timeline yet, so there is nothing to repair. The repair therefore landed one full
-// interval later: observed as a standby that acquired the lease, refused on the highwater guard,
-// and only became promotable 55s afterwards -- long enough that a failover window can close first
-// (it made the disk-loss stage of test-agent-failover skip seven assertions). Four ticks is
-// cheap: the steady-state check is a single SQL round trip.
-const durableTLInterval = 15 * time.Second
-
-// durableTLNoAdvanceInterval backs the check off after a restartpoint that did NOT move the
-// durable timeline (#298 review).
+// durableTLNoAdvanceInterval backs the restartpoint off after one that failed or did NOT move
+// the durable timeline (#298 review).
 //
 // The no-op case is not free. PostgreSQL skips the restartpoint only when no NEWER checkpoint
 // record has been replayed; a standby working through a replay backlog behind a timeline switch
 // (or one held back by recovery_min_apply_delay) keeps replaying checkpoint records on the OLD
 // timeline, so every CHECKPOINT performs a real restartpoint -- a full flush of dirty shared
 // buffers -- while the durable timeline stays put because the switch itself has not been
-// replayed yet. At durableTLInterval that is a forced checkpoint every 15 seconds on a node
+// replayed yet. Without the backoff that is a forced checkpoint on every tick on a node
 // already saturated with replay I/O, for a repair that cannot land until replay catches up.
 // Retrying a minute apart still records the timeline long before checkpoint_timeout (5 minutes on
 // chart defaults) would have, which is the window this whole check exists to close.
@@ -3208,13 +3434,17 @@ const durableTLBudget = 10 * time.Second
 // next restartpoint. Measuring against the checkpoint TLI alone therefore called a node stale
 // that was already promotable, and forced a full restartpoint on it every interval, forever.
 //
-// Best-effort and throttled: a failed checkpoint is not an incident, it just leaves the node in
-// the state it was already in, and the next tick past the interval tries again.
+// The read runs on every tick and only the CHECKPOINT is throttled (#364). A throttle on the
+// read left a window of up to the interval between this node starting to stream a new timeline
+// and the repair; a primary lost inside it left a caught-up standby refusing to promote, with no
+// walreceiver left to show the newer timeline and trigger the repair later (observed as the
+// disk-loss stage of test-agent-failover skipping: the standby took the Lease 9s after it began
+// streaming timeline 3 and refused on the highwater guard). The steady-state read is one SQL round
+// trip per tick.
+//
+// Best-effort: a failed checkpoint is not an incident, it just leaves the node in the state it
+// was already in, and the first tick past the backoff tries again.
 func (a *agent) ensureDurableTimeline(ctx context.Context) {
-	if !a.durableTLNextAt.IsZero() && time.Now().Before(a.durableTLNextAt) {
-		return
-	}
-	a.durableTLNextAt = time.Now().Add(durableTLInterval)
 	dctx, dcancel := context.WithTimeout(ctx, durableTLBudget)
 	defer dcancel()
 	self := a.selfConn()
@@ -3223,13 +3453,16 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// defaults) -- at which point the kubelet SIGKILLs PID 1 and the postmaster it supervises.
 	// verifyTLSActive, three lines up in the same tick, is bounded by Prober.Timeout (10s), and
 	// RecoveryTimelines below is bounded by the same 10s: beating only after that read left a
-	// 20s hole -- past the threshold -- reachable whenever the two throttles (60s and 15s)
-	// coincide, which is every fourth check, not a theoretical case. It also covers the early
-	// return below, which is the COMMON path (a caught-up standby has nothing to repair) and
-	// previously beat not at all no matter how long the read took.
+	// 20s hole -- past the threshold -- whenever both run in the same tick, which is every
+	// minute. It also covers the early return below, which is the COMMON path (a caught-up
+	// standby has nothing to repair) and previously beat not at all no matter how long the read
+	// took.
 	a.metr.Beat()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {
+		return
+	}
+	if !a.durableTLNextAt.IsZero() && time.Now().Before(a.durableTLNextAt) {
 		return
 	}
 	// And again before the CHECKPOINT, which is the one call here that is slow while perfectly
@@ -3278,6 +3511,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 			"durableTimeline", uint32(after), "streamedTimeline", uint32(reported), "retryIn", durableTLNoAdvanceInterval.String())
 		return
 	}
+	a.durableTLNextAt = time.Time{}
 	a.log.Info("forced a restartpoint so the control file records the timeline this standby is streaming (#298)",
 		"was", uint32(durable), "now", uint32(after))
 }
@@ -3338,9 +3572,9 @@ func (a *agent) verifyTLSActive(ctx context.Context) {
 		a.log.Error("postgresql.tls.enabled is set but this server reports `ssl = off` -- clients are being served in PLAINTEXT. "+
 			"The usual cause is that PGDATA/postgresql.conf carries no `include_dir` for the chart's conf.d, so tls.conf was never read (#335); "+
 			"an `ssl` set in postgresql.configuration or via ALTER SYSTEM does the same. "+
-			"Fix: check `SHOW config_file` and that the file ends with include_dir = '"+confdDir+"', then reload -- `ssl` is a sighup parameter. "+
+			"Fix: check `SHOW config_file` and that the file ends with include_dir = '"+a.confdDir+"', then reload -- `ssl` is a sighup parameter. "+
 			"This pod is failing its readiness probe until then, so it serves no client traffic",
-			"confd", confdDir)
+			"confd", a.confdDir)
 	}
 }
 

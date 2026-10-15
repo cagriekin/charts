@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,8 @@ import (
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
@@ -187,6 +190,12 @@ func (f *fakeDCS) IsLeader() bool {
 func (f *fakeDCS) Leader() string { return "" }
 func (f *fakeDCS) Release()       { f.released = true }
 
+// execProber is a Prober whose SQL goes through ExecQuerier over e, so a fake Exec
+// answers probes by inspecting the psql argument list.
+func execProber(e pg.Exec) *pg.Prober {
+	return &pg.Prober{Exec: e, SQL: pg.ExecQuerier{Exec: e, Timeout: time.Second}, Timeout: time.Second}
+}
+
 // scriptedExec backs BOTH mechanism.Runner (repmgr CLI) and pg.Exec (psql) -- the
 // signatures are identical -- so one fake drives the whole Follow act() path. It
 // counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
@@ -281,7 +290,7 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dcs:    &fakeDCS{},
 		mech:   m,
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		sup:    process.NewSupervisor(pm),
 		metr:   observe.New(),
 	}
@@ -1570,7 +1579,7 @@ func TestActPromoteDoesNotClaimRoutingAfterLosingTheLease(t *testing.T) {
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dcs:    &fakeDCS{leaderSeq: []bool{true, false}}, // held at the pre-promote check, lapsed during pg_ctl promote
 		mech:   &rewindStubMech{},                        // Promote succeeds
-		prober: &pg.Prober{Exec: &slotExec{}, Timeout: time.Second},
+		prober: execProber(&slotExec{}),
 		sup:    process.NewSupervisor(&fakePostmaster{running: true}),
 		kube:   k8s.NewWithClient(cs, "ns"),
 		metr:   observe.New(),
@@ -1621,7 +1630,7 @@ func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		kube:   k8s.NewWithClient(cs, "ns"),
 		dcs:    &fakeDCS{leader: true}, // slot tests act as the holder; a lease-loss case overrides this (#298 review)
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		metr:   observe.New(),
 	}
 }
@@ -1835,6 +1844,17 @@ func TestBootstrapInitdbNativePropagatesFailure(t *testing.T) {
 	}
 }
 
+// confdFixture is a conf.d directory as the chart mounts it: never empty, it always carries
+// reserved-connections.conf.
+func confdFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "reserved-connections.conf"), []byte("superuser_reserved_connections = 5\nreserved_connections = 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func newBootstrapTestAgent(t *testing.T, ex *initdbExec, mech string) *agent {
 	t.Helper()
 	return newBootstrapTestAgentWithPM(t, ex, mech, &fakePostmaster{})
@@ -1855,14 +1875,15 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
 			Namespace: "ns", MarkerName: "pg-primary",
 		},
-		base: "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
-		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:  &fakeDCS{leader: true},
-		mech: m,
+		base:     "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
+		confdDir: confdFixture(t),
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:      &fakeDCS{leader: true},
+		mech:     m,
 		// A real k8s client over a fake apiserver, so the highwater marker write this path makes
 		// is observable rather than swallowed by a nil kube.
 		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		sup:    process.NewSupervisor(pm),
 		metr:   observe.New(),
 		// Tests must not sit out the production budget when a fake never starts a postmaster.
@@ -2266,7 +2287,7 @@ func TestObserveStandbyStallHoldsOnAProbeError(t *testing.T) {
 	}
 	before := a.standbyNoReceiverTicks
 	// Swap in a prober whose psql fails.
-	a.prober = &pg.Prober{Exec: &failingExec{}, Timeout: time.Second}
+	a.prober = execProber(&failingExec{})
 	o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
 	a.observeStandbyStall(context.Background(), &o)
 	if a.standbyNoReceiverTicks != before {
@@ -2398,7 +2419,7 @@ func (s *stallExec) Run(_ context.Context, _ []string, name string, args ...stri
 func newStallTestAgent(t *testing.T, ex *stallExec) *agent {
 	t.Helper()
 	a := newSlotTestAgent(t, nil, config.MechanismNative)
-	a.prober = &pg.Prober{Exec: ex, Timeout: time.Second}
+	a.prober = execProber(ex)
 	a.followUpstream = "pg-1" // pointed at an upstream, the precondition for a stall
 	return a
 }
@@ -2481,7 +2502,7 @@ func newInitdbMarkerAgent(t *testing.T) *agent {
 	return &agent{
 		cfg:    &config.Config{PGDATA: pgdata, PodName: "pg-0"},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prober: &pg.Prober{Exec: noopExec{}, Timeout: time.Second},
+		prober: execProber(noopExec{}),
 	}
 }
 
@@ -2627,6 +2648,7 @@ func newPreloadTestAgent(t *testing.T, mech, pgdata, modulePath string) *agent {
 		cfg:              &config.Config{PGDATA: pgdata, Mechanism: mech},
 		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
 		repmgrModulePath: modulePath,
+		confdDir:         t.TempDir(), // no fragments: nothing in conf.d asks for a library
 	}
 }
 
@@ -3262,7 +3284,7 @@ func TestMigrateForeignRecoveryConfigCarriesTheUpstreamForward(t *testing.T) {
 			fragSeededBeforePrecreate = strings.Contains(string(b), "host=pgm-0")
 		}
 	}
-	a.prober = &pg.Prober{Exec: slots, Timeout: time.Second}
+	a.prober = execProber(slots)
 	auto := filepath.Join(dir, "postgresql.auto.conf")
 	if err := os.WriteFile(auto, []byte(
 		"# Do not edit this file manually!\nprimary_conninfo = 'host=pgm-0 port=5432 user=repmgr password=hunter2'\nprimary_slot_name = 'repmgr_slot_2'\n"), 0o600); err != nil {
@@ -3330,7 +3352,7 @@ func TestMigrateForeignRecoveryConfigDoesNotCarryAPrimarysStaleUpstream(t *testi
 	a.mech = mechanism.NewNative(dir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pgm-0")
 	a.cfg.PodName = "pgm-0"
 	slots := &slotExec{}
-	a.prober = &pg.Prober{Exec: slots, Timeout: time.Second}
+	a.prober = execProber(slots)
 	auto := filepath.Join(dir, "postgresql.auto.conf")
 	if err := os.WriteFile(auto, []byte(
 		"primary_conninfo = 'host=pgm-1 port=5432 user=repmgr'\nprimary_slot_name = 'repmgr_slot_1'\n"), 0o600); err != nil {
@@ -3822,7 +3844,7 @@ func TestObservePeersAreProbedConcurrentlyAndStayOrdered(t *testing.T) {
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dcs:    &fakeDCS{}, // not the holder, so the gossip read is skipped entirely
 		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		sup:    process.NewSupervisor(&fakePostmaster{}),
 		metr:   observe.New(),
 		health: &selfHealthTracker{grace: 15 * time.Second},
@@ -3880,7 +3902,7 @@ func newTLSTestAgent(ex *tlsExec, tlsEnabled bool) *agent {
 			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
 		},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		metr:   observe.New(),
 	}
 }
@@ -4202,7 +4224,7 @@ func newDurableTLAgent(t *testing.T, ex *durableTLExec) *agent {
 	return &agent{
 		cfg:    &config.Config{PodName: "pgm-1", RepmgrUser: "repmgr", RepmgrDB: "repmgr"},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		prober: execProber(ex),
 		// ensureDurableTimeline heartbeats before the CHECKPOINT, so the harness needs a real
 		// metrics registry or the beat nil-derefs (#298 review).
 		metr: observe.New(),
@@ -4230,16 +4252,31 @@ func TestEnsureDurableTimelineForcesARestartpointWhenItLags(t *testing.T) {
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	// Throttled to the normal interval after a repair that landed.
-	if got := time.Until(a.durableTLNextAt); got > durableTLInterval || got < durableTLInterval/2 {
-		t.Errorf("next check due in %s, want ~%s (not the no-advance backoff)", got, durableTLInterval)
+	if !a.durableTLNextAt.IsZero() {
+		t.Errorf("a repair that landed must leave no backoff, got one until %s", a.durableTLNextAt)
+	}
+}
+
+// The read runs every tick, so the first tick that sees the streamed timeline ahead of the
+// durable one repairs it at once (#364). A throttled read left a window in which a primary lost
+// right after this node began streaming its timeline left the node refusing to promote.
+func TestEnsureDurableTimelineRepairsOnTheFirstLaggingTick(t *testing.T) {
+	ex := &durableTLExec{reads: []string{"2|2", "2|3", "3|3"}}
+	a := newDurableTLAgent(t, ex)
+	a.ensureDurableTimeline(context.Background())
+	if ex.checkpoints != 0 {
+		t.Fatalf("nothing to repair yet, got %d restartpoint(s)", ex.checkpoints)
+	}
+	a.ensureDurableTimeline(context.Background())
+	if ex.checkpoints != 1 {
+		t.Errorf("the next tick streams timeline 3: want one restartpoint at once, got %d", ex.checkpoints)
 	}
 }
 
 // A restartpoint PostgreSQL skipped (no newer checkpoint record replayed yet) must back the check
 // off (#298 review). Without it a standby working through a replay backlog behind a timeline
 // switch -- or one held back by recovery_min_apply_delay -- takes a forced flush of dirty shared
-// buffers every durableTLInterval, indefinitely, for a repair that cannot land until replay
+// buffers every tick, indefinitely, for a repair that cannot land until replay
 // catches up.
 func TestEnsureDurableTimelineBacksOffWhenTheRestartpointDidNotAdvanceIt(t *testing.T) {
 	ex := &durableTLExec{reads: []string{"2|3"}} // the re-read still says 2
@@ -4248,10 +4285,10 @@ func TestEnsureDurableTimelineBacksOffWhenTheRestartpointDidNotAdvanceIt(t *test
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
-	// And the throttle is honoured: a second call in the same window does nothing at all.
+	// And the backoff is honoured: a second call in the same window reads but forces nothing.
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
 		t.Errorf("the backoff did not hold: %d restartpoints", ex.checkpoints)
@@ -4287,13 +4324,13 @@ func (e *durableTLFailExec) Run(ctx context.Context, env []string, name string, 
 func TestEnsureDurableTimelineBacksOffWhenTheRestartpointFails(t *testing.T) {
 	ex := &durableTLFailExec{durableTLExec: durableTLExec{reads: []string{"2|3"}}, failCheckpoint: true}
 	a := newDurableTLAgent(t, &ex.durableTLExec)
-	a.prober = &pg.Prober{Exec: ex, Timeout: time.Second}
+	a.prober = execProber(ex)
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint attempt, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
@@ -4306,13 +4343,13 @@ func TestEnsureDurableTimelineBacksOffWhenTheRestartpointFails(t *testing.T) {
 func TestEnsureDurableTimelineBacksOffWhenTheConfirmationReadFails(t *testing.T) {
 	ex := &durableTLFailExec{durableTLExec: durableTLExec{reads: []string{"2|3"}}, failReread: true}
 	a := newDurableTLAgent(t, &ex.durableTLExec)
-	a.prober = &pg.Prober{Exec: ex, Timeout: time.Second}
+	a.prober = execProber(ex)
 	a.ensureDurableTimeline(context.Background())
 	if ex.checkpoints != 1 {
 		t.Fatalf("want exactly one restartpoint, got %d", ex.checkpoints)
 	}
-	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
-		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	if got := time.Until(a.durableTLNextAt); got < durableTLNoAdvanceInterval/2 {
+		t.Errorf("next restartpoint due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
 	}
 }
 
@@ -4340,5 +4377,455 @@ func TestUpstreamHost(t *testing.T) {
 				t.Errorf("upstreamHost(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// saturatingQuerier refuses every connection the way a node at max_connections does.
+type saturatingQuerier struct{}
+
+func (saturatingQuerier) QueryText(context.Context, pg.ConnInfo, pg.QueryKind, string) (string, error) {
+	return "", &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+}
+
+// refusingQuerier fails every connection the way a dead node does.
+type refusingQuerier struct{}
+
+func (refusingQuerier) QueryText(context.Context, pg.ConnInfo, pg.QueryKind, string) (string, error) {
+	return "", errors.New("dial tcp: connect: connection refused")
+}
+
+func saturationTestAgent(t *testing.T, q pg.Querier) *agent {
+	t.Helper()
+	pgdata := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agent{
+		cfg: &config.Config{
+			PGDATA: pgdata, HeadlessService: "h", PodName: "pg-0", NodeCount: 3,
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RenewDeadline: 2 * time.Second,
+			LeaseDuration: 15 * time.Second, SaturationGrace: time.Minute,
+		},
+		base:               "pg",
+		log:                slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:                &fakeDCS{leader: true},
+		kube:               k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
+		prober:             &pg.Prober{Exec: noopExec{}, SQL: q, Timeout: time.Second},
+		sup:                process.NewSupervisor(&fakePostmaster{}),
+		metr:               observe.New(),
+		peersSeen:          map[string]bool{},
+		peerSaturatedSince: map[string]time.Time{},
+		// A primary that was running and whose grace has already elapsed: the next
+		// unhealthy observation past the first one trips the step-down.
+		health: &selfHealthTracker{grace: time.Nanosecond, wasRunning: true},
+	}
+}
+
+// A primary at max_connections refuses the agent's probe, but that refusal proves it is
+// alive: the self-health step-down (SIGQUIT the primary, release the Lease) must not arm.
+// The same observation with a dead node's error does trip it, so the suppression is keyed
+// on the SQLSTATE, not on probe failure in general.
+func TestObserveSaturatedPrimaryIsNotSteppedDown(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	var o reconcile.Observation
+	for i := 0; i < 3; i++ {
+		o = a.observe(context.Background())
+	}
+	if !o.Local.Saturated || o.Local.Running {
+		t.Fatalf("local = %+v, want Saturated and not Running", o.Local)
+	}
+	if o.LocalStuck {
+		t.Error("a saturated primary was declared stuck; self-health would step it down")
+	}
+	if len(o.Peers) != 2 {
+		t.Fatalf("peers = %+v", o.Peers)
+	}
+	for _, p := range o.Peers {
+		if !p.Saturated || !p.SaturatedWait || p.Reachable {
+			t.Errorf("peer %s = %+v, want Saturated within its grace and not Reachable", p.Name, p)
+		}
+	}
+	if !a.localSaturated {
+		t.Error("the local saturation transition was not latched")
+	}
+
+	dead := saturationTestAgent(t, refusingQuerier{})
+	for i := 0; i < 3; i++ {
+		o = dead.observe(context.Background())
+	}
+	if !o.LocalStuck {
+		t.Error("control: a primary failing probes for a non-saturation reason must still trip self-health")
+	}
+	if o.Local.Saturated {
+		t.Error("control: connection refused was classified as saturation")
+	}
+}
+
+// A peer's saturation grace starts at its first saturated probe, ends after SaturationGrace,
+// and restarts after the peer answers again.
+func TestTrackPeerSaturationGrace(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.cfg.SaturationGrace
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0) {
+		t.Fatal("the first saturated probe must start the grace")
+	}
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(grace-time.Second)) {
+		t.Error("still inside the grace")
+	}
+	if a.trackPeerSaturation("pg-1", true, false, false, t0.Add(grace)) {
+		t.Error("the grace must end after SaturationGrace")
+	}
+	if a.trackPeerSaturation("pg-1", false, true, false, t0.Add(grace+time.Second)) {
+		t.Error("an answering peer is never in the wait")
+	}
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(2*grace)) {
+		t.Error("a new saturation episode must start a fresh grace")
+	}
+}
+
+// Only a successful probe ends a peer's episode, and while it is active every failed probe --
+// a timeout as much as a refusal -- keeps the standby waiting until the grace runs out. A full
+// peer alternating between refusals and timeouts may still be ahead on its timeout ticks;
+// letting those through would promote past it (invariant 8). The timeouts must not restart
+// the grace either.
+func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.cfg.SaturationGrace
+	if a.trackPeerSaturation("pg-1", false, false, false, t0) {
+		t.Error("an unreachable peer outside an episode is not saturated")
+	}
+	a.trackPeerSaturation("pg-1", true, false, false, t0)
+	if !a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace/2)) {
+		t.Error("a timeout tick inside an active episode must keep the standby waiting")
+	}
+	if a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace)) {
+		t.Error("the grace runs from the FIRST refusal; the timeouts must not have restarted it")
+	}
+	if a.trackPeerSaturation("pg-1", false, true, false, t0.Add(grace+time.Second)) {
+		t.Error("a successful probe ends the episode")
+	}
+	if a.trackPeerSaturation("pg-1", false, false, false, t0.Add(grace+2*time.Second)) {
+		t.Error("after the episode ended, a timeout is the ordinary unreachable case")
+	}
+}
+
+// A refused TCP connection means the peer's postmaster exited, so it ends the episode: the
+// next refusal belongs to a new server and gets a fresh grace instead of an expired one.
+func TestTrackPeerSaturationEndsOnRefusedConnection(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	grace := a.cfg.SaturationGrace
+	a.trackPeerSaturation("pg-1", true, false, false, t0)
+	if a.trackPeerSaturation("pg-1", false, false, true, t0.Add(grace/2)) {
+		t.Error("a refused connection ends the episode; the standby no longer waits on it")
+	}
+	if _, active := a.peerSaturatedSince["pg-1"]; active {
+		t.Error("the episode must be cleared")
+	}
+	if !a.trackPeerSaturation("pg-1", true, false, false, t0.Add(2*grace)) {
+		t.Error("a refusal after the restart must start a fresh grace")
+	}
+}
+
+// roleRunExec fails provisioning for the roles named in fail and counts runs per role.
+type roleRunExec struct {
+	fail map[string]bool
+	runs map[string]int
+}
+
+func (r *roleRunExec) RunStdin(_ context.Context, _ []string, _, _ string, args ...string) error {
+	role := ""
+	for _, a := range args {
+		if v, ok := strings.CutPrefix(a, "r="); ok {
+			role = v
+		}
+	}
+	r.runs[role]++
+	if r.fail[role] {
+		return errors.New("psql: transient failure")
+	}
+	return nil
+}
+
+// A role that converged is not re-run while the other keeps failing, and a permanent
+// failure (a password needing SASLprep) is latched instead of retried every tick.
+func TestEnsureManagedRolesLatchesPerRole(t *testing.T) {
+	ex := &roleRunExec{fail: map[string]bool{"pgpool_check": true}, runs: map[string]int{}}
+	a := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pw",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        ex,
+		managedRoleDone: map[pg.RoleKind]bool{},
+	}
+	for i := 0; i < 3; i++ {
+		a.ensureManagedRolesOnce(context.Background())
+	}
+	if ex.runs["app_user"] != 1 {
+		t.Errorf("the converged app role ran %d times, want 1", ex.runs["app_user"])
+	}
+	if ex.runs["pgpool_check"] != 3 {
+		t.Errorf("the failing check role ran %d times, want a retry every call (3)", ex.runs["pgpool_check"])
+	}
+	ex.fail["pgpool_check"] = false
+	a.ensureManagedRolesOnce(context.Background())
+	a.ensureManagedRolesOnce(context.Background())
+	if ex.runs["pgpool_check"] != 4 {
+		t.Errorf("the check role ran %d times, want it latched after converging (4)", ex.runs["pgpool_check"])
+	}
+
+	perm := &roleRunExec{fail: map[string]bool{}, runs: map[string]int{}}
+	b := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pässwörd ",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        perm,
+		managedRoleDone: map[pg.RoleKind]bool{},
+	}
+	b.ensureManagedRolesOnce(context.Background())
+	b.ensureManagedRolesOnce(context.Background())
+	if !b.managedRoleDone[pg.RoleApp] {
+		t.Error("a permanent failure must latch the role")
+	}
+	if perm.runs["app_user"] != 0 {
+		t.Errorf("a password needing SASLprep never reaches psql, ran %d times", perm.runs["app_user"])
+	}
+}
+
+// notManagedExec refuses provisioning the way ensureRoleSQL does for a same-named role the
+// chart did not create.
+type notManagedExec struct{ runs int }
+
+func (n *notManagedExec) RunStdin(context.Context, []string, string, string, ...string) error {
+	n.runs++
+	return errors.New(`psql: exit status 3: ERROR:  role app_user already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE app_user IS 'managed by the pg chart'`)
+}
+
+// A foreign same-named role is reported once and latched, never retried every tick.
+func TestEnsureManagedRolesLatchesAForeignRole(t *testing.T) {
+	ex := &notManagedExec{}
+	a := &agent{
+		cfg: &config.Config{
+			PostgresUser: "postgres", PostgresDB: "postgres",
+			AppUser: "app_user", AppPassword: "pw",
+			PgpoolCheckUser: "pgpool_check", PgpoolCheckPassword: "pw",
+		},
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metr:            observe.New(),
+		roleExec:        ex,
+		managedRoleDone: map[pg.RoleKind]bool{},
+	}
+	for i := 0; i < 3; i++ {
+		a.ensureManagedRolesOnce(context.Background())
+	}
+	if ex.runs != 2 {
+		t.Errorf("want one attempt per role, then latched; got %d runs", ex.runs)
+	}
+	if !a.managedRoleDone[pg.RoleApp] || !a.managedRoleDone[pg.RolePgpoolCheck] {
+		t.Error("a foreign role must latch its slot")
+	}
+}
+
+// Saturation counts as alive only within SaturationGrace. A primary whose slots are all
+// held by sessions stuck on hung storage refuses every new connection at once; past the
+// grace it must become eligible for the self-health step-down again, or it would hold the
+// Lease forever.
+func TestObserveSaturationPastTheGraceIsNotAlive(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	a.cfg.SaturationGrace = time.Nanosecond
+	var o reconcile.Observation
+	for i := 0; i < 3; i++ {
+		o = a.observe(context.Background())
+	}
+	if !o.Local.Saturated {
+		t.Fatal("the local node must still read as saturated")
+	}
+	if !o.LocalStuck {
+		t.Error("a primary saturated past the grace must trip self-health")
+	}
+	if !o.LocalSaturationExpired {
+		t.Error("observe must report the expired episode")
+	}
+	if !a.localSaturationExpired {
+		t.Error("the expiry must be latched (logged once)")
+	}
+}
+
+// The grace is per episode: a node that answers again and later saturates starts a fresh one.
+func TestLocalSaturationGraceIsPerEpisode(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, false, true, t0)
+	if !a.localSaturationAlive(t0.Add(30 * time.Second)) {
+		t.Error("inside the grace a saturated node counts as alive")
+	}
+	if a.localSaturationAlive(t0.Add(2 * time.Minute)) {
+		t.Error("past the grace it must not")
+	}
+	a.trackLocalSaturation(false, true, true, t0.Add(3*time.Minute))
+	a.trackLocalSaturation(true, false, true, t0.Add(4*time.Minute))
+	if !a.localSaturationAlive(t0.Add(4*time.Minute + 30*time.Second)) {
+		t.Error("a new episode must start a fresh grace")
+	}
+	if a.localSaturationExpired {
+		t.Error("the expiry latch must reset when the node answers again")
+	}
+}
+
+// A primary on hung storage alternates between too_many_connections and timeouts. Only a
+// successful probe ends the episode, so the timeouts cannot renew SaturationGrace and keep
+// a node that should step down holding the Lease.
+func TestLocalSaturationGraceSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, false, true, t0)
+	a.trackLocalSaturation(false, false, true, t0.Add(g/4)) // timeout: neither saturated nor reachable
+	if a.localSaturationAlive(t0.Add(g / 4)) {
+		t.Error("a timeout tick is not proof of life")
+	}
+	a.trackLocalSaturation(true, false, true, t0.Add(g*3/4))
+	if !a.localSaturationAlive(t0.Add(g * 3 / 4)) {
+		t.Error("still inside the original grace")
+	}
+	a.trackLocalSaturation(true, false, true, t0.Add(g))
+	if a.localSaturationAlive(t0.Add(g)) {
+		t.Error("the grace runs from the FIRST refusal; the timeout in between must not have restarted it")
+	}
+}
+
+// The episode ends when the supervised postmaster stops: a refusal after a restart is a new
+// server's and must get a fresh grace, not inherit the old episode's expiry.
+func TestLocalSaturationEpisodeEndsWhenPostmasterStops(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	a.trackLocalSaturation(true, false, true, t0)
+	if !a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Fatal("control: the episode expires at the grace")
+	}
+	a.trackLocalSaturation(false, false, false, t0.Add(g))
+	if a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Error("a stopped postmaster must end the episode")
+	}
+	a.trackLocalSaturation(true, false, true, t0.Add(g+time.Second))
+	if !a.localSaturationAlive(t0.Add(g + 2*time.Second)) {
+		t.Error("a refusal after the restart must start a fresh grace")
+	}
+}
+
+// The expiry that releases a saturated standby's Lease holds across the timeout ticks
+// between refusals, as the episode does.
+func TestLocalSaturationEpisodeExpiredSurvivesTimeouts(t *testing.T) {
+	a := saturationTestAgent(t, saturatingQuerier{})
+	g := a.cfg.SaturationGrace
+	t0 := time.Unix(1_700_000_000, 0)
+	if a.localSaturationEpisodeExpired(t0.Add(10 * g)) {
+		t.Error("no episode, no expiry")
+	}
+	a.trackLocalSaturation(true, false, true, t0)
+	if a.localSaturationEpisodeExpired(t0.Add(g - time.Second)) {
+		t.Error("inside the grace")
+	}
+	a.trackLocalSaturation(false, false, true, t0.Add(g)) // timeout tick
+	if !a.localSaturationEpisodeExpired(t0.Add(g)) {
+		t.Error("a timeout tick past the grace must still report the expiry")
+	}
+	a.trackLocalSaturation(false, true, true, t0.Add(g+time.Second))
+	if a.localSaturationEpisodeExpired(t0.Add(g + time.Second)) {
+		t.Error("a successful probe ends the episode")
+	}
+}
+
+// switchingQuerier refuses with too_many_connections until timeout is set, then fails
+// every probe the way a timed-out connect does.
+type switchingQuerier struct{ timeout atomic.Bool }
+
+func (q *switchingQuerier) QueryText(ctx context.Context, ci pg.ConnInfo, k pg.QueryKind, s string) (string, error) {
+	if q.timeout.Load() {
+		return "", context.DeadlineExceeded
+	}
+	return saturatingQuerier{}.QueryText(ctx, ci, k, s)
+}
+
+// A timeout tick inside a saturation episode must not gossip the pg_controldata checkpoint
+// position: the node is still running and ahead of it, and a peer's promote check settles on
+// any known gossiped position.
+func TestObserveSaturationEpisodeHidesCheckpointPositionOnTimeoutTicks(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "pg_controldata")
+	script := "#!/bin/sh\n" +
+		"echo \"Database cluster state:               in archive recovery\"\n" +
+		"echo \"Latest checkpoint location:           0/3000000\"\n" +
+		"echo \"Latest checkpoint's TimeLineID:       3\"\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	control := saturationTestAgent(t, refusingQuerier{})
+	control.sup = process.NewSupervisor(&fakePostmaster{running: true})
+	control.pgControlDataBin = bin
+	if o := control.observe(context.Background()); !o.Local.TimelineOK || !o.Local.LSNOK {
+		t.Fatalf("control: outside an episode the checkpoint position stands in, got %+v", o.Local)
+	}
+
+	q := &switchingQuerier{}
+	a := saturationTestAgent(t, q)
+	a.sup = process.NewSupervisor(&fakePostmaster{running: true})
+	a.pgControlDataBin = bin
+	if o := a.observe(context.Background()); o.Local.TimelineOK || o.Local.LSNOK {
+		t.Fatalf("saturated tick gossiped a checkpoint position: %+v", o.Local)
+	}
+	q.timeout.Store(true)
+	o := a.observe(context.Background())
+	if o.Local.Saturated {
+		t.Fatal("the timeout tick must not read as saturated")
+	}
+	if o.Local.TimelineOK || o.Local.LSNOK {
+		t.Errorf("timeout tick inside the episode gossiped the stale checkpoint position: %+v", o.Local)
+	}
+	if !o.Local.InRecovery {
+		t.Error("InRecovery must still come from pg_controldata")
+	}
+}
+
+// Since 2.5.0 the chart always mounts conf.d (it carries reserved-connections.conf), so a
+// fresh native initdb refuses a missing or empty directory instead of initialising a cluster
+// with no connection reserves.
+func TestEnsureConfdIncludeRefusesAMissingOrEmptyMount(t *testing.T) {
+	for name, dir := range map[string]string{
+		"missing": filepath.Join(t.TempDir(), "absent"),
+		"empty":   t.TempDir(),
+	} {
+		a := &agent{cfg: &config.Config{PGDATA: t.TempDir()}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), confdDir: dir}
+		if err := a.ensureConfdInclude(); err == nil || !strings.Contains(err.Error(), "reserved-connections.conf") {
+			t.Errorf("%s conf.d: want a refusal naming reserved-connections.conf, got %v", name, err)
+		}
+	}
+	a := &agent{cfg: &config.Config{PGDATA: t.TempDir()}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := a.ensureConfdInclude(); err == nil {
+		t.Error("an unset conf.d directory must be refused")
+	}
+	pgdata := t.TempDir()
+	writePGDATAConf(t, pgdata, "max_connections = 100\n")
+	ok := &agent{cfg: &config.Config{PGDATA: pgdata}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), confdDir: confdFixture(t)}
+	if err := ok.ensureConfdInclude(); err != nil {
+		t.Fatalf("a populated conf.d must be wired in: %v", err)
+	}
+	conf, err := os.ReadFile(filepath.Join(pgdata, "postgresql.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(conf), "include_dir = '"+ok.confdDir+"'") {
+		t.Errorf("include_dir not written: %s", conf)
 	}
 }

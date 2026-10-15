@@ -18,7 +18,7 @@ func (f fakeReplayExec) Run(context.Context, []string, string, ...string) (strin
 }
 
 func replayProber(out string, err error) *Prober {
-	return &Prober{Exec: fakeReplayExec{out: out, err: err}}
+	return execProber(fakeReplayExec{out: out, err: err})
 }
 
 func TestReplayProgressRecovering(t *testing.T) {

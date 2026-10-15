@@ -1,0 +1,410 @@
+package pg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// Querier runs one SQL text against a node and returns the result the way `psql -tA`
+// prints it: rows separated by newlines, columns by '|', NULL as the empty string, the
+// whole thing trimmed, and only the LAST statement's result when the text holds several.
+// Every parser in this package was written against that shape, so the transport
+// underneath can change without touching a single parser (#364).
+type Querier interface {
+	QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error)
+}
+
+// QueryKind says whether a statement may be sent twice. ConnCache retries a query whose
+// reused socket failed on a fresh connection; for a read that is always safe, but a write
+// may already have run on the server when the reply was lost, and running it again changes
+// what the caller sees (a slot already dropped reads as "nothing to drop") or repeats work
+// (CHECKPOINT, ALTER SYSTEM). Writes therefore fail on the stale socket and the next tick
+// runs them on a fresh connection, after re-reading state.
+type QueryKind int
+
+const (
+	QueryRead QueryKind = iota
+	QueryWrite
+)
+
+// ExecQuerier is the original transport: a fresh `psql` process per query. It stays for
+// the unit tests, whose fakes answer by inspecting the psql argument list, and as the
+// documented shape of what ConnCache replaced. Not used by the agent binary: every probe
+// through it paid a process start -- and in the pg-ha image `psql` on PATH is Debian's
+// Perl wrapper, ~18ms of CPU before libpq even dialled -- at six to nine probes per tick
+// per pod, which came to over half a core per idle pod on slow vCPUs (#364).
+type ExecQuerier struct {
+	Exec    Exec
+	Timeout time.Duration
+}
+
+func (q ExecQuerier) QueryText(ctx context.Context, ci ConnInfo, _ QueryKind, sql string) (string, error) {
+	if q.Timeout <= 0 {
+		return "", fmt.Errorf("ExecQuerier: Timeout must be positive, got %s", q.Timeout)
+	}
+	env := []string{
+		"PGPASSWORD=" + ci.Password,
+		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(q.Timeout.Seconds())),
+	}
+	// --no-psqlrc: every caller parses psql's OUTPUT SHAPE, and a startup file can change
+	// all of it (`\pset fieldsep`, `\pset null`, a banner) while psql still exits 0 (#298).
+	args := []string{"--no-psqlrc", "-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
+	return q.Exec.Run(ctx, env, "psql", args...)
+}
+
+// sqlConn is the slice of a server connection the cache needs; pgconn implements it
+// through pgConn, tests through fakes.
+type sqlConn interface {
+	// exec runs sql with the simple protocol and returns the LAST statement's rows in
+	// text format (nil cell = NULL). Multi-statement texts are allowed, as in `psql -c`.
+	exec(ctx context.Context, sql string) ([][][]byte, error)
+	closed() bool
+	close(ctx context.Context)
+}
+
+type pgConn struct{ c *pgconn.PgConn }
+
+func (p pgConn) exec(ctx context.Context, sql string) ([][][]byte, error) {
+	results, err := p.c.Exec(ctx, sql).ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return results[len(results)-1].Rows, nil
+}
+func (p pgConn) closed() bool              { return p.c.IsClosed() }
+func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
+
+// ConnCache is the agent's transport: one persistent server connection per node,
+// dialled on first use and kept across reconcile ticks, so a probe is one round trip on
+// an open socket instead of a process start, a TCP connect, an authentication exchange
+// and a backend fork (#364).
+//
+// Liveness is bounded twice. The caller's deadline bounds every query: pgconn cancels
+// and closes the connection when it passes, so a stale socket cannot hide a dead peer
+// behind more than the timeout the old transport already had (PGCONNECT_TIMEOUT). And
+// TCP_USER_TIMEOUT (tcpUserTimeout) bounds a socket whose peer has VANISHED -- a pod
+// recreated on a new IP while the old IP silently drops packets: the kernel fails the
+// socket once sent data has gone unacknowledged that long, well inside the probe
+// deadline, so a READ that fails on the REUSED connection is retried once on a fresh dial
+// within the same call and the tick sees what a fresh psql would have seen (a write is
+// not re-sent; see QueryKind). A slow query is not affected: the server still
+// acknowledges what was sent.
+//
+// A server-side ERROR keeps the connection (the session is still usable); a FATAL or a
+// transport error drops it. Entries idle longer than idleTTL -- a scaled-down ordinal, an
+// upstream the agent no longer probes -- are closed and forgotten on the next query.
+//
+// Connections are dialled from the same libpq environment psql used -- PGSSLMODE,
+// PGSSLROOTCERT and friends are honoured by pgconn's config parser -- with host, port,
+// user, database and connect_timeout set explicitly and the password from ConnInfo,
+// which is required (no .pgpass fallback: every caller passes the replication password
+// config.Load requires, so an empty one is a bug, refused up front). The password is set on
+// the parsed config, never written into the connection string, so a parse error (which
+// pgx quotes with only partial password redaction) cannot leak it. Sessions identify as
+// application_name=pg-ha-agent in pg_stat_activity.
+type ConnCache struct {
+	// dial opens a connection for dsn, authenticating with password (required; QueryText
+	// refuses an empty one).
+	dial    func(ctx context.Context, dsn, password string) (sqlConn, error)
+	idleTTL time.Duration
+	now     func() time.Time
+
+	mu       sync.Mutex
+	entries  map[string]*cacheEntry
+	isClosed bool
+	// evicting tracks background closes of evicted connections, so Close can wait for them.
+	evicting sync.WaitGroup
+}
+
+// evictCloseTimeout bounds the Terminate exchange of one evicted connection. Evicted
+// connections belong to nodes the agent stopped probing, so the close runs in the
+// background on its own budget rather than on the deadline of whichever probe happened
+// to trigger the sweep.
+const evictCloseTimeout = time.Second
+
+// connIdleTTL is how long an unused entry is kept. Every reconcile tick probes every
+// current member, so only nodes the agent stopped probing reach it; a reconcile interval
+// longer than this just costs one dial per tick.
+const connIdleTTL = 5 * time.Minute
+
+// tcpUserTimeout is how long sent data may go unacknowledged before the kernel fails the
+// socket. On Linux it also caps the SYN retries of a connect. Short enough that a vanished
+// peer fails with half the 10s probe deadline left for the redial; long enough that a
+// healthy peer behind a few seconds of packet loss is not reported unreachable -- a
+// result that feeds survivor ranking and failover.
+const tcpUserTimeout = 5 * time.Second
+
+// cacheEntry serialises use of one connection: pgconn connections are not safe for
+// concurrent use, and the control API can probe the same node the reconcile loop is
+// probing. Holding the entry lock for the whole query keeps the two in order. The lock is
+// a one-slot channel rather than a sync.Mutex so a waiter gives up at its own deadline
+// instead of queueing past it behind a query hung on a dead peer.
+type cacheEntry struct {
+	sem  chan struct{}
+	conn sqlConn
+	// lastUsed is guarded by ConnCache.mu, not by sem, so the idle sweep can read it
+	// without waiting on a query.
+	lastUsed time.Time
+}
+
+func (e *cacheEntry) lock(ctx context.Context) error {
+	select {
+	case e.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *cacheEntry) unlock() { <-e.sem }
+
+// NewConnCache returns a cache that dials real PostgreSQL connections.
+func NewConnCache() *ConnCache {
+	dialer := &net.Dialer{
+		// Keepalives catch a dead socket that sits idle between ticks; TCP_USER_TIMEOUT
+		// also caps how long the kernel keeps probing it.
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: 15 * time.Second, Interval: 5 * time.Second, Count: 3},
+		Control:         setTCPUserTimeout(tcpUserTimeout),
+	}
+	return &ConnCache{
+		dial: func(ctx context.Context, dsn, password string) (sqlConn, error) {
+			cfg, err := pgconn.ParseConfig(dsn)
+			if err != nil {
+				return nil, err
+			}
+			// A custom DialFunc, not a tcp_user_timeout keyword: pgconn does not know that
+			// keyword and would send it to the server as a run-time parameter.
+			cfg.DialFunc = dialer.DialContext
+			cfg.Password = password
+			c, err := pgconn.ConnectConfig(ctx, cfg)
+			if err != nil {
+				return nil, err
+			}
+			return pgConn{c: c}, nil
+		},
+		idleTTL: connIdleTTL,
+		now:     time.Now,
+	}
+}
+
+// QueryText implements Querier. The deadline is the caller's (Prober sets it from its
+// Timeout); connect_timeout mirrors it so a dial never outlives the probe either.
+func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error) {
+	if c.dial == nil || c.now == nil || c.idleTTL <= 0 {
+		return "", errors.New("connection cache is not initialised (use NewConnCache)")
+	}
+	// Every caller passes the replication password, which config.Load requires. An empty
+	// one must fail here rather than fall back to .pgpass or the libpq environment, where it
+	// would surface as an authentication failure that reads like an unreachable node.
+	if ci.Password == "" {
+		return "", fmt.Errorf("connection cache: no password for %s@%s", ci.User, ci.Host)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return "", errors.New("connection cache: query context has no deadline")
+	}
+	key := ci.Host + ":" + strconv.Itoa(ci.Port) + ":" + ci.User + ":" + ci.DB
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return "", errors.New("connection cache is closed")
+	}
+	if c.entries == nil {
+		c.entries = map[string]*cacheEntry{}
+	}
+	now := c.now()
+	evicted := c.evictIdleLocked(now, key)
+	e := c.entries[key]
+	if e == nil {
+		e = &cacheEntry{sem: make(chan struct{}, 1)}
+		c.entries[key] = e
+	}
+	e.lastUsed = now
+	// Added under c.mu, which Close takes to set isClosed before it waits: an Add after
+	// the unlock could land after Close's Wait returned and leak a close past shutdown.
+	c.evicting.Add(len(evicted))
+	c.mu.Unlock()
+	for _, old := range evicted {
+		go func(old *cacheEntry) {
+			defer c.evicting.Done()
+			cctx, cancel := context.WithTimeout(context.Background(), evictCloseTimeout)
+			defer cancel()
+			c.drop(cctx, old)
+			old.unlock()
+		}(old)
+	}
+
+	if err := e.lock(ctx); err != nil {
+		return "", err
+	}
+	defer e.unlock()
+	// Close may have swept this entry while we waited for it; dialling now would open a
+	// session Close never sees.
+	if c.closing() {
+		return "", errors.New("connection cache is closed")
+	}
+	// A reused socket that fails may only mean the peer restarted since the last tick, so a
+	// READ gets one fresh dial inside the same deadline: the probe then reports what a fresh
+	// connection sees rather than a stale one's error. A fresh dial is never retried, and
+	// neither is a write (see QueryKind).
+	for {
+		reused := e.conn != nil && !e.conn.closed()
+		if !reused {
+			if err := c.redial(ctx, deadline, e, ci); err != nil {
+				return "", err
+			}
+		}
+		rows, err := e.conn.exec(ctx, sql)
+		if err == nil {
+			return formatRows(rows), nil
+		}
+		if keepOnServerError(err, e) {
+			return "", err
+		}
+		c.drop(ctx, e)
+		if !reused || kind != QueryRead || ctx.Err() != nil {
+			return "", err
+		}
+		// Close may have started while the query ran; a redial now would open a session it
+		// never terminates.
+		if c.closing() {
+			return "", err
+		}
+	}
+}
+
+func (c *ConnCache) closing() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isClosed
+}
+
+// keepOnServerError reports whether err is a server-side ERROR (permission denied, a
+// RAISE, a duplicate slot) that left the session usable: such an error would recur on a
+// fresh dial, so the connection is kept and the statement not retried. A FATAL (e.g.
+// admin shutdown on a restarted peer) closes the session, so it is not kept.
+func keepOnServerError(err error, e *cacheEntry) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && !e.conn.closed()
+}
+
+func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+	secs := int(time.Until(deadline).Seconds())
+	// connect_timeout=0 means "wait forever" to libpq and pgconn; ctx still bounds the dial.
+	if secs < 1 {
+		secs = 1
+	}
+	conn, err := c.dial(ctx, connString(ci, secs), ci.Password)
+	if err != nil {
+		return err
+	}
+	e.conn = conn
+	return nil
+}
+
+// evictIdleLocked removes every entry other than keep that has been unused for idleTTL
+// and is not in use, and returns them still locked so the caller can close their
+// connections after releasing c.mu. An entry whose lock is held is skipped, never
+// waited on: it is in use, so it will be swept on a later call once it goes idle.
+// Called with c.mu held.
+func (c *ConnCache) evictIdleLocked(now time.Time, keep string) []*cacheEntry {
+	var out []*cacheEntry
+	for k, e := range c.entries {
+		if k == keep || now.Sub(e.lastUsed) < c.idleTTL {
+			continue
+		}
+		select {
+		case e.sem <- struct{}{}:
+			delete(c.entries, k)
+			out = append(out, e)
+		default:
+		}
+	}
+	return out
+}
+
+func (c *ConnCache) drop(ctx context.Context, e *cacheEntry) {
+	if e.conn != nil {
+		e.conn.close(ctx)
+		e.conn = nil
+	}
+}
+
+// Close terminates every cached connection cleanly (shutdown), so the nodes see a
+// Terminate message instead of logging an unexpected EOF for each agent session. The
+// cache refuses further queries once Close starts. The cache lock is released before
+// waiting on any entry, and each wait is bounded by ctx: an entry still held by a query
+// hung on a dead peer is reported, not waited out, and its socket goes with the process.
+func (c *ConnCache) Close(ctx context.Context) error {
+	c.mu.Lock()
+	c.isClosed = true
+	entries := make(map[string]*cacheEntry, len(c.entries))
+	for k, e := range c.entries {
+		entries[k] = e
+	}
+	c.mu.Unlock()
+
+	var errs []error
+	for key, e := range entries {
+		if err := e.lock(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("close %s: %w", key, err))
+			continue
+		}
+		c.drop(ctx, e)
+		e.unlock()
+	}
+	// Background closes of evicted entries are already bounded by evictCloseTimeout.
+	c.evicting.Wait()
+	return errors.Join(errs...)
+}
+
+// connString builds the libpq keyword/value string for ci, without the password (see
+// ConnCache: it is set on the parsed config instead). Values are quoted the way
+// libpq and pgconn expect (backslash-escaped, single-quoted), so a database or user name
+// with a space or quote cannot inject keywords -- the conninfo-injection class the agent
+// guards the Lease holder name against (#298) applies here too.
+func connString(ci ConnInfo, connectTimeoutSecs int) string {
+	parts := []string{
+		"host=" + quoteConnValue(ci.Host),
+		"port=" + strconv.Itoa(ci.Port),
+		"user=" + quoteConnValue(ci.User),
+		"dbname=" + quoteConnValue(ci.DB),
+		"connect_timeout=" + strconv.Itoa(connectTimeoutSecs),
+		"application_name=pg-ha-agent",
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteConnValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `'`, `\'`)
+	return "'" + v + "'"
+}
+
+// formatRows renders text-format rows as `psql -tA` would print them.
+func formatRows(rows [][][]byte) string {
+	var b strings.Builder
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		for j, cell := range row {
+			if j > 0 {
+				b.WriteByte('|')
+			}
+			b.Write(cell) // nil (NULL) writes nothing, which is psql's default null display
+		}
+	}
+	return strings.TrimSpace(b.String())
+}

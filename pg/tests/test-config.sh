@@ -38,6 +38,13 @@ probe_lab_350 "${NAMESPACE}" "${POD}"
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem is 64MB" "64MB" "${work_mem}"
 
+# conf.d must be loaded by the FIRST server start of a fresh install, not by a later reload:
+# postmaster-level settings (max_connections here; reserved_connections, which pgpool's check
+# role depends on) only apply at start. A conf.d added after the start shows the new value as
+# pending_restart with the old one still live.
+max_conn=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT setting || ':' || pending_restart FROM pg_settings WHERE name = 'max_connections'" "testuser" "testdb")
+assert_eq "postmaster-level conf.d setting is live at first start (max_connections=120, no pending restart)" "120:false" "${max_conn}"
+
 maint_work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW maintenance_work_mem" "testuser" "testdb")
 assert_eq "maintenance_work_mem is 128MB" "128MB" "${maint_work_mem}"
 
@@ -95,12 +102,20 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 30
 pod_phase=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.status.phase}')
 assert_eq "pod Running after configuration disabled" "Running" "${pod_phase}"
 
-# Exact match: stock initdb postgresql.conf ships a commented
-# "#include_dir = '...'" documentation line that must not count
+# The conf.d ConfigMap always renders now (it carries reserved-connections.conf), so the
+# mount never goes away and include_dir is kept rather than stripped: it can no longer point
+# at a missing directory, which is what #107 guarded against. Exact match: stock initdb
+# postgresql.conf ships a commented "#include_dir = '...'" documentation line that must not
+# count.
 include_rc=0
 kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
   grep -q "^include_dir = '/etc/postgresql/conf.d'" /var/lib/postgresql/data/pgdata/postgresql.conf 2>/dev/null || include_rc=$?
-assert_eq "stale include_dir stripped from postgresql.conf" "1" "${include_rc}"
+assert_eq "include_dir kept: conf.d stays mounted with configuration disabled" "0" "${include_rc}"
+
+# By source file, not value: standalone's 3 is also PostgreSQL's default, so the value alone
+# would pass with the chart's file ignored.
+su_reserved_src=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT sourcefile FROM pg_settings WHERE name = 'superuser_reserved_connections'" "testuser" "testdb")
+assert_eq "superuser_reserved_connections comes from the chart's reserved-connections.conf" "/etc/postgresql/conf.d/reserved-connections.conf" "${su_reserved_src}"
 
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem reverted to default after disable" "4MB" "${work_mem}"

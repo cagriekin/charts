@@ -1,5 +1,170 @@
 # pgvector chart changelog
 
+## 2.5.0 - 2026-10-13
+
+### Upgrade notes
+
+- **With `postgresql.existingSecret`, add two keys to that Secret before upgrading**:
+  `app-password` and `pgpool-check-password` (or point `postgresql.existingSecret.appPasswordKey`
+  / `pgpoolCheckPasswordKey` at existing keys). Helm cannot see that Secret, so the render passes
+  without them. The first PostgreSQL pod the rollout replaces then stays in
+  `CreateContainerConfigError` (`couldn't find key app-password in Secret ...`) and the rollout
+  stalls; in HA the other pods keep serving. The new pgpool pod fails the same way while the old
+  ones keep serving. Generated Secrets get both keys automatically.
+- **pg-ha image 2.2.0 requires chart 2.5.0 or newer.** The agent now requires `APP_USER`,
+  `APP_PASSWORD`, `PGPOOL_CHECK_USER`, `PGPOOL_CHECK_PASSWORD`, `POSTGRES_USER` and `POSTGRES_DB`,
+  which only this chart supplies. Setting `ha.image.tag` to 2.2.0 on an older chart crash-loops
+  every pod; upgrade the chart instead, which pins the tag.
+- **Two new roles are created on upgrade: `app_user` (`postgresql.app.username`) and
+  `pgpool_check` (`pgpool.checkUser.username`).** Both are plain `LOGIN` roles, marked with
+  `COMMENT ON ROLE ... IS 'managed by the pg chart'`, and the chart re-asserts their definition on
+  every primary start: no superuser or other elevated attribute, the password from the release
+  Secret. **A role that already exists under one of these names without that mark is left
+  untouched, and provisioning stops**: in HA the agent logs the error once and new pgpool pods
+  wait; in standalone the postStart hook fails, so the PostgreSQL container restarts until it is
+  resolved. Rename the chart value, or hand the role over with
+  `COMMENT ON ROLE <name> IS 'managed by the pg chart'` (it is then converted). A name that
+  collides with `postgresql.username`, `ha.username`, the monitoring user or a
+  `postgresql.roles[]` entry is refused at render time, and so are `all`, `public`, `none` and
+  names starting with `pg_` (PostgreSQL refuses them as role names, and pg_hba reads `all` as
+  every user). In HA the agent provisions them once the
+  node is observed as a primary (not on the promotion tick itself, while it may still be in
+  recovery). Provisioning turns `pg_stat_statements` tracking off for its own session before any
+  password or verifier is sent, so neither is recorded even with `track = all`. A marked role
+  moved from one kind to the other loses the other kind's privileges (`pg_monitor` and the
+  reserved slots, or `CREATE` on `public` in the `postgres` database).
+- **`app_user` becomes the owner of `postgresql.database`, unless that is `postgres` (the
+  default).** The maintenance database keeps its owner: whoever owns it could drop it or set
+  per-database settings that every superuser session there inherits. On `postgres`, `app_user`
+  gets `CONNECT` and `USAGE, CREATE` on schema `public` instead. Either way, objects already
+  in the database keep their current owner, so give `app_user` access to them (`GRANT`, or
+  `REASSIGN OWNED BY` the superuser when it owns the database) before you point applications at
+  it. Until you do, applications keep working as `postgresql.username`. Nothing forces them to
+  switch. A `postgresql.databases[]` entry that gives a non-`postgres` `postgresql.database`
+  another owner is refused at render time.
+- **PostgreSQL 16 or newer is required** when `postgresql.majorVersion` is set (both images ship
+  18). `postgresql.configuration.superuser_reserved_connections` and `reserved_connections` are
+  now refused. The chart owns both, and `max_connections` must exceed their sum. With pgpool,
+  `pgpool.reservedConnections` (default 7) must be at least `2 x pgpool.replicaCount + 1`, or
+  `3 x pgpool.replicaCount + 1` with `pgpool.metrics.enabled`, so more than 3 pgpool replicas (2
+  with metrics) need it raised.
+- **Non-superuser roles get fewer slots.** The reserves grow from PostgreSQL's 3 to one per node
+  plus 3, plus `pgpool.reservedConnections` (7) with pgpool: 13 on a 3-node cluster with pgpool,
+  so non-superuser logins get 87 of the default 100 `max_connections` instead of 97. Raise
+  `max_connections` if a cluster already runs near the limit.
+- **HA: a fresh native initialisation refuses a missing or empty `/etc/postgresql/conf.d`.** The
+  chart mounts it on every install now (it carries `reserved-connections.conf`), so this only
+  affects a hand-edited StatefulSet or a broken ConfigMap mount; before, the agent initialised the
+  cluster without the include and the connection reserves were silently absent on every node.
+- **The pods roll once** (new configuration, environment and image), and so does pgpool. Each new
+  pgpool pod waits in its `wait-check-role` init container until the agent on the primary (or the
+  standalone postStart hook) has created `pgpool_check`. The old pgpool pods keep serving until
+  then.
+
+### Added
+
+- **Connection reserves, so a full node stays observable.** A chart-owned
+  `reserved-connections.conf` sets `superuser_reserved_connections` to one slot per node plus 3
+  (every agent holds one session to every node; standalone keeps PostgreSQL's 3), and
+  `reserved_connections` to `pgpool.reservedConnections` (default 7, at least
+  `2 x pgpool.replicaCount + 1`, `3 x` with metrics), for pgpool's checks and exporter. That is a
+  value of its own because the
+  setting needs a PostgreSQL restart: deriving it from `pgpool.replicaCount` would roll every
+  database pod on a pgpool scale. Applications get the rest. The postgresql ConfigMap therefore
+  renders on every install.
+- **`postgresql.app`: a non-superuser application role** that owns `postgresql.database` (on
+  `postgres`, the default, it gets `CONNECT` and `USAGE, CREATE` on schema `public` instead). All
+  superusers share one emergency pool (`superuser_reserved_connections`), so an application
+  logged in as the superuser can use up the slots the agent needs. Point applications at
+  `app_user` through pgpool, which now accepts it, or directly. The password is in the release
+  Secret under `app-password`.
+- **`pgpool.checkUser`: pgpool's health and streaming checks no longer log in as the superuser.**
+  The check role has `pg_monitor` and `pg_use_reserved_connections`, so the checks draw from
+  `reserved_connections`. When application sessions fill a node, its health check still passes
+  and pgpool does not detach it. With `postgresql.tls.clientCertAuth`, the check role is exempt
+  from the client-certificate requirement like the other internal users (password over TLS),
+  since pgpool's backend connections present no client certificate.
+- **The agent treats `too many clients` (SQLSTATE 53300) as proof that a node is alive.** A full
+  primary is not stepped down by self-health for up to `ha.agent.saturationGrace` (default 2m):
+  before, a primary whose connections ran out for `LeaseDuration` was SIGQUIT'd and failed over as
+  if wedged. The grace is bounded because a primary whose slots are all held by sessions stuck on
+  hung storage refuses connections the same way; past it, the node counts as not running again
+  and the ordinary self-health step-down applies. The grace runs from the FIRST refusal of an
+  episode, and the episode ends only on positive evidence: a successful probe, or a restart (the
+  local postmaster no longer running; for a peer, every TCP connection attempt refused). Timeouts between
+  refusals neither count as alive nor restart the clock, so a node alternating between refusals
+  and timeouts cannot renew it forever. A lease-holding standby that stays full past the grace
+  releases the Lease instead of waiting for a free slot. A lease-holding standby waits up to
+  `ha.agent.saturationGrace` before promoting past a full peer whose position it cannot read, including
+  on ticks where that peer times out instead of refusing, unless that peer's fresh gossip shows it
+  is not ahead (only when both positions are known). A full node gossips neither its last-checkpoint LSN nor its
+  checkpoint timeline, which can lag a promotion, for the whole episode, including the ticks where
+  its own probe times out instead of being refused. New gauges: `pg_ha_agent_local_saturated`,
+  `pg_ha_agent_peers_saturated`.
+
+### Changed
+
+- **pg-ha image 2.2.0 builds the agent with Go 1.26.9 and golang.org/x/net v0.60.0**, fixing
+  the standard-library and x/net vulnerabilities GO-2026-6599 through GO-2026-6617 (net/http,
+  net/textproto, crypto/tls, html/template) that Go 1.25 has no release for.
+- **Fresh standalone installs load conf.d settings at the first server start.** On a new volume
+  `postgresql.conf` does not exist yet when the `setup-config` init container runs, so
+  `include_dir` used to be appended by the postStart hook after PostgreSQL had started. Settings
+  that only apply at server start -- `max_connections`, `shared_buffers`, `wal_level`,
+  `reserved_connections` and every other postmaster-level key in `postgresql.configuration` or a
+  chart-owned conf.d file -- then stayed at PostgreSQL's defaults until the pod's next restart.
+  A script mounted into `/docker-entrypoint-initdb.d` now adds `include_dir` after `initdb` and
+  before that first start; `setup-config` keeps covering every later start. HA installs are
+  unaffected (the agent wires `include_dir` before starting PostgreSQL).
+
+- **The standalone postStart hook runs against the real server only.** On first boot the official
+  image starts a temporary server, socket-only, before it creates `postgresql.database`, and the
+  hook's socket `pg_isready` gate answered for it. The `postgresql.pgHba` step's `SHOW hba_file`
+  then failed (database not there yet) and the rules were silently skipped -- a fresh install could
+  come up without its declared pg_hba entries. The whole hook (pgHba, reload, managed roles) now
+  waits for loopback TCP and `postgresql.database` accepting a session, up to 300s, and fails
+  loudly if the server never gets there.
+
+- **pgpool's liveness and readiness probes ask pgpool over PCP instead of running `SELECT 1`
+  through it.** A session through pgpool leaves a cached backend connection in one of its
+  children, whatever the role. On a node at `max_connections` that connection came out of a
+  reserve and stayed there: the probes logged in as the superuser and so took
+  `superuser_reserved_connections` slots from the agent. Now readiness requires node 0 (the
+  primary, the write path) to be up or waiting and at least one pgpool child to be free
+  (`pcp_proc_info`, still no session), so a pgpool whose children are all busy or hung leaves the
+  Service as before; liveness fails only when PCP stops answering or every backend is marked down
+  (the #122 wedge), and never restarts a pgpool that is merely saturated. A detached read backend still never makes
+  pgpool unready (#361). The pgpool metrics exporter logs in as `pgpool_check` instead of the
+  superuser for the same reason: its one session (pgpool2_exporter caps its pool at one
+  connection) makes pgpool connect to every backend, and those connections now come from
+  `reserved_connections`, so pgpool metrics keep working on a full node. Unlike before, an unreachable primary that pgpool still lists as up no
+  longer makes pgpool unready: sessions fail with pgpool's error instead of being refused by an
+  empty Service.
+
+- **pg-ha image 2.2.0: the agent probes over persistent connections (#364).** Every probe used to
+  be a fresh `psql` process, and `psql` on the image's PATH is Debian's Perl wrapper, so each of
+  the six to nine probes per tick paid a Perl start, a psql start, a TCP connect, authentication
+  and a backend fork -- measured at ~0.6 CPU core per *idle* pod on slow vCPUs, an idle tax that
+  scales with tenant count. The agent now keeps one connection per node across ticks (every query
+  under the per-probe deadline; re-dialled on a connection failure, kept on an ordinary SQL error;
+  one in-call retry on a fresh dial when a reused socket fails, with `TCP_USER_TIMEOUT` failing a
+  socket to a vanished peer within 5s so that retry still fits the deadline; connections idle for
+  5 minutes, such as to a scaled-down ordinal, are closed; sessions are terminated cleanly on
+  shutdown). An open session is not affected when the node reaches `max_connections`. Failover
+  and fencing timings are unchanged; the sessions appear as `application_name = pg-ha-agent` in
+  `pg_stat_activity`, one from each agent on every node. `ha.image.tag` and the etcd bootstrap
+  image move to `2.2.0-pg18`.
+
+### Fixed
+
+- **A standby that has just followed a new timeline can be promoted right away.** The agent
+  forces a restartpoint so the standby's control file records the timeline it streams; the check
+  ran at most every 15s, so a primary lost within that window after the standby began streaming
+  its timeline left a caught-up standby refusing to promote on the timeline highwater guard, with
+  no walreceiver left to trigger the repair later. The timeline is now read on every reconcile tick
+  and the restartpoint forced on the first tick that sees it lag; only repeated restartpoints are
+  backed off.
+
 ## 2.4.1 - 2026-10-08
 
 ### Changed

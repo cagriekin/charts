@@ -56,6 +56,20 @@ postgresql:
   database: postgres
   username: postgres
 
+  # Application role. postgresql.username is a SUPERUSER (initdb's bootstrap role by
+  # default) and the chart's own tooling -- the HA agent, backups, hook Jobs -- logs in as
+  # a superuser too. Superusers share one emergency pool, superuser_reserved_connections,
+  # so an application connecting as the superuser can exhaust the very slots that keep
+  # the agent able to observe and manage a node at max_connections. Point applications at
+  # this role instead: a plain LOGIN that owns postgresql.database (on "postgres", the
+  # maintenance database, it gets CONNECT and USAGE, CREATE on schema public instead, since
+  # that database's owner could drop it or set GUCs superuser sessions inherit), created and kept in
+  # sync by the chart (the agent on the primary in HA mode, the postStart hook in
+  # standalone), password in the release Secret under "app-password". Existing
+  # applications keep working on postgresql.username until they switch.
+  app:
+    username: app_user
+
   existingSecret:
     enabled: false
     name: ""
@@ -65,6 +79,10 @@ postgresql:
     repmgrPasswordKey: repmgr-password
     # Required only when prometheusExporter.monitoringUser.enabled is true.
     monitoringPasswordKey: monitoring-password
+    # Passwords of the application role (postgresql.app) and pgpool's check role
+    # (pgpool.checkUser). Always required with existingSecret.
+    appPasswordKey: app-password
+    pgpoolCheckPasswordKey: pgpool-check-password
 
   livenessProbe:
     enabled: true
@@ -517,7 +535,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.1.0-pg18
+    tag: 2.2.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -555,6 +573,15 @@ ha:
     renewDeadline: 10s
     retryPeriod: 2s
     reconcileInterval: 5s
+    # How long a primary that refuses the agent's connections with "too many clients"
+    # (max_connections exhausted) still counts as alive for the self-health step-down. The
+    # refusal proves the postmaster is up, so a connection storm does not turn into a
+    # failover; but a primary whose slots are all held by sessions stuck on hung storage
+    # refuses the same way, so past this grace it counts as not running again and
+    # self-health may step it down (after its own leaseDuration grace). It is also how long a
+    # lease-holding standby waits before promoting past a peer refusing it the same way, since
+    # that peer's WAL position is unreadable and may be ahead.
+    saturationGrace: 2m
     # Cascading replication (#29). Off by default: every standby streams from the
     # primary. When true, a standby may instead follow another standby (a chain by
     # pod ordinal toward the primary) to offload the primary's WAL senders on larger
@@ -878,6 +905,26 @@ pgpool:
     pullPolicy: IfNotPresent
 
   replicaCount: 1
+
+  # Role pgpool's health and streaming-replication checks log in as. A plain LOGIN with
+  # pg_monitor and pg_use_reserved_connections, so the checks draw from
+  # reserved_connections (pgpool.reservedConnections below) rather
+  # than competing with application sessions: a node that is merely full must not fail
+  # its health check and be detached. Created by the chart like postgresql.app; the
+  # password lives in the release Secret under "pgpool-check-password". A new pgpool pod
+  # waits in Init until this role can log in.
+  checkUser:
+    username: pgpool_check
+
+  # reserved_connections on every PostgreSQL node: slots only roles with
+  # pg_use_reserved_connections (the check role above) may use. Each pgpool replica runs
+  # a health check and a streaming check -- and, with pgpool.metrics, the exporter, which
+  # logs in as the check role too -- so it must be at least 2 x replicaCount + 1, or
+  # 3 x replicaCount + 1 with metrics
+  # (render-enforced). A value of its own rather than derived from replicaCount: the
+  # setting needs a PostgreSQL restart, so tying it to replicaCount would roll every
+  # database pod on a pgpool scale. 7 covers up to 3 pgpool replicas, or 2 with metrics.
+  reservedConnections: 7
 
   # Startup command override for the pgpool container. Empty uses the chart default,
   # which reaps SysV shmem/semaphores orphaned by a prior OOM-killed pgpool
@@ -1589,4 +1636,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.1.0-pg18
+      tag: 2.2.0-pg18

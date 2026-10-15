@@ -163,13 +163,18 @@ data:
     # Check/recovery passwords are deliberately blank: pgpool then reads
     # them from pool_passwd, which carries raw bytes. Conf-string escaping
     # of arbitrary existingSecret passwords does not round-trip the lexer.
-    sr_check_user = '__POSTGRES_USER__'
+    # The checks log in as pgpool.checkUser, not the superuser: that role holds
+    # pg_use_reserved_connections, so on a node at max_connections the checks still
+    # get a slot from reserved_connections and pgpool does not detach a node for
+    # being full. They also stay out of superuser_reserved_connections, which the
+    # HA agent needs to keep observing the node.
+    sr_check_user = '__CHECK_USER__'
     sr_check_password = ''
     sr_check_database = '__POSTGRES_DB__'
 
     health_check_period = {{ .Values.pgpool.healthCheck.period }}
     health_check_timeout = {{ .Values.pgpool.healthCheck.timeout }}
-    health_check_user = '__POSTGRES_USER__'
+    health_check_user = '__CHECK_USER__'
     health_check_password = ''
     health_check_database = '__POSTGRES_DB__'
     health_check_max_retries = {{ .Values.pgpool.healthCheck.maxRetries }}
@@ -196,4 +201,6 @@ data:
            as md5 hashes, which work against md5 backends by accident but
            cannot answer scram challenges */}}
     __POSTGRES_USER__:TEXT__POSTGRES_PASSWORD__
+    __CHECK_USER__:TEXT__CHECK_PASSWORD__
+    __APP_USER__:TEXT__APP_PASSWORD__
 {{- end }}

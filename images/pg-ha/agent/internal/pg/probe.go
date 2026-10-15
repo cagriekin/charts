@@ -8,7 +8,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
@@ -29,10 +32,11 @@ type OSExec struct{}
 // psql writes its diagnostics to STDERR, and cmd.Output() puts them in
 // exec.ExitError.Stderr -- but ExitError.Error() renders only "exit status N", so an
 // unwrapped error carries none of them. Every caller that inspects the message therefore
-// saw nothing to inspect: IsDuplicateSlot could never match a real create/create race
-// (verified: stdout empty, err.Error() == "exit status 1", the ERROR text only in
-// ExitError.Stderr), and every probe failure logged an opaque "exit status 1" instead of
-// the reason PostgreSQL gave. Fold stderr into the error so both work.
+// saw nothing to inspect: the mechanism layer's duplicate-slot check could never match a
+// real create/create race (verified: stdout empty, err.Error() == "exit status 1", the
+// ERROR text only in ExitError.Stderr), and every command failure logged an opaque
+// "exit status 1" instead of the reason PostgreSQL gave. Fold stderr into the error so
+// both work.
 //
 // Stdout is returned separately and unchanged: callers parse it as query output, so
 // diagnostics must not be mixed into it the way CombinedOutput would.
@@ -64,8 +68,8 @@ func withStderr(err error) error {
 	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
 }
 
-// ConnInfo is how to reach one PostgreSQL node. Password is passed via PGPASSWORD,
-// never on the command line, so it never appears in argv or logs.
+// ConnInfo is how to reach one PostgreSQL node. Password is never put into argv or a
+// connection string, so it never appears in a process list or a parse error.
 type ConnInfo struct {
 	Host     string
 	Port     int
@@ -107,47 +111,63 @@ type NodeState struct {
 	// primary's current WAL LSN, or a standby's last *received* LSN.
 	WriteLSN LSN
 	LSNOK    bool
+	// Saturated is true when the node refused the probe's connection with
+	// too_many_connections (53300): it is NOT Reachable -- nothing about its role or
+	// position could be read -- but the refusal is positive evidence the postmaster is
+	// alive and forking backends, which a crashed or frozen node never produces.
+	Saturated bool
+	// ConnRefused is true when the TCP connection itself was refused (ECONNREFUSED):
+	// nothing is listening on the port, so the postmaster has exited. Unlike a timeout,
+	// which a frozen or overloaded node also produces, it is positive evidence of a
+	// restart, and it ends a saturation episode.
+	ConnRefused bool
 }
 
-// Prober runs SQL probes against PostgreSQL nodes via psql.
+// Prober runs SQL probes against PostgreSQL nodes through its SQL transport.
 type Prober struct {
-	Exec    Exec
+	// Exec runs the external commands the agent still needs a process for (the bootstrap
+	// entrypoint, pg_ctl). It is no longer how SQL reaches a node.
+	Exec Exec
+	// SQL is the transport every probe goes through. Required. The agent sets a
+	// ConnCache -- one persistent connection per node (#364); the unit tests set an
+	// ExecQuerier over a fake Exec, whose fakes answer by inspecting the psql argument list.
+	SQL Querier
+	// Timeout is the per-probe deadline. Required (positive).
 	Timeout time.Duration
 }
 
-// NewProber returns a Prober using the real psql with the shell's 10s timeout.
-func NewProber() *Prober { return &Prober{Exec: OSExec{}, Timeout: 10 * time.Second} }
+// NewProber returns the agent's prober: SQL over sql, 10s per-probe deadline. The caller
+// owns sql (the agent closes its ConnCache on shutdown). A missing transport is refused
+// here, at startup, rather than surfacing as every peer reading unreachable.
+func NewProber(sql Querier) (*Prober, error) {
+	if sql == nil {
+		return nil, errors.New("prober: SQL querier is required")
+	}
+	if cc, ok := sql.(*ConnCache); ok && cc == nil {
+		return nil, errors.New("prober: SQL querier is a nil *ConnCache")
+	}
+	return &Prober{Exec: OSExec{}, SQL: sql, Timeout: 10 * time.Second}, nil
+}
 
-// psql runs one query (tuples-only, unaligned) and returns trimmed stdout. The
-// per-call context bounds total time; PGCONNECT_TIMEOUT bounds the connect phase
-// (mirrors the shell `timeout 10 psql ... connect_timeout=10`).
-func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, error) {
-	to := p.Timeout
-	if to <= 0 {
-		to = 10 * time.Second // a zero Timeout would make the deadline expire immediately
+// psql runs sql against ci under the per-probe deadline and returns `psql -tA` shaped
+// text (see Querier). The name is historical: until #364 this really was a psql process
+// per call, and every parser below still consumes that output shape.
+func (p *Prober) psql(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error) {
+	if p.SQL == nil {
+		return "", errors.New("prober: SQL querier is not set")
 	}
-	ctx, cancel := context.WithTimeout(ctx, to)
+	if p.Timeout <= 0 {
+		return "", fmt.Errorf("prober: Timeout must be positive, got %s", p.Timeout)
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.Timeout)
 	defer cancel()
-	env := []string{
-		"PGPASSWORD=" + ci.Password,
-		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(to.Seconds())),
-	}
-	// --no-psqlrc, as RehashMd5User already passes (#298 review). Every caller here parses
-	// psql's OUTPUT SHAPE -- `strings.Cut(out, "|")`, an exact "t"/"f", a bare LSN for
-	// ParseLSN -- and a startup file can change all of it (`\pset fieldsep`, `\pset null`,
-	// a banner) while psql still exits 0. PSQLRC reaches this process through
-	// postgresql.extraEnv and childenv.Filtered strips only *PASSWORD*, and the agent itself
-	// writes into the postgres home (writePgpass), so ~/.psqlrc is reachable too. The failure
-	// is silent and cluster-wide: LSNOK false on every node, so survivor ranking has no
-	// positions to compare and the failover simply never happens.
-	args := []string{"--no-psqlrc", "-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
-	return p.Exec.Run(ctx, env, "psql", args...)
+	return p.SQL.QueryText(ctx, ci, kind, sql)
 }
 
 // InRecovery reports pg_is_in_recovery(). reachable is false when the node could
 // not be queried or returned anything other than the expected 't'/'f'.
 func (p *Prober) InRecovery(ctx context.Context, ci ConnInfo) (inRecovery, reachable bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT pg_is_in_recovery();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT pg_is_in_recovery();")
 	if err != nil {
 		return false, false, err
 	}
@@ -166,7 +186,7 @@ func (p *Prober) InRecovery(ctx context.Context, ci ConnInfo) (inRecovery, reach
 // reflects a fast promotion immediately, NOT pg_control_checkpoint() which lags.
 // pg_current_wal_lsn() is primary-only; ok is false on a standby or unreadable node.
 func (p *Prober) PrimaryWALPosition(ctx context.Context, ci ConnInfo) (tl Timeline, lsn LSN, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();")
 	if err != nil {
 		return 0, LSN{}, false, err
 	}
@@ -189,7 +209,7 @@ func (p *Prober) PrimaryWALPosition(ctx context.Context, ci ConnInfo) (tl Timeli
 // the cold-boot election) has a NULL receive LSN but a real replay LSN, so the
 // GREATEST (with NULLs coalesced) reports its true end-of-WAL.
 func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0'));")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0'));")
 	if err != nil {
 		return LSN{}, false, err
 	}
@@ -244,7 +264,7 @@ func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, 
 // superusers and pg_read_all_stats members; the agent connects as REPMGR_USER, which the
 // bootstrap creates WITH SUPERUSER.
 func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT GREATEST("+
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT GREATEST("+
 		"(SELECT timeline_id FROM pg_control_checkpoint()), "+
 		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), "+
 		"COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
@@ -266,7 +286,7 @@ func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline,
 // follow (which would error "slot already active" and re-run every tick). The host
 // is sender_host, derived from primary_conninfo -- the upstream's registered FQDN.
 func (p *Prober) StreamingUpstream(ctx context.Context, ci ConnInfo) (host string, streaming bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT sender_host, status FROM pg_stat_wal_receiver;")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT sender_host, status FROM pg_stat_wal_receiver;")
 	if err != nil {
 		return "", false, err
 	}
@@ -287,7 +307,7 @@ func (p *Prober) StreamingUpstream(ctx context.Context, ci ConnInfo) (host strin
 // a shared headless Service, a leftover, or a DR-restored cluster). ok is false when
 // the peer is unreachable or returns an unparseable value.
 func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT system_identifier FROM pg_control_system();")
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT system_identifier FROM pg_control_system();")
 	if err != nil {
 		return 0, false, err
 	}
@@ -333,7 +353,7 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // until something forced a checkpoint. Making the durable value current while the node is still
 // streaming is what closes that window.
 func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
-	_, err := p.psql(ctx, ci, "CHECKPOINT;")
+	_, err := p.psql(ctx, ci, QueryWrite, "CHECKPOINT;")
 	return err
 }
 
@@ -357,7 +377,7 @@ func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
 func (p *Prober) RecoveryTimelines(ctx context.Context, ci ConnInfo) (durable, streamed Timeline, ok bool, err error) {
 	const durableExpr = "GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), " +
 		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0))"
-	out, err := p.psql(ctx, ci, "SELECT "+durableExpr+", "+
+	out, err := p.psql(ctx, ci, QueryRead, "SELECT "+durableExpr+", "+
 		"GREATEST("+durableExpr+", COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
 	if err != nil {
 		return 0, 0, false, err
@@ -425,7 +445,7 @@ func (r ReplicaRow) Streaming() bool { return r.State == "streaming" }
 // disconnects, which is exactly the failover moment when a promotion decision is being made.
 // Absence here means "not streaming right now", never "this node does not exist".
 func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]ReplicaRow, error) {
-	out, err := p.psql(ctx, ci,
+	out, err := p.psql(ctx, ci, QueryRead,
 		"SELECT r.application_name, COALESCE(s.slot_name, ''), r.state "+
 			"FROM pg_stat_replication r "+
 			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid AND s.slot_type = 'physical' "+
@@ -532,7 +552,7 @@ func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 // GREATEST(..., 0) additionally clamps the negative a post-rewind restart_lsn ahead of the
 // local end-of-WAL produces, which slotMetrics' max would otherwise carry silently.
 func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
-	out, err := p.psql(ctx, ci,
+	out, err := p.psql(ctx, ci, QueryRead,
 		"SELECT slot_name, active, GREATEST(COALESCE(pg_wal_lsn_diff("+
 			"CASE WHEN pg_is_in_recovery() THEN GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0')) ELSE pg_current_wal_lsn() END, "+
 			"restart_lsn), 0), 0)::bigint, "+
@@ -601,13 +621,13 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	//
 	// The collision is RAISEd with a message of our OWN, not left to PostgreSQL's (#298
 	// review, round 2). Scoping the guard alone did not surface anything: the create then
-	// runs and pg_create_physical_replication_slot fails with the very phrase
-	// `replication slot "..." already exists`, which IsDuplicateSlot matches -- so the
-	// error was swallowed and this returned nil exactly as before, leaving the silent
-	// per-tick no-op the scoping was meant to end. A distinct message (deliberately
-	// WITHOUT the words "already exists") makes the squatter fatal while a genuine
-	// physical/physical race still raises PostgreSQL's own phrase and is still treated as
-	// success below -- which is the one case that IS success.
+	// runs and pg_create_physical_replication_slot fails with duplicate_object (42710),
+	// which IsDuplicateSlot treats as a lost race -- so the error was swallowed and this
+	// returned nil exactly as before, leaving the silent per-tick no-op the scoping was
+	// meant to end. RAISE EXCEPTION (P0001, with a message deliberately WITHOUT the words
+	// "already exists") makes the squatter fatal while a genuine physical/physical race
+	// still raises PostgreSQL's own duplicate_object and is still treated as success
+	// below -- which is the one case that IS success.
 	// An INVALIDATED slot is recycled, not accepted (#298 review). wal_status = 'lost'
 	// means PostgreSQL destroyed the reservation because the slot passed
 	// max_slot_wal_keep_size (4GB in this image), and such a slot can never be acquired
@@ -623,7 +643,7 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	// one, which is the whole point of an idempotent ensure.
 	//
 	// Guarded on NOT active, so this can only ever remove a reservation nothing holds.
-	out, err := p.psql(ctx, ci, fmt.Sprintf(
+	_, err := p.psql(ctx, ci, QueryWrite, fmt.Sprintf(
 		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
 			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
@@ -634,7 +654,7 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');", name))
-	if err != nil && IsDuplicateSlot(out, err) {
+	if IsDuplicateSlot(err) {
 		return nil
 	}
 	return err
@@ -643,17 +663,58 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 // IsDuplicateSlot reports whether a failed slot create lost a create/create race, i.e. the
 // slot now exists -- which is the outcome the caller wanted (#289).
 //
-// Matched on message text because psql surfaces the server error only as combined output
-// plus a non-zero exit status; there is no SQLSTATE to read through this transport. Kept
-// narrow (the literal phrase PostgreSQL uses for duplicate_object on a slot) so it cannot
-// swallow an unrelated failure, and exported so the mechanism layer can apply the same
-// judgement to its own clone-time create without duplicating the string.
-func IsDuplicateSlot(out string, err error) bool {
-	if err == nil {
-		return false
+// Matched on SQLSTATE 42710 (duplicate_object), which pg_create_physical_replication_slot
+// raises for an existing name and which does not depend on the server's message wording
+// or lc_messages. The squatter RAISE in CreatePhysicalSlot is a plain RAISE EXCEPTION
+// (P0001), so it is not swallowed; neither is any error that did not come from the
+// server (connection loss, deadline), which carries no SQLSTATE at all (#364).
+func IsDuplicateSlot(err error) bool {
+	return hasSQLState(err, sqlstateDuplicateObject)
+}
+
+func hasSQLState(err error, code string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == code
+}
+
+const (
+	sqlstateDuplicateObject    = "42710"
+	sqlstateTooManyConnections = "53300"
+)
+
+// IsTooManyConnections reports whether err is the server refusing a new connection
+// because its slots are exhausted: "sorry, too many clients already" and "remaining
+// connection slots are reserved ..." both carry SQLSTATE 53300. The refusal comes from
+// a backend the postmaster has just forked, so it proves the postmaster is alive.
+func IsTooManyConnections(err error) bool {
+	return hasSQLState(err, sqlstateTooManyConnections)
+}
+
+// IsConnRefused reports whether err is a refused TCP connection: no process is
+// listening on the port. pgconn joins the errors of every address and TLS/plaintext
+// attempt it made, so a joined error counts only when EVERY attempt was refused: one
+// refused address (an IPv6 record on an IPv4-only listener) next to a timeout or a
+// too_many_connections refusal is not evidence that the postmaster exited.
+func IsConnRefused(err error) bool {
+	for err != nil {
+		if multi, ok := err.(interface{ Unwrap() []error }); ok {
+			errs := multi.Unwrap()
+			if len(errs) == 0 {
+				return false
+			}
+			for _, e := range errs {
+				if !IsConnRefused(e) {
+					return false
+				}
+			}
+			return true
+		}
+		if errno, ok := err.(syscall.Errno); ok {
+			return errno == syscall.ECONNREFUSED
+		}
+		err = errors.Unwrap(err)
 	}
-	s := strings.ToLower(out + " " + err.Error())
-	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
+	return false
 }
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
@@ -680,7 +741,7 @@ func (p *Prober) DropPhysicalSlotIfInactive(ctx context.Context, ci ConnInfo, na
 	if err := validSlotName(name); err != nil {
 		return false, err
 	}
-	out, err := p.psql(ctx, ci, fmt.Sprintf(
+	out, err := p.psql(ctx, ci, QueryWrite, fmt.Sprintf(
 		"WITH victim AS (SELECT slot_name FROM pg_replication_slots "+
 			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active) "+
 			"SELECT v.slot_name FROM victim v, pg_drop_replication_slot(v.slot_name);", name))
@@ -715,7 +776,13 @@ func validSlotName(name string) error {
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
 	ns := NodeState{Host: ci.Host}
 	inRec, reachable, err := p.InRecovery(ctx, ci)
-	if err != nil || !reachable {
+	if err != nil {
+		ns.Saturated = IsTooManyConnections(err)
+		// A 53300 from any attempt proves the postmaster is up, whatever else was refused.
+		ns.ConnRefused = !ns.Saturated && IsConnRefused(err)
+		return ns
+	}
+	if !reachable {
 		return ns
 	}
 	ns.Reachable = true
@@ -765,10 +832,10 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 		}
 	}
 	alter := fmt.Sprintf("ALTER SYSTEM SET synchronized_standby_slots = '%s';", strings.Join(slots, ","))
-	if _, err := p.psql(ctx, ci, alter); err != nil {
+	if _, err := p.psql(ctx, ci, QueryWrite, alter); err != nil {
 		return fmt.Errorf("alter system: %w", err)
 	}
-	if _, err := p.psql(ctx, ci, "SELECT pg_reload_conf();"); err != nil {
+	if _, err := p.psql(ctx, ci, QueryWrite, "SELECT pg_reload_conf();"); err != nil {
 		return fmt.Errorf("reload after alter system: %w", err)
 	}
 	return nil
@@ -787,7 +854,7 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 // readiness/alerting path, and "the query did not work" must not be indistinguishable from
 // "TLS is off" -- the caller retries the former and escalates the latter.
 func (p *Prober) SSLActive(ctx context.Context, ci ConnInfo) (bool, error) {
-	out, err := p.psql(ctx, ci, "SHOW ssl;")
+	out, err := p.psql(ctx, ci, QueryRead, "SHOW ssl;")
 	if err != nil {
 		return false, err
 	}

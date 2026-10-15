@@ -3,9 +3,22 @@ package pg
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// execProber is a Prober whose SQL goes through ExecQuerier over e, so a fake Exec
+// answers probes by inspecting the psql argument list.
+func execProber(e Exec) *Prober {
+	return &Prober{Exec: e, SQL: ExecQuerier{Exec: e, Timeout: time.Second}, Timeout: time.Second}
+}
 
 // fakeExec dispatches on a distinctive token in the SQL (the last arg) so each
 // probe query can be stubbed independently.
@@ -45,7 +58,7 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	return "", nil
 }
 
-func proberWith(f fakeExec) *Prober { return &Prober{Exec: f} }
+func proberWith(f fakeExec) *Prober { return execProber(f) }
 
 func TestProbePrimary(t *testing.T) {
 	p := proberWith(fakeExec{role: "f", primary: "0000000A|16/B374D848"})
@@ -116,7 +129,7 @@ func (e *sqlCaptureExec) Run(_ context.Context, _ []string, _ string, args ...st
 // NULL on a node with no walreceiver -- which is every primary.
 func TestStandbyTimelineGreatestsAllThreeSources(t *testing.T) {
 	e := &sqlCaptureExec{ret: "2"}
-	p := &Prober{Exec: e}
+	p := execProber(e)
 	tl, ok, err := p.StandbyTimeline(context.Background(), ConnInfo{Host: "x"})
 	if err != nil || !ok || tl != 2 {
 		t.Fatalf("got tl=%d ok=%v err=%v, want 2", tl, ok, err)
@@ -271,7 +284,7 @@ func (s *slotExec) Run(_ context.Context, _ []string, _ string, args ...string) 
 // its retained-bytes figure reads 0 and cannot be alerted on).
 func TestPhysicalSlotsParsesNameActiveRetainedWALAndWALStatus(t *testing.T) {
 	ex := &slotExec{out: "pg_ha_slot_1|f|0||f\npg_ha_slot_2|t|16777216|reserved|t\npg_ha_slot_3|f|0|lost|f"}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("PhysicalSlots: %v", err)
@@ -300,7 +313,7 @@ func TestPhysicalSlotsParsesNameActiveRetainedWALAndWALStatus(t *testing.T) {
 // listing there and made those leftovers invisible.
 func TestPhysicalSlotsQueryWorksOnAStandby(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
 		t.Fatalf("PhysicalSlots: %v", err)
 	}
@@ -317,7 +330,7 @@ func TestPhysicalSlotsQueryWorksOnAStandby(t *testing.T) {
 // them as candidates for its own reconcile.
 func TestPhysicalSlotsQueryExcludesLogicalSlots(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
 		t.Fatalf("PhysicalSlots: %v", err)
 	}
@@ -330,7 +343,7 @@ func TestPhysicalSlotsQueryExcludesLogicalSlots(t *testing.T) {
 // than erroring the whole listing -- otherwise one new slot hides every other slot's
 // retained WAL.
 func TestPhysicalSlotsEmptyOutputIsNoSlotsNotAnError(t *testing.T) {
-	p := &Prober{Exec: &slotExec{out: ""}}
+	p := execProber(&slotExec{out: ""})
 	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("PhysicalSlots: %v", err)
@@ -343,14 +356,14 @@ func TestPhysicalSlotsEmptyOutputIsNoSlotsNotAnError(t *testing.T) {
 // A malformed row is an error, not a silent skip: silently dropping a row would hide an
 // orphaned slot that is filling the disk.
 func TestPhysicalSlotsMalformedRowIsAnError(t *testing.T) {
-	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t"}}
+	p := execProber(&slotExec{out: "pg_ha_slot_1|t"})
 	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
 		t.Fatal("want an error for a 2-field row, got nil")
 	}
 }
 
 func TestPhysicalSlotsUnparseableRetainedWALIsAnError(t *testing.T) {
-	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t|notanumber"}}
+	p := execProber(&slotExec{out: "pg_ha_slot_1|t|notanumber"})
 	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
 		t.Fatal("want an error for a non-numeric retained-WAL value, got nil")
 	}
@@ -360,7 +373,7 @@ func TestPhysicalSlotsUnparseableRetainedWALIsAnError(t *testing.T) {
 // -name failure forever once the slot exists.
 func TestCreatePhysicalSlotIsIdempotentInSQL(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
 		t.Fatalf("CreatePhysicalSlot: %v", err)
 	}
@@ -379,7 +392,7 @@ func TestCreatePhysicalSlotIsIdempotentInSQL(t *testing.T) {
 // to pg_basebackup --slot after renaming PGDATA aside (#298 review). Recycle it instead.
 func TestCreatePhysicalSlotRecyclesAnInvalidatedSlot(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
 		t.Fatalf("CreatePhysicalSlot: %v", err)
 	}
@@ -400,7 +413,7 @@ func TestCreatePhysicalSlotRecyclesAnInvalidatedSlot(t *testing.T) {
 // in Go would let a standby reattach in the window between the two.
 func TestDropPhysicalSlotRefusesActiveSlotsInSQL(t *testing.T) {
 	ex := &slotExec{out: ""}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
 		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
 	}
@@ -421,7 +434,7 @@ func TestDropPhysicalSlotRefusesActiveSlotsInSQL(t *testing.T) {
 // observable record of it disappears. This pins the shape that actually reports it.
 func TestDropPhysicalSlotProjectsTheSlotNameNotTheVoidResult(t *testing.T) {
 	ex := &slotExec{out: ""}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
 		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
 	}
@@ -437,12 +450,12 @@ func TestDropPhysicalSlotProjectsTheSlotNameNotTheVoidResult(t *testing.T) {
 // An empty result means the slot was already gone or is active -- both are "nothing was
 // dropped", not an error the caller should warn about every tick.
 func TestDropPhysicalSlotReportsWhetherARowWasAffected(t *testing.T) {
-	p := &Prober{Exec: &slotExec{out: ""}}
+	p := execProber(&slotExec{out: ""})
 	dropped, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
 	if err != nil || dropped {
 		t.Errorf("empty result: got dropped=%v err=%v, want false/nil", dropped, err)
 	}
-	p = &Prober{Exec: &slotExec{out: "pg_ha_slot_9"}}
+	p = execProber(&slotExec{out: "pg_ha_slot_9"})
 	dropped, err = p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
 	if err != nil || !dropped {
 		t.Errorf("non-empty result: got dropped=%v err=%v, want true/nil", dropped, err)
@@ -450,7 +463,7 @@ func TestDropPhysicalSlotReportsWhetherARowWasAffected(t *testing.T) {
 }
 
 func TestDropPhysicalSlotPropagatesQueryErrors(t *testing.T) {
-	p := &Prober{Exec: &slotExec{err: errors.New("boom")}}
+	p := execProber(&slotExec{err: errors.New("boom")})
 	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err == nil {
 		t.Fatal("want the query error propagated, got nil")
 	}
@@ -483,7 +496,7 @@ func TestSlotNameValidationRejectsInjectionAndAcceptsRealNames(t *testing.T) {
 // The guard must run BEFORE the SQL is built, so a rejected name never reaches psql.
 func TestSlotHelpersRejectBadNamesWithoutQuerying(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "bad; name"); err == nil {
 		t.Error("CreatePhysicalSlot accepted an invalid name")
 	}
@@ -501,11 +514,18 @@ func TestSlotHelpersRejectBadNamesWithoutQuerying(t *testing.T) {
 // and there are two legitimate independent creators (a cloning standby and the primary's
 // own reconcile), so this path is genuinely reachable at bootstrap.
 func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
-	dup := &slotExec{out: `ERROR:  replication slot "pg_ha_slot_1" already exists`, err: errors.New("exit status 1")}
-	p := &Prober{Exec: dup}
+	q := errQuerier{err: &pgconn.PgError{Severity: "ERROR", Code: "42710", Message: `replication slot "pg_ha_slot_1" already exists`}}
+	p := &Prober{SQL: q, Timeout: time.Second}
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
 		t.Errorf("a lost create race must be success (the slot exists), got %v", err)
 	}
+}
+
+// errQuerier fails every query with err, the way ConnCache surfaces a server error.
+type errQuerier struct{ err error }
+
+func (q errQuerier) QueryText(context.Context, ConnInfo, QueryKind, string) (string, error) {
+	return "", q.err
 }
 
 // #298 review, round 2: a NON-PHYSICAL slot squatting on the name must SURFACE, and the
@@ -516,7 +536,7 @@ func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
 // did nothing on every tick while the standby pointed at that ordinal could not stream.
 func TestCreatePhysicalSlotSurfacesANonPhysicalSquatter(t *testing.T) {
 	ex := &slotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
 		t.Fatalf("CreatePhysicalSlot: %v", err)
 	}
@@ -529,8 +549,8 @@ func TestCreatePhysicalSlotSurfacesANonPhysicalSquatter(t *testing.T) {
 	if strings.Contains(sql, "already exists") {
 		t.Errorf("the raised message must avoid the duplicate-slot phrase: %s", sql)
 	}
-	raised := `ERROR:  replication slot pg_ha_slot_1 is not a physical slot, so it cannot be used for streaming replication: drop it or free the name`
-	p = &Prober{Exec: &slotExec{out: raised, err: errors.New("exit status 1")}}
+	raised := &pgconn.PgError{Severity: "ERROR", Code: "P0001", Message: "replication slot pg_ha_slot_1 is not a physical slot, so it cannot be used for streaming replication: drop it or free the name"}
+	p = &Prober{SQL: errQuerier{err: raised}, Timeout: time.Second}
 	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err == nil {
 		t.Error("a non-physical slot on this name was reported as a successful create")
 	}
@@ -539,44 +559,48 @@ func TestCreatePhysicalSlotSurfacesANonPhysicalSquatter(t *testing.T) {
 // It must NOT swallow an unrelated failure -- a connection error or a permission denial
 // has to surface, or a primary that cannot create slots at all would look healthy.
 func TestCreatePhysicalSlotPropagatesUnrelatedErrors(t *testing.T) {
-	for _, out := range []string{
-		"psql: error: connection to server failed: Connection refused",
-		"ERROR:  permission denied for function pg_create_physical_replication_slot",
-		"ERROR:  all replication slots are in use",
-		"",
+	for _, err := range []error{
+		errors.New("dial tcp 10.0.0.1:5432: connect: connection refused"),
+		context.DeadlineExceeded,
+		&pgconn.PgError{Severity: "ERROR", Code: "42501", Message: "permission denied for function pg_create_physical_replication_slot"},
+		&pgconn.PgError{Severity: "ERROR", Code: "53400", Message: "all replication slots are in use"},
 	} {
-		p := &Prober{Exec: &slotExec{out: out, err: errors.New("exit status 1")}}
-		if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err == nil {
-			t.Errorf("error %q was swallowed; only a duplicate-slot race may be treated as success", out)
+		p := &Prober{SQL: errQuerier{err: err}, Timeout: time.Second}
+		if got := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); got == nil {
+			t.Errorf("error %q was swallowed; only a duplicate-slot race may be treated as success", err)
 		}
 	}
 }
 
 func TestIsDuplicateSlotIsNarrow(t *testing.T) {
-	if IsDuplicateSlot("anything", nil) {
+	if IsDuplicateSlot(nil) {
 		t.Error("a nil error is not a duplicate-slot outcome")
 	}
-	if !IsDuplicateSlot(`ERROR:  replication slot "x" already exists`, errors.New("exit 1")) {
-		t.Error("the real PostgreSQL duplicate-slot message was not recognised")
+	dup := &pgconn.PgError{Severity: "ERROR", Code: "42710", Message: `replication slot "x" already exists`}
+	if !IsDuplicateSlot(dup) {
+		t.Error("duplicate_object (42710) was not recognised")
 	}
-	// Both halves are required, so an unrelated "already exists" (a table, a role, a
-	// database) cannot be mistaken for a slot race.
-	for _, out := range []string{
-		`ERROR:  relation "foo" already exists`,
-		`ERROR:  role "repmgr" already exists`,
-		`ERROR:  database "x" already exists`,
-		"replication slot is active",
+	if !IsDuplicateSlot(fmt.Errorf("create slot: %w", dup)) {
+		t.Error("a wrapped duplicate_object was not recognised")
+	}
+	// The SQLSTATE decides, never the wording: an unrelated code with the slot phrase in
+	// its text, or the phrase in a plain error, is not a lost race.
+	for _, err := range []error{
+		&pgconn.PgError{Severity: "ERROR", Code: "P0001", Message: `replication slot "x" already exists`},
+		&pgconn.PgError{Severity: "ERROR", Code: "42P07", Message: `relation "foo" already exists`},
+		errors.New(`ERROR:  replication slot "x" already exists`),
 	} {
-		if IsDuplicateSlot(out, errors.New("exit 1")) {
-			t.Errorf("IsDuplicateSlot(%q) = true, want false", out)
+		if IsDuplicateSlot(err) {
+			t.Errorf("IsDuplicateSlot(%v) = true, want false", err)
 		}
 	}
 }
 
 // The production Exec must surface the command's stderr in its error, because psql puts
 // every diagnostic there and exec.ExitError.Error() renders only "exit status N". Without
-// this, IsDuplicateSlot had nothing to match on and a lost create/create race -- the
-// documented, reproducible one -- surfaced as a per-tick warning instead of a no-op. Runs
+// this, the mechanism layer's duplicate-slot check had nothing to match on and a lost
+// create/create race -- the documented, reproducible one -- surfaced as a warning
+// instead of a no-op. Runs
 // against the real OSExec, since a fake that returns the text as stdout is exactly what
 // hid the gap.
 func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
@@ -591,9 +615,6 @@ func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
 	if !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("error message drops the stderr diagnostic: %q", err.Error())
 	}
-	if !IsDuplicateSlot(out, err) {
-		t.Errorf("IsDuplicateSlot cannot recognise a real duplicate-slot failure: out=%q err=%q", out, err.Error())
-	}
 }
 
 // #308: synchronized_standby_slots reconciliation reads this.
@@ -602,7 +623,7 @@ func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
 // detached) emptied synchronized_standby_slots. This must query existence only.
 func TestPhysicalSlotsQueryHasNoActiveFilter(t *testing.T) {
 	ex := &spySlotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -636,7 +657,7 @@ func (s *spySlotExec) Run(_ context.Context, _ []string, _ string, args ...strin
 
 func TestSetSynchronizedStandbySlotsIssuesTwoSeparateStatements(t *testing.T) {
 	ex := &spySlotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, []string{"repmgr_slot_1001", "repmgr_slot_1002"}); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -655,7 +676,7 @@ func TestSetSynchronizedStandbySlotsEmptyListIsAValidValue(t *testing.T) {
 	// No active standbys is a legitimate steady state (e.g. a lone primary), not an
 	// error -- synchronized_standby_slots = '' means "no slots required".
 	ex := &spySlotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	if err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, nil); err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -666,7 +687,7 @@ func TestSetSynchronizedStandbySlotsEmptyListIsAValidValue(t *testing.T) {
 
 func TestSetSynchronizedStandbySlotsSkipsReloadOnAlterFailure(t *testing.T) {
 	ex := &spySlotExec{alterErr: errors.New("permission denied")}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, []string{"repmgr_slot_1001"})
 	if err == nil {
 		t.Fatal("expected an error")
@@ -681,7 +702,7 @@ func TestSetSynchronizedStandbySlotsSkipsReloadOnAlterFailure(t *testing.T) {
 // bypass the check by omission.
 func TestSetSynchronizedStandbySlotsRefusesUnexpectedSlotName(t *testing.T) {
 	ex := &spySlotExec{}
-	p := &Prober{Exec: ex}
+	p := execProber(ex)
 	err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, []string{"repmgr_slot_1001'; DROP TABLE x; --"})
 	if err == nil {
 		t.Fatal("expected an error for an unexpected slot name")
@@ -697,7 +718,7 @@ func TestSetSynchronizedStandbySlotsRefusesUnexpectedSlotName(t *testing.T) {
 // come from the ordinal-named slot instead.
 func TestReplicationTopologyParsesBothIdentitySources(t *testing.T) {
 	ex := &slotExec{out: "pg-1|pg_ha_slot_1|streaming\nwalreceiver|pg_ha_slot_2|streaming"}
-	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(ex)).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("ReplicationTopology: %v", err)
 	}
@@ -722,7 +743,7 @@ func TestReplicationTopologyParsesBothIdentitySources(t *testing.T) {
 // caught up: it has a row, so it is present, but it cannot serve or be safely promoted yet.
 func TestReplicationTopologyDistinguishesCatchupFromStreaming(t *testing.T) {
 	ex := &slotExec{out: "pg-1|pg_ha_slot_1|catchup"}
-	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(ex)).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("ReplicationTopology: %v", err)
 	}
@@ -735,7 +756,7 @@ func TestReplicationTopologyDistinguishesCatchupFromStreaming(t *testing.T) {
 // empty SlotName must survive rather than dropping the row.
 func TestReplicationTopologyKeepsSlotlessRows(t *testing.T) {
 	ex := &slotExec{out: "pg-1||streaming"}
-	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(ex)).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("ReplicationTopology: %v", err)
 	}
@@ -748,7 +769,7 @@ func TestReplicationTopologyKeepsSlotlessRows(t *testing.T) {
 // reads this replaces, where an empty result meant "the table is missing" and had to be an
 // error to keep the #297 gate from firing.
 func TestReplicationTopologyEmptyIsNoReplicasNotAnError(t *testing.T) {
-	rows, err := (&Prober{Exec: &slotExec{out: ""}}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(&slotExec{out: ""})).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil || len(rows) != 0 {
 		t.Errorf("empty output: got rows=%+v err=%v, want none/nil", rows, err)
 	}
@@ -756,7 +777,7 @@ func TestReplicationTopologyEmptyIsNoReplicasNotAnError(t *testing.T) {
 
 // Too FEW fields is still an error -- that is a genuinely unparseable row.
 func TestReplicationTopologyRejectsTruncatedRows(t *testing.T) {
-	if _, err := (&Prober{Exec: &slotExec{out: "pg-1|pg_ha_slot_1"}}).ReplicationTopology(context.Background(), ConnInfo{}); err == nil {
+	if _, err := (execProber(&slotExec{out: "pg-1|pg_ha_slot_1"})).ReplicationTopology(context.Background(), ConnInfo{}); err == nil {
 		t.Fatal("want an error for a 2-field row")
 	}
 }
@@ -767,7 +788,7 @@ func TestReplicationTopologyRejectsTruncatedRows(t *testing.T) {
 // the whole read and blind all three gauges on every tick. slot_name is [a-z0-9_] and state is a
 // fixed enum, so the last two fields are unambiguous.
 func TestReplicationTopologyToleratesSeparatorsInApplicationName(t *testing.T) {
-	rows, err := (&Prober{Exec: &slotExec{out: "some|third|party|tool|pg_ha_slot_1|streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(&slotExec{out: "some|third|party|tool|pg_ha_slot_1|streaming"})).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("a '|' in application_name blinded the whole topology view: %v", err)
 	}
@@ -784,7 +805,7 @@ func TestReplicationTopologyToleratesSeparatorsInApplicationName(t *testing.T) {
 // and must NOT fall back to repmgr.nodes -- retiring that table is the point of #288.
 func TestReplicationTopologyQueryShape(t *testing.T) {
 	ex := &slotExec{}
-	if _, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{}); err != nil {
+	if _, err := (execProber(ex)).ReplicationTopology(context.Background(), ConnInfo{}); err != nil {
 		t.Fatalf("ReplicationTopology: %v", err)
 	}
 	sql := ex.sqls[0]
@@ -813,7 +834,7 @@ func TestReplicationTopologyExcludesLogicalSenders(t *testing.T) {
 	// The query filters them server-side, so the parser only ever sees physical rows; this
 	// pins the contract that an unresolvable row is COUNTED as unidentified rather than
 	// silently dropped, which is what makes the gauge meaningful.
-	rows, err := (&Prober{Exec: &slotExec{out: "some_subscription||streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	rows, err := (execProber(&slotExec{out: "some_subscription||streaming"})).ReplicationTopology(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("ReplicationTopology: %v", err)
 	}
@@ -831,7 +852,7 @@ func TestSSLActiveReadsShowSSL(t *testing.T) {
 		want bool
 	}{{"on", true}, {"off", false}, {" on \n", true}} {
 		e := &sqlCaptureExec{ret: c.ret}
-		p := &Prober{Exec: e}
+		p := execProber(e)
 		got, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"})
 		if err != nil {
 			t.Fatalf("ret %q: err = %v", c.ret, err)
@@ -846,14 +867,14 @@ func TestSSLActiveReadsShowSSL(t *testing.T) {
 }
 
 func TestSSLActiveRejectsANonBooleanAnswer(t *testing.T) {
-	p := &Prober{Exec: &sqlCaptureExec{ret: "ERROR"}}
+	p := execProber(&sqlCaptureExec{ret: "ERROR"})
 	if _, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"}); err == nil {
 		t.Fatal("a non-boolean `SHOW ssl` answer must be an error, not a silent false")
 	}
 }
 
 func TestSSLActivePropagatesAQueryFailure(t *testing.T) {
-	p := &Prober{Exec: &fakeExec{err: errors.New("connection refused")}}
+	p := execProber(&fakeExec{err: errors.New("connection refused")})
 	if _, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"}); err == nil {
 		t.Fatal("an unreachable server must be an error, not a report of plaintext")
 	}
@@ -900,7 +921,7 @@ func TestEveryProberQueryDisablesTheStartupFile(t *testing.T) {
 		e := &argCaptureExec{ret: "on"}
 		// Return values and errors are irrelevant here: the assertion is about argv, and
 		// each of these parses the fixed output differently.
-		run(&Prober{Exec: e})
+		run(execProber(e))
 		if len(e.calls) == 0 {
 			t.Errorf("%s ran no psql call", name)
 			continue
@@ -923,7 +944,7 @@ func TestEveryProberQueryDisablesTheStartupFile(t *testing.T) {
 // full restartpoint on it every interval, forever.
 func TestRecoveryTimelinesSplitsDurableFromStreamed(t *testing.T) {
 	e := &sqlCaptureExec{ret: "2|3"}
-	p := &Prober{Exec: e}
+	p := execProber(e)
 	durable, streamed, ok, err := p.RecoveryTimelines(context.Background(), ConnInfo{Host: "x"})
 	if err != nil || !ok || durable != 2 || streamed != 3 {
 		t.Fatalf("got durable=%d streamed=%d ok=%v err=%v, want 2/3", durable, streamed, ok, err)
@@ -946,9 +967,120 @@ func TestRecoveryTimelinesSplitsDurableFromStreamed(t *testing.T) {
 // read 0 as durable would force a restartpoint on every tick.
 func TestRecoveryTimelinesRejectsAnUnparseableAnswer(t *testing.T) {
 	for _, ret := range []string{"", "2", "x|3", "2|y"} {
-		p := &Prober{Exec: &sqlCaptureExec{ret: ret}}
+		p := execProber(&sqlCaptureExec{ret: ret})
 		if _, _, ok, err := p.RecoveryTimelines(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
 			t.Errorf("%q: got ok=%v err=%v, want not-ok with no error", ret, ok, err)
+		}
+	}
+}
+
+// SQL and Timeout are required: a Prober missing either fails the probe instead of
+// silently picking a transport or a deadline.
+func TestProberRequiresSQLAndTimeout(t *testing.T) {
+	if _, _, err := (&Prober{Timeout: time.Second}).InRecovery(context.Background(), ConnInfo{}); err == nil {
+		t.Error("a Prober without SQL ran a probe")
+	}
+	p := execProber(fakeExec{role: "t"})
+	p.Timeout = 0
+	if _, _, err := p.InRecovery(context.Background(), ConnInfo{}); err == nil {
+		t.Error("a Prober without a Timeout ran a probe")
+	}
+}
+
+// A too_many_connections refusal leaves the node unreachable (nothing could be read) but
+// marks it Saturated, the evidence that its postmaster is alive. Any other failure does not.
+func TestProbeMarksATooManyConnectionsRefusalAsSaturated(t *testing.T) {
+	refused := &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "sorry, too many clients already"}
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"too many clients", refused, true},
+		{"wrapped by the dial", fmt.Errorf("failed to connect to `host=pg-1`: %w", refused), true},
+		{"reserved slots", &pgconn.PgError{Severity: "FATAL", Code: "53300", Message: "remaining connection slots are reserved for roles with the SUPERUSER attribute"}, true},
+		{"connection refused", errors.New("dial tcp 10.0.0.1:5432: connect: connection refused"), false},
+		{"deadline", context.DeadlineExceeded, false},
+		{"other FATAL", &pgconn.PgError{Severity: "FATAL", Code: "57P03", Message: "the database system is starting up"}, false},
+	} {
+		ns := (&Prober{SQL: errQuerier{err: c.err}, Timeout: time.Second}).Probe(context.Background(), ConnInfo{Host: "pg-1"})
+		if ns.Reachable {
+			t.Errorf("%s: a failed probe reported Reachable", c.name)
+		}
+		if ns.Saturated != c.want {
+			t.Errorf("%s: Saturated = %v, want %v", c.name, ns.Saturated, c.want)
+		}
+	}
+}
+
+func TestIsConnRefused(t *testing.T) {
+	refused := fmt.Errorf("dial: %w", &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)})
+	if !IsConnRefused(refused) {
+		t.Error("a wrapped ECONNREFUSED must be recognised")
+	}
+	if !IsConnRefused(errors.Join(refused, refused)) {
+		t.Error("every joined attempt refused must be recognised")
+	}
+	for _, err := range []error{
+		&net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ETIMEDOUT)},
+		&pgconn.PgError{Code: sqlstateTooManyConnections},
+		context.DeadlineExceeded,
+		errors.Join(refused, &pgconn.PgError{Code: sqlstateTooManyConnections}),
+		errors.Join(refused, context.DeadlineExceeded),
+	} {
+		if IsConnRefused(err) {
+			t.Errorf("%v must not read as a refused connection", err)
+		}
+	}
+}
+
+func TestNewProberRequiresATransport(t *testing.T) {
+	if _, err := NewProber(nil); err == nil {
+		t.Error("NewProber(nil) must fail")
+	}
+	var cc *ConnCache
+	if _, err := NewProber(cc); err == nil {
+		t.Error("NewProber with a nil *ConnCache must fail")
+	}
+	p, err := NewProber(NewConnCache())
+	if err != nil || p.SQL == nil || p.Timeout != 10*time.Second {
+		t.Errorf("NewProber(NewConnCache()) = %+v, %v", p, err)
+	}
+}
+
+// kindRecorder records the QueryKind of every query.
+type kindRecorder struct{ kinds []QueryKind }
+
+func (k *kindRecorder) QueryText(_ context.Context, _ ConnInfo, kind QueryKind, _ string) (string, error) {
+	k.kinds = append(k.kinds, kind)
+	return "", nil
+}
+
+// Every statement that changes server state is sent as a write, so the transport never
+// re-sends it after a lost reply; probes are reads.
+func TestProberClassifiesWrites(t *testing.T) {
+	ctx := context.Background()
+	for name, c := range map[string]struct {
+		run  func(p *Prober)
+		want []QueryKind
+	}{
+		"Restartpoint":                {func(p *Prober) { _ = p.Restartpoint(ctx, ConnInfo{}) }, []QueryKind{QueryWrite}},
+		"CreatePhysicalSlot":          {func(p *Prober) { _ = p.CreatePhysicalSlot(ctx, ConnInfo{}, "pg_ha_slot_1") }, []QueryKind{QueryWrite}},
+		"DropPhysicalSlotIfInactive":  {func(p *Prober) { _, _ = p.DropPhysicalSlotIfInactive(ctx, ConnInfo{}, "pg_ha_slot_1") }, []QueryKind{QueryWrite}},
+		"SetSynchronizedStandbySlots": {func(p *Prober) { _ = p.SetSynchronizedStandbySlots(ctx, ConnInfo{}, []string{"pg_ha_slot_1"}) }, []QueryKind{QueryWrite, QueryWrite}},
+		"InRecovery":                  {func(p *Prober) { _, _, _ = p.InRecovery(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"PhysicalSlots":               {func(p *Prober) { _, _ = p.PhysicalSlots(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+	} {
+		k := &kindRecorder{}
+		c.run(&Prober{SQL: k, Timeout: time.Second})
+		if len(k.kinds) != len(c.want) {
+			t.Errorf("%s: kinds = %v, want %v", name, k.kinds, c.want)
+			continue
+		}
+		for i := range c.want {
+			if k.kinds[i] != c.want[i] {
+				t.Errorf("%s: kinds = %v, want %v", name, k.kinds, c.want)
+			}
 		}
 	}
 }

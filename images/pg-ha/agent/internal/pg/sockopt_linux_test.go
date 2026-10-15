@@ -1,0 +1,41 @@
+package pg
+
+import (
+	"context"
+	"net"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+// The dialer Control really sets TCP_USER_TIMEOUT on the socket, read back from the kernel.
+func TestSetTCPUserTimeoutAppliesToTheSocket(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	d := net.Dialer{Control: setTCPUserTimeout(tcpUserTimeout)}
+	conn, err := d.DialContext(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	rc, err := conn.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	var gerr error
+	if err := rc.Control(func(fd uintptr) {
+		got, gerr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if want := int(tcpUserTimeout.Milliseconds()); got != want {
+		t.Errorf("TCP_USER_TIMEOUT = %dms, want %d", got, want)
+	}
+}

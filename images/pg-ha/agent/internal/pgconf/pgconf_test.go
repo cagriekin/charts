@@ -8,7 +8,7 @@ import (
 )
 
 func TestAssemblePgHbaIsHardened(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ExtraRules:      []string{"host all readonly 10.0.0.0/8 scram-sha-256"},
@@ -31,7 +31,7 @@ func TestAssemblePgHbaIsHardened(t *testing.T) {
 }
 
 func TestAssemblePgHbaRequireSSL(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		RequireSSL:      true,
@@ -53,16 +53,17 @@ func TestAssemblePgHbaRequireSSL(t *testing.T) {
 }
 
 func TestAssemblePgHbaClientCertAuthExemptsInternalUsers(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		RequireSSL:      true,
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 	})
 	// Internal users get hostssl WITHOUT clientcert (password over TLS).
-	for _, u := range []string{"repmgr", "postgres", "monitoring"} {
+	for _, u := range []string{"repmgr", "postgres", "monitoring", "pgpool_check"} {
 		line := "hostssl     all           " + u + "        10.0.0.0/8        scram-sha-256"
 		if !strings.Contains(out, line) {
 			t.Errorf("mTLS: internal user %q must be exempt from clientcert:\n%s", u, out)
@@ -85,11 +86,12 @@ func TestAssemblePgHbaClientCertAuthExemptsInternalUsers(t *testing.T) {
 }
 
 func TestAssemblePgHbaClientCertAuthSkipsEmptyMonitoringUser(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
+		PgpoolCheckUser: "pgpool_check",
 		// MonitoringUser empty -> no monitoring exemption rule emitted.
 	})
 	if strings.Contains(out, "monitoring") {
@@ -102,7 +104,7 @@ func TestAssemblePgHbaClientCertAuthSkipsEmptyMonitoringUser(t *testing.T) {
 
 func TestAssemblePgHbaDefaultUnchangedByTLSFields(t *testing.T) {
 	// TLS off (zero-value options): byte-identical to the pre-#110 hardened default.
-	out := AssemblePgHba(PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8"})
+	out := mustAssemblePgHba(t, PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8"})
 	if !strings.Contains(out, "host        all           all        10.0.0.0/8        scram-sha-256") {
 		t.Errorf("default must keep the plain host catch-all:\n%s", out)
 	}
@@ -116,13 +118,14 @@ func TestAssemblePgHbaClientCertAuthOnlyForcesHostssl(t *testing.T) {
 	// first, so it still emits the full mTLS rule set -- there is NO plaintext host
 	// catch-all. This is the combination behind the cross-component guard fix (the
 	// exporter/pgpool sslmode guards must fire on clientCertAuth, not just require).
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
 		RequireSSL:      false, // explicitly off
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 	})
 	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
 		t.Errorf("clientCertAuth alone must emit the clientcert catch-all:\n%s", out)
@@ -136,21 +139,22 @@ func TestAssemblePgHbaClientCertAuthOnlyForcesHostssl(t *testing.T) {
 func TestAssemblePgHbaRequireAndClientCertAuthMatchesClientCertOnly(t *testing.T) {
 	// require=true is subsumed by clientCertAuth=true: the rule set is identical whether
 	// require is also set, so the two flags never produce conflicting/duplicate rules.
-	base := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PostgresUser: "postgres"}
+	base := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PostgresUser: "postgres", PgpoolCheckUser: "pgpool_check"}
 	withReq := base
 	withReq.RequireSSL = true
-	if AssemblePgHba(base) != AssemblePgHba(withReq) {
-		t.Errorf("require+clientCertAuth must equal clientCertAuth-only:\n--- cca ---\n%s\n--- cca+req ---\n%s", AssemblePgHba(base), AssemblePgHba(withReq))
+	if mustAssemblePgHba(t, base) != mustAssemblePgHba(t, withReq) {
+		t.Errorf("require+clientCertAuth must equal clientCertAuth-only:\n--- cca ---\n%s\n--- cca+req ---\n%s", mustAssemblePgHba(t, base), mustAssemblePgHba(t, withReq))
 	}
 }
 
 func TestAssemblePgHbaEmptyPostgresUserMTLS(t *testing.T) {
 	// Empty PostgresUser -> no postgres exemption line and no malformed empty-user rule;
 	// the repmgr exemption and the clientcert catch-all are still emitted.
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
+		PgpoolCheckUser: "pgpool_check",
 		// PostgresUser + MonitoringUser empty
 	})
 	if !strings.Contains(out, "hostssl     all           repmgr        10.0.0.0/8        scram-sha-256") {
@@ -166,7 +170,7 @@ func TestAssemblePgHbaEmptyPostgresUserMTLS(t *testing.T) {
 }
 
 func TestAssemblePgHbaMD5FallbackLayersMd5AboveScram(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		MD5Fallback:     true,
@@ -190,12 +194,13 @@ func TestAssemblePgHbaMD5FallbackLayersMd5AboveScram(t *testing.T) {
 }
 
 func TestAssemblePgHbaMD5FallbackMTLSNeverBypassesClientCert(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ClientCertAuth:  true,
 		PostgresUser:    "postgres",
 		MonitoringUser:  "monitoring",
+		PgpoolCheckUser: "pgpool_check",
 		MD5Fallback:     true,
 	})
 	// Internal-user exemptions get an md5 twin (they auth by password over TLS).
@@ -213,7 +218,7 @@ func TestAssemblePgHbaMD5FallbackMTLSNeverBypassesClientCert(t *testing.T) {
 }
 
 func TestAssemblePgHbaMD5FallbackLeavesExtraRules(t *testing.T) {
-	out := AssemblePgHba(PgHbaOptions{
+	out := mustAssemblePgHba(t, PgHbaOptions{
 		ReplicationUser: "repmgr",
 		PeerCIDR:        "10.0.0.0/8",
 		ExtraRules:      []string{"host all readonly 10.0.0.0/8 scram-sha-256"},
@@ -331,5 +336,34 @@ func TestWritePgHbaErrorNamesTheFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "pg_hba.conf") {
 		t.Errorf("error should name the file: %v", err)
+	}
+}
+
+func mustAssemblePgHba(t *testing.T, o PgHbaOptions) string {
+	t.Helper()
+	out, err := AssemblePgHba(o)
+	if err != nil {
+		t.Fatalf("AssemblePgHba: %v", err)
+	}
+	return out
+}
+
+func TestAssemblePgHbaRejectsMissingRequiredFields(t *testing.T) {
+	valid := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PgpoolCheckUser: "pgpool_check"}
+	cases := map[string]func(*PgHbaOptions){
+		"ReplicationUser": func(o *PgHbaOptions) { o.ReplicationUser = "" },
+		"PeerCIDR":        func(o *PgHbaOptions) { o.PeerCIDR = "" },
+		"PgpoolCheckUser": func(o *PgHbaOptions) { o.PgpoolCheckUser = "" },
+	}
+	for field, clear := range cases {
+		o := valid
+		clear(&o)
+		_, err := AssemblePgHba(o)
+		if err == nil || !strings.Contains(err.Error(), field) {
+			t.Errorf("empty %s: want an error naming it, got %v", field, err)
+		}
+	}
+	if _, err := AssemblePgHba(PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8"}); err != nil {
+		t.Errorf("PgpoolCheckUser is only required under ClientCertAuth: %v", err)
 	}
 }

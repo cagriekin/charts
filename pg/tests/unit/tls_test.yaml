@@ -6,13 +6,15 @@ release:
   name: test-pg
 tests:
   # --- Scenario 12 (TLS off): agent values, no client TLS ---
-  - it: TLS off renders no postgresql-configmap (so no ssl=on)
+  # The ConfigMap itself always renders since it carries reserved-connections.conf; with
+  # TLS off it must simply carry no tls.conf.
+  - it: TLS off renders no tls.conf (so no ssl=on)
     values:
       - ../values-agent.yaml
     template: templates/postgresql-configmap.yaml
     asserts:
-      - hasDocuments:
-          count: 0
+      - notExists:
+          path: data["tls.conf"]
 
   - it: TLS off statefulset has no postgresql-tls volume
     values:

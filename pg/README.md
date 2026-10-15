@@ -106,7 +106,8 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. With `ha.enabled` the server runs from the HA image and follows `ha.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` HA image tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
-| `postgresql.username` | Database username | `postgres` |
+| `postgresql.username` | Database username (a superuser; the chart's own tooling logs in as it) | `postgres` |
+| `postgresql.app.username` | Non-superuser application role, owns `postgresql.database` (except `postgres`) -- see [Application role and connection reserves](#application-role-and-connection-reserves) | `app_user` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |
@@ -517,7 +518,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.0.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.2.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -629,12 +630,29 @@ This is the only failover path. It has been the default since `1.0.0`; the legac
 service-updater sidecars were removed in **2.0.0**, and `repmgr.failoverMode` is now rejected at
 render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
+**How it observes.** Every tick the agent queries its own PostgreSQL and every peer (role,
+timeline, WAL position; the primary's replication topology and slots) as the replication user
+over TCP, on **one persistent connection per node** that it keeps across ticks and re-dials when
+the connection fails (pg-ha image 2.2.0, #364). Each query runs under the agent's per-probe
+deadline, so a dead peer is still noticed within that deadline rather than hidden behind a stale
+socket, and a peer that restarted between ticks -- including one that came back on a new pod IP,
+which `TCP_USER_TIMEOUT` detects within 5s -- is re-dialled inside the same probe. Connections
+idle for 5 minutes (a scaled-down ordinal) are closed. An open session is not affected when the
+node reaches `max_connections`; a refused *new* connection ("too many clients") is read as proof
+the node is alive -- see [Application role and connection reserves](#application-role-and-connection-reserves).
+The sessions show as
+`application_name = pg-ha-agent` in `pg_stat_activity`: expect one from each agent on every
+node, so a 3-node cluster holds three such sessions per node. Before 2.2.0 every probe was a
+fresh `psql` process, which in this image resolves to Debian's Perl wrapper; at six to nine probes
+per tick that cost over half a CPU core per *idle* pod on slow vCPUs.
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `ha.agent.leaseDuration` | Lease TTL; a challenger cannot acquire until this elapses since the last renew | `15s` |
 | `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `ha.agent.saturationGrace` | How long a primary refusing the agent with "too many clients" still counts as alive for self-health, and how long a lease-holding standby waits before promoting past a peer refusing it that way; past it, the step-down and the promotion apply again | `2m` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
 | `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Accept the loss per incident with `pg-ha/accept-failover-lag=<pod>` on the marker. Needs the pg-ha image at 2.1.0 or later (render-enforced). See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
@@ -1543,7 +1561,9 @@ in its status.
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2`, render-enforced) | `1` |
+| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x replicaCount + 1`, or `3 x replicaCount + 1` with `pgpool.metrics.enabled` (the exporter logs in as the check role). Changing it restarts the PostgreSQL pods | `7` |
+| `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
 | `pgpool.maxPool` | Max cached connections per process | `4` |
@@ -1629,12 +1649,15 @@ in its status.
 | `postgresql.existingSecret.databaseKey` | Database key in secret | `database` |
 | `postgresql.existingSecret.repmgrPasswordKey` | Repmgr password key in secret | `repmgr-password` |
 | `postgresql.existingSecret.monitoringPasswordKey` | Monitoring-user password key in secret (required when `prometheusExporter.monitoringUser.enabled`) | `monitoring-password` |
+| `postgresql.existingSecret.appPasswordKey` | Application-role (`postgresql.app`) password key in secret | `app-password` |
+| `postgresql.existingSecret.pgpoolCheckPasswordKey` | pgpool check-role (`pgpool.checkUser`) password key in secret | `pgpool-check-password` |
 
 When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-generated with:
 - `username`: Base64 encoded value from `postgresql.username`
 - `password`: Random 32 character alphanumeric string
 - `database`: Base64 encoded value from `postgresql.database`
 - `repmgr-password`: Random 32 character alphanumeric string (when `ha.enabled` is true — the key keeps its 1.x name; see `ha.username`)
+- `app-password`, `pgpool-check-password`: Random 32 character alphanumeric strings, kept across upgrades
 
 ### Service Parameters
 
@@ -1717,6 +1740,61 @@ When enabled, NetworkPolicies restrict traffic:
 > For clients in another namespace, add a `namespaceSelector` (alone, or combined with
 > `podSelector` in the same `from` entry) — `podSelector` matches the policy's own
 > namespace only.
+
+## Application role and connection reserves
+
+PostgreSQL refuses a **new** connection once `max_connections` is used up. Superusers get a
+small emergency pool, `superuser_reserved_connections`, but every superuser shares it. The HA
+agent and the chart's own tooling log in as superusers, and so does `postgresql.username`. So
+an application connecting as `postgresql.username` can use up the very slots the agent needs to
+reconnect to a full node.
+
+The chart splits connections into three pools:
+
+| Pool | Who | Size |
+|------|-----|------|
+| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one session to every node). Standalone: 3 |
+| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x pgpool.replicaCount + 1`, `3 x` with `pgpool.metrics.enabled`) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
+| the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
+
+Both reserves live in a chart-owned `reserved-connections.conf`. Setting them in
+`postgresql.configuration` is refused, and so is a `max_connections` that leaves no room for
+applications. Raise `max_connections` (default 100) to grow the application pool. Requires
+PostgreSQL 16+ (`reserved_connections` is new in 16).
+
+The reserves only isolate the agent if applications are not superusers. The chart therefore
+provisions two non-superuser `LOGIN` roles, re-asserting their definition on every primary
+start: no elevated attribute, the password from the release Secret. In HA mode the agent does
+this on the primary; standalone does it in the postStart hook. Roles the chart creates are marked
+with `COMMENT ON ROLE ... IS 'managed by the pg chart'`. A same-named role without that mark is
+never converted: provisioning stops with an error naming it (logged by the agent; a failed
+postStart, and so a container restart, in standalone). Rename the chart value, or hand the role
+over by giving it the mark.
+
+- **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. The exception
+  is `postgres`, the default and the maintenance database: its owner could drop it or set
+  per-database settings that every superuser session there inherits. So on `postgres` the role
+  gets `CONNECT` and `USAGE, CREATE` on schema `public` instead, and the database keeps its
+  owner. Point applications at it, through pgpool or directly; the password is the Secret's
+  `app-password` key. Objects created earlier by `postgresql.username` keep their owner, so
+  grant access (or `REASSIGN OWNED`) before switching. Applications still using
+  `postgresql.username` keep working, just without the isolation.
+- **`pgpool.checkUser.username` (default `pgpool_check`)** is what pgpool's health and
+  streaming checks log in as. It holds `pg_monitor` and `pg_use_reserved_connections`, so on a
+  full node the checks still get a slot and pgpool does not detach the node. A new pgpool pod
+  waits in its `wait-check-role` init container until the role can log in.
+
+When a node does refuse the agent with `too many clients` (SQLSTATE 53300):
+
+- **The agent counts it as alive, for a while.** A full primary is not stepped down by
+  self-health for up to `ha.agent.saturationGrace` (2m), and the agent waits instead of acting
+  on it. Past the grace it counts as not running again: a primary whose slots are all held by
+  sessions stuck on hung storage refuses connections the same way, and must still fail over.
+- **A lease-holding standby holds off.** It waits up to `ha.agent.saturationGrace` before promoting
+  past a full peer whose WAL position it cannot read, unless that peer's fresh gossip shows it
+  is not ahead.
+- **It is exported.** `pg_ha_agent_local_saturated` and `pg_ha_agent_peers_saturated` report
+  it, and the agent logs each transition.
 
 ## Databases & roles
 
@@ -3191,7 +3269,7 @@ Check that the Services have endpoints (`my-postgres-pg-readonly` exists when `h
 kubectl get endpoints my-postgres-pg my-postgres-pg-pgpool my-postgres-pg-readonly
 ```
 
-The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pg-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
+The PGPool-II probes ask pgpool itself over its PCP port (`pcp_node_info`) and open no PostgreSQL session: a session through pgpool leaves a cached backend connection behind, and on a node at `max_connections` that connection would come out of a reserved pool. Readiness requires node 0 -- the primary, the write path -- to be up and at least one pgpool child to be free (`pcp_proc_info`), so empty `my-postgres-pg-pgpool` endpoints mean pgpool has the primary marked down, every child is busy (raise `pgpool.numInitChildren` or add replicas), or PCP does not answer. Liveness never restarts a pgpool that is merely saturated. A detached read backend never makes pgpool unready; the re-attach loop brings it back. Liveness restarts PGPool-II after about 60 seconds when PCP stops answering or every backend is marked down.
 
 If reads through the `my-postgres-pg-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the agent re-applies every reconcile tick, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
 

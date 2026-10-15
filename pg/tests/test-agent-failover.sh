@@ -224,10 +224,34 @@ holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.hold
 
 if [[ "${holder}" == "${POD0}" ]]; then
   echo "  Lease is on ${POD0}; moving it to ${POD1} first..."
+  # Right after the cold boot ${POD1} may still be recording the new timeline in its control
+  # file (the agent forces a restartpoint for it). Taking the Lease before that, it reads the
+  # old timeline once the walreceiver drops and refuses on the highwater guard (#125), so the
+  # handover under test never happens. Wait until its durable timeline matches the primary's.
+  primary_tl=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT ('x' || substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8))::bit(32)::int" "testuser" "testdb" 2>/dev/null || echo "")
+  standby_tl=""
+  for _ in $(seq 1 30); do
+    standby_tl=$(pg_exec "${NAMESPACE}" "${POD1}" "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), (SELECT min_recovery_end_timeline FROM pg_control_recovery()))" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ -n "${primary_tl}" && "${standby_tl}" == "${primary_tl}" ]] && break
+    sleep 2
+  done
+  assert_eq "${POD1} has recorded the primary's timeline before the Lease is moved to it" "${primary_tl}" "${standby_tl}"
+  park_uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
   kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   for _ in $(seq 1 30); do
     holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
     [[ "${holder}" == "${POD1}" ]] && break
+    sleep 5
+  done
+  # Wait for the REPLACEMENT ${POD0}, by uid. A label-selected readiness count can be satisfied
+  # by the old, still-terminating instance (it stays Ready through its grace period), and the
+  # kubectl exec below then lands on a pod that is going away: the data directory is never
+  # emptied and the disk-loss scenario silently tests nothing (observed: "All 2 pod(s) ready
+  # (0s elapsed)" followed by an empty exec result).
+  for _ in $(seq 1 60); do
+    uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+    ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo "")
+    [[ -n "${uid}" && "${uid}" != "${park_uid}" && "${ready}" == "true" ]] && break
     sleep 5
   done
   wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300 || true
@@ -236,7 +260,16 @@ fi
 if [[ "${holder}" == "${POD1}" ]]; then
   # Something only the surviving primary knows, so a divergent initdb cannot fake it.
   DV="disk-loss-$(date +%s)"
-  pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}')" "testuser" "testdb" 2>/dev/null || true
+  # Holding the Lease is not yet being the primary: when the lease was just parked on ${POD1},
+  # it promotes a tick or two later, and a write before that is rejected read-only -- the
+  # marker row then never exists and the clone assertion below fails for the wrong reason.
+  # Wait for ${POD1} to leave recovery, and require the write to land.
+  for _ in $(seq 1 60); do
+    [[ "$(pg_exec "${NAMESPACE}" "${POD1}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")" == "f" ]] && break
+    sleep 2
+  done
+  dv_written=$(pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}') RETURNING value" "testuser" "testdb" 2>/dev/null | head -1 || echo "")
+  assert_eq "the marker row lands on ${POD1} (the primary) before ${POD0}'s disk is lost" "${DV}" "${dv_written}"
 
   echo "  Emptying ${POD0}'s data directory (simulated disk loss)..."
   # `|| echo ""` like every other capture in this file: the preceding readiness wait is

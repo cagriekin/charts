@@ -71,6 +71,18 @@ inside the main container where it can be fenced.
 | `PGBACKREST_ENABLED` | No | Set to `true` to enable WAL archiving via pgBackRest during initdb |
 | `PGBACKREST_STANZA` | No | pgBackRest stanza name (default: `db`). Only used when `PGBACKREST_ENABLED=true` |
 
+### agent mode
+
+The chart's `ENVIRONMENT.md` lists the full set. Since 2.2.0 the agent also requires
+`APP_USER`/`APP_PASSWORD` and `PGPOOL_CHECK_USER`/`PGPOOL_CHECK_PASSWORD`, plus `POSTGRES_USER` and
+`POSTGRES_DB`, so **image 2.2.0 needs the pg/pgvector chart 2.5.0 or newer**; on an older chart the
+agent refuses to start. On the primary it provisions those two non-superuser roles over the local
+socket, marking them with `COMMENT ON ROLE ... IS 'managed by the pg chart'`. It refuses to start
+if one is named like the superuser, the replication user or the monitoring user. A same-named role
+that lacks the mark does not stop the agent: it logs the error once, leaves that role untouched
+and unprovisioned for the life of the process, and keeps running. Rename the chart value, or hand
+the role over with `COMMENT ON ROLE <name> IS 'managed by the pg chart'` and restart the pod.
+
 ### init mode
 
 Reads exactly one variable (#290). It used to need the credentials, the headless service and the

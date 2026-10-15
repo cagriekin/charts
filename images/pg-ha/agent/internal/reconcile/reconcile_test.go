@@ -672,3 +672,53 @@ func TestLagGateDoesNotPreemptEarlierGuards(t *testing.T) {
 		t.Errorf("highwater guard should speak before the gate: %+v", got)
 	}
 }
+
+// A peer refusing connections at max_connections is alive with an unknown position. Within
+// its grace a lease-holding standby waits rather than promote past it, unless fresh gossip
+// shows it is not ahead; past the grace the ordinary unreachable-peer logic applies.
+func TestDecideSaturation(t *testing.T) {
+	localStandby := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
+	saturated := func(p PeerState, wait bool) PeerState {
+		p.Reachable, p.Saturated, p.SaturatedWait = false, true, wait
+		return p
+	}
+	cases := []struct {
+		name string
+		obs  Observation
+		want Action
+	}{
+		{"saturated local primary, process alive, holder -> wait, never a step-down",
+			Observation{HoldLease: true, LocalProcessAlive: true, Local: LocalState{HasData: true, Saturated: true, Timeline: tl(5), TimelineOK: true}}, Wait},
+		{"saturated peer without gossip inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, true)}}, Wait},
+		{"saturated peer whose gossip is ahead, inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x200), true)}}, Wait},
+		{"saturated peer whose gossip is behind -> promote",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(gossipPeer("pg-2", 5, 5, 0x80), true)}}, Promote},
+		{"saturated peer whose gossip carries no LSN, inside grace -> wait",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(func() PeerState {
+				p := gossipPeer("pg-2", 5, 5, 0x80)
+				p.LSNOK = false
+				return p
+			}(), true)}}, Wait},
+		{"saturated peer past its grace -> promote",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{saturated(PeerState{Name: "pg-2"}, false)}}, Promote},
+		{"reachable peer ahead still wins the handoff over a saturated one",
+			Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-1", 5, 5, 0x200), saturated(PeerState{Name: "pg-2"}, true)}}, ReleaseLease},
+		{"saturated local standby holder inside the grace -> wait",
+			Observation{HoldLease: true, LocalProcessAlive: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, Wait},
+		{"saturated local standby holder past the grace -> release the lease",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, ReleaseLease},
+		{"local standby holder past the grace on a timeout tick -> release the lease",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, InRecovery: true}}, ReleaseLease},
+		{"saturated local standby past the grace without the lease -> wait",
+			Observation{LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true, InRecovery: true}}, Wait},
+		{"saturated local primary holder past the grace, not yet stuck -> wait for self-health",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalSaturationExpired: true, Local: LocalState{HasData: true, Saturated: true}}, Wait},
+	}
+	for _, c := range cases {
+		if got := Decide(c.obs); got.Action != c.want {
+			t.Errorf("%s: got %v (%s), want %v", c.name, got.Action, got.Reason, c.want)
+		}
+	}
+}

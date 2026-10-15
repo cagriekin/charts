@@ -293,6 +293,19 @@
         },
         "resources": {
           "$ref": "#/definitions/resources"
+        },
+        "app": {
+          "type": "object",
+          "description": "Application role: a non-superuser LOGIN provisioned by the chart. Owns postgresql.database, except the maintenance database \"postgres\", where it gets CONNECT and USAGE, CREATE on schema public.",
+          "required": [
+            "username"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+            }
+          }
         }
       }
     },
@@ -498,6 +511,24 @@
               "$ref": "#/definitions/resources"
             }
           }
+        },
+        "checkUser": {
+          "type": "object",
+          "description": "Role pgpool's health and streaming checks log in as (pg_monitor + pg_use_reserved_connections), provisioned by the chart.",
+          "required": [
+            "username"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "pattern": "^[a-z_][a-z0-9_]{0,62}$"
+            }
+          }
+        },
+        "reservedConnections": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "reserved_connections for pgpool's check role on every PostgreSQL node; at least 2 x pgpool.replicaCount + 1, or 3 x with pgpool.metrics.enabled (render-enforced). Changing it restarts PostgreSQL pods."
         }
       }
     },

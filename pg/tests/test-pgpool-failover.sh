@@ -40,6 +40,18 @@ via_pgpool() {
     env PGPASSWORD="${PGPW}" psql -h "${PGPOOL}" -p 9999 -U testuser -d testdb -tAc "$2" 2>&1
 }
 
+# SHOW POOL_NODES rows are node_id|hostname|port|status|pg_status|...; pgpool's own attach state
+# is `status`. `pg_status` turns "up" as soon as the backend answers, while the node may still be
+# detached, so a bare "|up|" match would report a re-attach that has not happened. An attached
+# node no client has used yet is "waiting".
+# up_backends <rows> -> how many backends pgpool has attached.
+up_backends() { printf '%s\n' "$1" | awk -F'|' '$4 == "up" || $4 == "waiting"' | wc -l | tr -d ' '; }
+# ro_attached <rows> -> "true" when pgpool has the -readonly backend attached, "false" when it is
+# detached, "" when the row is missing.
+ro_attached() {
+  printf '%s\n' "$1" | awk -F'|' '$2 ~ /-readonly\./ { print (($4 == "up" || $4 == "waiting") ? "true" : ($4 == "down" ? "false" : "")) }'
+}
+
 # --- settle the primary/standby pair ---
 echo "  Waiting for a single primary to settle (up to 240s)..."
 PRIMARY=""; STANDBY=""; s=0
@@ -54,7 +66,7 @@ assert_contains "agent elected a primary" "${PRIMARY:-none}" "${FULLNAME}"
 
 # --- health check: PGPool sees its backends; the primary (RW Service) backend is up ---
 nodes=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
-up_count=$(printf '%s\n' "${nodes}" | grep -c "|up|" || true)
+up_count=$(up_backends "${nodes}")
 assert_gt "#32 health check: PGPool reports a backend up (SHOW POOL_NODES)" "${up_count}" "0"
 
 # --- write through PGPool before failover -> routes to the RW (primary) backend ---
@@ -98,7 +110,7 @@ if [[ "${promoted}" == "true" ]]; then
   on_new=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT v FROM pp_fo WHERE v='${AFTER}'" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "#32: post-failover write landed on the new primary" "${AFTER}" "${on_new}"
   nodes2=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
-  up2=$(printf '%s\n' "${nodes2}" | grep -c "|up|" || true)
+  up2=$(up_backends "${nodes2}")
   assert_gt "#32: PGPool has a healthy backend after failover (excluded the dead primary)" "${up2}" "0"
 else
   skip "#32: client connections recover (failover did not complete)"
@@ -121,7 +133,7 @@ ro_ready=false; s=0
 while [[ ${s} -lt 240 ]]; do
   ro_eps=$(kubectl get endpointslices -n "${NAMESPACE}" -l "kubernetes.io/service-name=${FULLNAME}-readonly" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{" "}{end}' 2>/dev/null || true)
   nodes_pre=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
-  if [[ "${ro_eps}" == *true* ]] && printf '%s\n' "${nodes_pre}" | grep -q -- "-readonly.*|up|"; then ro_ready=true; break; fi
+  if [[ "${ro_eps}" == *true* ]] && [[ "$(ro_attached "${nodes_pre}")" == "true" ]]; then ro_ready=true; break; fi
   sleep 5; s=$((s + 5))
 done
 assert_eq "#361: precondition -- the RO backend is attached and the -readonly Service has a ready endpoint" "true" "${ro_ready}"
@@ -132,7 +144,7 @@ kubectl patch svc "${FULLNAME}-readonly" -n "${NAMESPACE}" --type merge -p '{"sp
 detached=false; s=0
 while [[ ${s} -lt 120 ]]; do
   nodes_mid=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
-  if printf '%s\n' "${nodes_mid}" | grep -q -- "-readonly.*|down|"; then detached=true; echo "  RO backend detached after ${s}s"; break; fi
+  if [[ "$(ro_attached "${nodes_mid}")" == "false" ]]; then detached=true; echo "  RO backend detached after ${s}s"; break; fi
   sleep 5; s=$((s + 5))
 done
 assert_eq "#361: PGPool detaches the unreachable RO backend" "true" "${detached}"
@@ -146,7 +158,7 @@ kubectl patch svc "${FULLNAME}-readonly" -n "${NAMESPACE}" --type merge -p '{"sp
 reattached=false; s=0
 while [[ ${s} -lt 120 ]]; do
   nodes_post=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
-  if printf '%s\n' "${nodes_post}" | grep -q -- "-readonly.*|up|"; then reattached=true; echo "  RO backend re-attached after ${s}s"; break; fi
+  if [[ "$(ro_attached "${nodes_post}")" == "true" ]]; then reattached=true; echo "  RO backend re-attached after ${s}s"; break; fi
   sleep 5; s=$((s + 5))
 done
 assert_eq "#361: the re-attach loop re-attaches the RO backend once the Service answers" "true" "${reattached}"

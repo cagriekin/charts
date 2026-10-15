@@ -42,7 +42,7 @@ assert_not_contains "minimal: no service-updater sidecar" "${minimal}" "name: se
 assert_not_contains "minimal: no pod annotations on statefulset" "${minimal}" "karpenter.sh/do-not-disrupt"
 
 # Minimal: should NOT have pgpool
-assert_not_contains "minimal: no pgpool deployment" "${minimal}" "pgpool"
+assert_not_contains "minimal: no pgpool deployment" "${minimal}" "app.kubernetes.io/component: pgpool"
 
 # Minimal: should NOT have prometheus exporter
 assert_not_contains "minimal: no prometheus exporter" "${minimal}" "postgres-exporter"
@@ -1807,20 +1807,49 @@ assert_not_contains "#298: ...in the same awk pass, not a pre-pass that can drop
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
-# Test: configuration disabled still renders setup-config, which strips a
-# stale include_dir left in PGDATA by a previous enable (#107)
-no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
-assert_not_contains "no config: no postgresql-config configmap" "${no_config}" "postgresql-config"
-assert_contains "no config: setup-config init container still present" "${no_config}" "name: setup-config"
-assert_contains "no config: setup-config strips stale include_dir" "${no_config}" 'grep -v "include_dir'
-assert_not_contains "no config: setup-config does not append include_dir" "${no_config}" 'echo "include_dir'
-assert_not_contains "no config: no checksum annotation" "${no_config}" "checksum/postgresql-config"
-assert_not_contains "no config: no conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
+# The standalone postStart hook provisions the managed roles with its own copy of the SQL the
+# agent runs in HA mode (pg.EnsureRole, images/pg-ha/agent/internal/pg/roles.go): the image and
+# the chart cannot share one file. Every dynamic statement must appear in both, in both
+# directions, so the two definitions of a managed role cannot drift apart.
+roles_go="$(cd "${SCRIPT_DIR}/../.." && pwd)/images/pg-ha/agent/internal/pg/roles.go"
+standalone_hook=$(helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --show-only templates/statefulset.yaml 2>&1)
+agent_formats=$(grep -o "format('[^']*'" "${roles_go}" | sort -u)
+hook_formats=$(grep -o "format('[^']*'" <<< "${standalone_hook}" | sort -u)
+assert_gt "managed roles: roles.go has dynamic statements to compare" "$(grep -c . <<< "${agent_formats}")" "5"
+assert_eq "managed roles: the standalone hook runs exactly the agent's role statements" "${agent_formats}" "${hook_formats}"
+assert_contains "managed roles: the hook guards the public-schema grant like the agent" "${standalone_hook}" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
+assert_contains "managed roles: roles.go guards the public-schema grant" "$(cat "${roles_go}")" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
+# The ownership marker and the refusal of an unmarked same-named role must match too.
+for needle in "v_marker TEXT := 'managed by the pg chart';" \
+  "SET pg_stat_statements.track = 'none';" \
+  "SET pg_stat_statements.track_utility = off;" \
+  "RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %'"; do
+  assert_contains "managed roles: roles.go carries: ${needle:0:60}" "$(cat "${roles_go}")" "${needle}"
+  assert_contains "managed roles: the hook carries: ${needle:0:60}" "${standalone_hook}" "${needle}"
+done
 
-# Test: repmgr defaults (no configuration set) also render the cleanup
+# reserved_connections needs a PostgreSQL restart, so it is pgpool.reservedConnections, not a
+# function of pgpool.replicaCount: scaling pgpool within it must not change the PostgreSQL
+# pods' config checksum (and so must not roll the database).
+cks_pgpool1=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+cks_pgpool3=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=3 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+assert_eq "reserves: scaling pgpool 1 -> 3 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool3}"
+
+# Test: with no postgresql.configuration the ConfigMap still renders and is wired in, since it
+# carries reserved-connections.conf. The include_dir strip that #107 needed when conf.d could
+# disappear is gone with that possibility: setup-config only ever appends.
+no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
+assert_contains "no config: postgresql-config configmap renders (connection reserves)" "${no_config}" "reserved-connections.conf"
+assert_contains "no config: setup-config init container still present" "${no_config}" "name: setup-config"
+assert_not_contains "no config: setup-config never strips include_dir" "${no_config}" 'grep -v "include_dir'
+assert_contains "no config: setup-config appends include_dir" "${no_config}" 'echo "include_dir'
+assert_contains "no config: checksum annotation" "${no_config}" "checksum/postgresql-config"
+assert_contains "no config: conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
+
 no_config_ha=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
-assert_not_contains "no config HA: no postgresql-config configmap" "${no_config_ha}" "postgresql-config"
-assert_contains "no config HA: setup-config strips stale include_dir" "${no_config_ha}" 'grep -v "include_dir'
+assert_contains "no config HA: postgresql-config configmap renders (connection reserves)" "${no_config_ha}" "reserved-connections.conf"
+assert_not_contains "no config HA: setup-config never strips include_dir" "${no_config_ha}" 'grep -v "include_dir'
 
 # Test: enabled render appends and never strips
 assert_not_contains "config standalone: no include_dir strip when enabled" "${config_standalone}" 'grep -v "include_dir'
@@ -2108,7 +2137,8 @@ assert_contains "#361: agent pgpool: RO backend is detachable" "${agent_pgpool}"
 assert_not_contains "#361: ... and no longer DISALLOW_TO_FAILOVER" "${agent_pgpool}" "backend_flag1 = 'DISALLOW_TO_FAILOVER'"
 pgpool_dep_361=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_eq "#361: the re-attach loop runs beside pgpool (pcp_attach_node once)" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pcp_attach_node -h 127.0.0.1')"
-assert_eq "#361: both probes pin SELECT 1 to the primary" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'NO LOAD BALANCE\*/ SELECT 1')"
+assert_eq "#361: both probes ask pgpool over PCP, not through a PostgreSQL session" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info')"
+assert_not_contains "#361: no probe opens a session through pgpool" "${pgpool_dep_361}" 'psql -h 127.0.0.1 -p 9999'
 pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpool_dep_361_off}" "pcp_attach_node"
 assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"
@@ -3373,11 +3403,10 @@ assert_contains "#308: standalone + walLevel=logical mounts postgresql-config" "
 walevel_standalone_volumes=$(grep -A1 "^      volumes:" <<< "${walevel_standalone_sts}")
 assert_contains "#308: standalone + walLevel=logical declares the matching volume" "${walevel_standalone_volumes}" "name: postgresql-config"
 
-# Byte-stable: an install that touches nothing #308-related must not gain a new
-# ConfigMap just because postgresql.walLevel defaults to "replica" in values.yaml.
-walevel_default_no_cm_rc=0
-helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml >/dev/null 2>&1 || walevel_default_no_cm_rc=$?
-assert_gt "#308: default walLevel renders no configmap at all (byte-stable)" "${walevel_default_no_cm_rc}" "0"
+# The default walLevel ("replica") must not emit wal-level.conf. The ConfigMap itself always
+# renders now (reserved-connections.conf), so the check is on the file, not the document.
+walevel_default_cm=$(helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308: default walLevel renders no wal-level.conf" "${walevel_default_cm}" "wal-level.conf"
 
 # Custom max_wal_senders must survive: pgbackrest-archive.conf does not re-assert its own.
 maxsenders_custom=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \

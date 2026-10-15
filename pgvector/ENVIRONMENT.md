@@ -13,9 +13,13 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
 | `PGDATA` | string | yes | `/var/lib/postgresql/data/pgdata` | postgres / entrypoint |
-| `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool |
+| `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool, agent (required: superuser for role provisioning over the local socket) |
 | `POSTGRES_PASSWORD` | string | yes | secret (`password`) | entrypoint |
-| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint |
+| `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint, agent (required: database for role provisioning; the application role owns it, unless it is `postgres`) |
+| `APP_USER` | string | yes | `postgresql.app.username` (`app_user`) | agent (provisions the non-superuser application role on the primary), standalone postStart (same) |
+| `APP_PASSWORD` | string | yes | secret (`app-password`, or `postgresql.existingSecret.appPasswordKey`) | agent, standalone postStart |
+| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` (`pgpool_check`) | agent (provisions pgpool's check role: `pg_monitor`, `pg_use_reserved_connections`), standalone postStart (same) |
+| `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`, or `postgresql.existingSecret.pgpoolCheckPasswordKey`) | agent, standalone postStart |
 | `LD_LIBRARY_PATH` | string | no | `/usr/lib/postgresql/<major>/extra-lib` | dynamic linker (`postgresql.extensions.extraLibs`, #309; emitted only when non-empty) |
 
 ## repmgr (both failover modes, when `ha.enabled=true`)
@@ -43,6 +47,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `RENEW_DEADLINE` | duration | yes | `ha.agent.renewDeadline` (10s) | agent |
 | `RETRY_PERIOD` | duration | yes | `ha.agent.retryPeriod` (2s) | agent |
 | `RECONCILE_INTERVAL` | duration | yes | `ha.agent.reconcileInterval` (5s) | agent (tick) |
+| `SATURATION_GRACE` | duration | yes | `ha.agent.saturationGrace` (2m) | agent (how long a local "too many clients" refusal counts as alive for self-health) |
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
 | `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
@@ -133,6 +138,20 @@ the HA table above).
 | `PGBACKREST_ENABLED` | bool | yes | `true` | entrypoint (archive/restore commands) |
 | `PGBACKREST_STANZA` | string | yes | `pgbackrest.stanza` | entrypoint, pgbackrest sidecar |
 | `PGBACKREST_REPO1_S3_*` | string | yes | `pgbackrest.existingSecret` | pgbackrest sidecar |
+
+## pgpool init containers (when `pgpool.enabled=true`)
+
+| Variable | Type | Required | Default / source | Consumer |
+|----------|------|----------|------------------|----------|
+| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` | init-config (`sr_check_user`/`health_check_user` and its `pool_passwd` entry), wait-check-role (login probe) |
+| `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`) | init-config (`pool_passwd`) |
+| `APP_USER` / `APP_PASSWORD` | string | yes | `postgresql.app.username` / secret (`app-password`) | init-config (`pool_passwd`, so pgpool accepts the application role) |
+| `PGPASSWORD` | string | yes | secret (`pgpool-check-password`) | wait-check-role (psql login as the check role before pgpool starts) |
+| `POSTGRES_DB` | string | yes | secret (`database`) | wait-check-role (database the login probe connects to) |
+| `PGSSLMODE` | string | no | `pgpool.tls.backendSslmode`; emitted only when `pgpool.tls.enabled` | wait-check-role and the pgpool container (backend TLS) |
+| `PGSSLROOTCERT` | string | no | `/usr/local/etc/tls/ca.crt`; emitted only when `backendSslmode` is `verify-ca`/`verify-full` | wait-check-role and the pgpool container |
+| `PGSSLCERT` / `PGSSLKEY` | string | no | `/usr/local/etc/tls/backend.crt` / `backend.key`; emitted only with `pgpool.tls.backendClientCert` | wait-check-role and the pgpool container |
+| `POSTGRES_USERNAME` / `POSTGRES_PASSWORD` | string | yes | `pgpool.checkUser.username` / secret (`pgpool-check-password`) | pgpool-exporter sidecar (when `pgpool.metrics.enabled`), which logs in to pgpool as the check role |
 
 ## metrics / exporters
 

@@ -91,17 +91,31 @@ tests:
       - matchRegex:
           path: spec.template.spec.initContainers[0].command[2]
           pattern: PCP_PASS=\$\(printf '%s' "\$PCP_ADMIN_PASSWORD"\)[\s\S]*contains a newline[\s\S]*printf '%s' "\$PCP_PASS" \| md5sum[\s\S]*PCP_PASS_ESC=\$\(printf '%s' "\$PCP_PASS"
-  - it: both probes pin SELECT 1 to the primary (#361)
+  # The probes ask pgpool over PCP and open no PostgreSQL session: a session through pgpool
+  # leaves a cached backend connection behind, which on a full node comes out of a reserve.
+  # Readiness follows node 0 (the write path) only, so a detached read backend never makes
+  # the proxy unready (#361), and requires a free pgpool child; liveness fails only when PCP
+  # stops answering or every backend is down (#122), never for a merely saturated pgpool.
+  - it: both probes use PCP and open no PostgreSQL session
     template: templates/pgpool-deployment.yaml
     set:
       pgpool.enabled: true
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
-          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*\$5 != "" && \$5 != "down" \{ live = 1 \}'
       - matchRegex:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
-          pattern: /\*NO LOAD BALANCE\*/ SELECT 1
+          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*NR == 1 \{ exit !\(\$5 == "up" \|\| \$5 == "waiting"\) \}[\s\S]*pcp_proc_info -h 127\.0\.0\.1 -p 9898 [^\n]* -w -a -v\) \|\| exit 1\n.*grep -q .\^Status \*: Wait for connection.'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: psql
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: pcp_proc_info
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: psql
   # The loop lives in the default command; a custom command with it still enabled would
   # silently drop the only thing that re-attaches a read backend, so the render refuses.
   - it: pgpool.command with pgpool.reattach.enabled fails fast (#361)
@@ -112,3 +126,70 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'pgpool.reattach.enabled=true but pgpool.command is set'
+
+  # --- wait-check-role: pgpool starts only once its check role logs in ---
+  - it: a wait-check-role init container runs after init-config and before pgpool
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: init-config
+      - equal:
+          path: spec.template.spec.initContainers[1].name
+          value: wait-check-role
+      - matchRegex:
+          path: spec.template.spec.initContainers[1].command[2]
+          pattern: 'until err=\$\(PGCONNECT_TIMEOUT=5 psql -h "test-pg[a-z-]*\.NAMESPACE\.svc\.cluster\.local" -p 5432 -U "\$PGPOOL_CHECK_USER" -d "\$POSTGRES_DB"'
+      - equal:
+          path: spec.template.spec.initContainers[1].env[?(@.name=="PGPASSWORD")].valueFrom.secretKeyRef.key
+          value: pgpool-check-password
+
+  - it: under backend TLS the wait connects with pgpool's own client certificate
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.tls.enabled: true
+      pgpool.tls.existingSecret: pgpool-tls
+      pgpool.tls.backendSslmode: verify-ca
+      pgpool.tls.backendClientCert: pgpool-client
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers[1].env
+          content:
+            name: PGSSLCERT
+            value: /usr/local/etc/tls/backend.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PGSSLCERT
+            value: /usr/local/etc/tls/backend.crt
+
+  - it: init-config splices the check and application roles into pool_passwd
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: 'splice\(\$0, "__CHECK_USER__", ENVIRON\["SUB_CHECK_USER"\]\)[\s\S]*splice\(\$0, "__APP_PASSWORD__", ENVIRON\["SUB_APP_PASS"\]\)'
+      - equal:
+          path: spec.template.spec.initContainers[0].env[?(@.name=="APP_PASSWORD")].valueFrom.secretKeyRef.key
+          value: app-password
+
+  # The metrics exporter logs in as the check role: its session makes pgpool open backend
+  # connections, which on a full node must come from reserved_connections, not the superuser
+  # reserve the agent needs.
+  - it: the pgpool exporter logs in as the check role, not the superuser
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].env[?(@.name=="POSTGRES_USERNAME")].value
+          value: pgpool_check
+      - equal:
+          path: spec.template.spec.containers[1].env[?(@.name=="POSTGRES_PASSWORD")].valueFrom.secretKeyRef.key
+          value: pgpool-check-password

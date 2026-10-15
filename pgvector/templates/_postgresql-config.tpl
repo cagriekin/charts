@@ -1,0 +1,1 @@
+../../pg/templates/_postgresql-config.tpl
