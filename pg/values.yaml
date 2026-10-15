@@ -578,7 +578,9 @@ ha:
     # refusal proves the postmaster is up, so a connection storm does not turn into a
     # failover; but a primary whose slots are all held by sessions stuck on hung storage
     # refuses the same way, so past this grace it counts as not running again and
-    # self-health may step it down (after its own leaseDuration grace).
+    # self-health may step it down (after its own leaseDuration grace). It is also how long a
+    # lease-holding standby waits before promoting past a peer refusing it the same way, since
+    # that peer's WAL position is unreadable and may be ahead.
     saturationGrace: 2m
     # Cascading replication (#29). Off by default: every standby streams from the
     # primary. When true, a standby may instead follow another standby (a chain by

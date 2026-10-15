@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -4460,12 +4461,12 @@ func TestObserveSaturatedPrimaryIsNotSteppedDown(t *testing.T) {
 	}
 }
 
-// A peer's saturation grace starts at its first saturated probe, ends after bootstrapGrace,
+// A peer's saturation grace starts at its first saturated probe, ends after SaturationGrace,
 // and restarts after the peer answers again.
 func TestTrackPeerSaturationGrace(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
-	grace := a.bootstrapGrace()
+	grace := a.cfg.SaturationGrace
 	if !a.trackPeerSaturation("pg-1", true, false, false, t0) {
 		t.Fatal("the first saturated probe must start the grace")
 	}
@@ -4473,7 +4474,7 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 		t.Error("still inside the grace")
 	}
 	if a.trackPeerSaturation("pg-1", true, false, false, t0.Add(grace)) {
-		t.Error("the grace must end after bootstrapGrace")
+		t.Error("the grace must end after SaturationGrace")
 	}
 	if a.trackPeerSaturation("pg-1", false, true, false, t0.Add(grace+time.Second)) {
 		t.Error("an answering peer is never in the wait")
@@ -4491,7 +4492,7 @@ func TestTrackPeerSaturationGrace(t *testing.T) {
 func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
-	grace := a.bootstrapGrace()
+	grace := a.cfg.SaturationGrace
 	if a.trackPeerSaturation("pg-1", false, false, false, t0) {
 		t.Error("an unreachable peer outside an episode is not saturated")
 	}
@@ -4515,7 +4516,7 @@ func TestTrackPeerSaturationSurvivesTimeouts(t *testing.T) {
 func TestTrackPeerSaturationEndsOnRefusedConnection(t *testing.T) {
 	a := saturationTestAgent(t, saturatingQuerier{})
 	t0 := time.Unix(1_700_000_000, 0)
-	grace := a.bootstrapGrace()
+	grace := a.cfg.SaturationGrace
 	a.trackPeerSaturation("pg-1", true, false, false, t0)
 	if a.trackPeerSaturation("pg-1", false, false, true, t0.Add(grace/2)) {
 		t.Error("a refused connection ends the episode; the standby no longer waits on it")
@@ -4743,6 +4744,57 @@ func TestLocalSaturationEpisodeExpiredSurvivesTimeouts(t *testing.T) {
 	a.trackLocalSaturation(false, true, true, t0.Add(g+time.Second))
 	if a.localSaturationEpisodeExpired(t0.Add(g + time.Second)) {
 		t.Error("a successful probe ends the episode")
+	}
+}
+
+// switchingQuerier refuses with too_many_connections until timeout is set, then fails
+// every probe the way a timed-out connect does.
+type switchingQuerier struct{ timeout atomic.Bool }
+
+func (q *switchingQuerier) QueryText(ctx context.Context, ci pg.ConnInfo, k pg.QueryKind, s string) (string, error) {
+	if q.timeout.Load() {
+		return "", context.DeadlineExceeded
+	}
+	return saturatingQuerier{}.QueryText(ctx, ci, k, s)
+}
+
+// A timeout tick inside a saturation episode must not gossip the pg_controldata checkpoint
+// position: the node is still running and ahead of it, and a peer's promote check settles on
+// any known gossiped position.
+func TestObserveSaturationEpisodeHidesCheckpointPositionOnTimeoutTicks(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "pg_controldata")
+	script := "#!/bin/sh\n" +
+		"echo \"Database cluster state:               in archive recovery\"\n" +
+		"echo \"Latest checkpoint location:           0/3000000\"\n" +
+		"echo \"Latest checkpoint's TimeLineID:       3\"\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	control := saturationTestAgent(t, refusingQuerier{})
+	control.sup = process.NewSupervisor(&fakePostmaster{running: true})
+	control.pgControlDataBin = bin
+	if o := control.observe(context.Background()); !o.Local.TimelineOK || !o.Local.LSNOK {
+		t.Fatalf("control: outside an episode the checkpoint position stands in, got %+v", o.Local)
+	}
+
+	q := &switchingQuerier{}
+	a := saturationTestAgent(t, q)
+	a.sup = process.NewSupervisor(&fakePostmaster{running: true})
+	a.pgControlDataBin = bin
+	if o := a.observe(context.Background()); o.Local.TimelineOK || o.Local.LSNOK {
+		t.Fatalf("saturated tick gossiped a checkpoint position: %+v", o.Local)
+	}
+	q.timeout.Store(true)
+	o := a.observe(context.Background())
+	if o.Local.Saturated {
+		t.Fatal("the timeout tick must not read as saturated")
+	}
+	if o.Local.TimelineOK || o.Local.LSNOK {
+		t.Errorf("timeout tick inside the episode gossiped the stale checkpoint position: %+v", o.Local)
+	}
+	if !o.Local.InRecovery {
+		t.Error("InRecovery must still come from pg_controldata")
 	}
 }
 

@@ -165,8 +165,8 @@ type agent struct {
 	// steady-state failover is not delayed by a recent agent/pod restart.
 	peersSeen map[string]bool
 	// peerSaturatedSince records when each peer was first seen refusing connections with
-	// too_many_connections in its current episode; cleared when it answers or fails
-	// differently. Bounds PeerState.SaturatedWait. Reconcile goroutine only.
+	// too_many_connections in its current episode; cleared when it answers or refuses TCP
+	// connections. Bounds PeerState.SaturatedWait. Reconcile goroutine only.
 	peerSaturatedSince map[string]time.Time
 	// localSaturated is this tick's local saturation result; localSaturationAlive counts
 	// only a tick that is saturated now, so a timeout between refusals does not.
@@ -1042,8 +1042,10 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			// checkpoint following a promotion -- so gossiping either would let a promoting
 			// holder rank it on stale data and promote past a node that is ahead (timelines
 			// compare first). Leave both unknown. InRecovery is still taken: self-health keys
-			// on it.
-			if !ls.Saturated {
+			// on it. Keyed on the EPISODE, not this tick: a timeout tick between refusals is
+			// the same running node, and gossiping its stale checkpoint position there would
+			// let saturatedPeerBlockingPromote settle on it and promote past this node.
+			if !ls.Saturated && a.localSaturatedSince.IsZero() {
 				ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 				ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK
 			}
@@ -1391,9 +1393,9 @@ func (a *agent) localSaturationEpisodeExpired(now time.Time) bool {
 // those ticks through would promote past it and discard its WAL (invariant 8). This is the
 // opposite of the local rule (localSaturationAlive), where uncertainty leans toward the
 // self-health step-down; for a peer it leans toward not promoting. The grace is
-// bootstrapGrace, 2x LeaseDuration from the first refusal: long enough to ride out a
-// connection spike, bounded because the saturated node's own agent is just as blind to it and
-// cannot take over.
+// cfg.SaturationGrace from the first refusal, the same bound the saturated node applies to
+// itself: long enough to ride out a connection spike, bounded because the saturated node's own
+// agent is just as blind to it and cannot take over.
 func (a *agent) trackPeerSaturation(name string, saturated, reachable, refused bool, now time.Time) bool {
 	since, active := a.peerSaturatedSince[name]
 	if reachable {
@@ -1418,7 +1420,7 @@ func (a *agent) trackPeerSaturation(name string, saturated, reachable, refused b
 		since = now
 		a.peerSaturatedSince[name] = since
 	}
-	return now.Sub(since) < a.bootstrapGrace()
+	return now.Sub(since) < a.cfg.SaturationGrace
 }
 
 // observeStandbyStall sets Observation.StandbyStalled when this node has been a running standby
@@ -2978,7 +2980,7 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 // (#199). md5 transparently authenticates SCRAM-stored passwords too, so this is
 // compat, not a downgrade, and the pod CIDR is trusted.
 func (a *agent) writePgHba() error {
-	content := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
+	content, err := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
 		ReplicationUser: a.cfg.RepmgrUser,
 		PeerCIDR:        a.cfg.PgHbaPeerCIDR,
 		ExtraRules:      a.cfg.PgHbaRules,
@@ -2989,6 +2991,9 @@ func (a *agent) writePgHba() error {
 		PgpoolCheckUser: a.cfg.PgpoolCheckUser,
 		MD5Fallback:     true,
 	})
+	if err != nil {
+		return err
+	}
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
 

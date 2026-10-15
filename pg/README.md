@@ -652,7 +652,7 @@ per tick that cost over half a CPU core per *idle* pod on slow vCPUs.
 | `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
-| `ha.agent.saturationGrace` | How long a primary refusing the agent with "too many clients" still counts as alive for self-health; past it, the step-down applies again | `2m` |
+| `ha.agent.saturationGrace` | How long a primary refusing the agent with "too many clients" still counts as alive for self-health, and how long a lease-holding standby waits before promoting past a peer refusing it that way; past it, the step-down and the promotion apply again | `2m` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
 | `ha.agent.maximumLagOnFailover` | RPO gate on **automatic** failover, in bytes (#273; Patroni's `maximum_lag_on_failover`). A lease-holding standby more than this far behind the primary's last recorded position refuses to promote and releases the lease, so the cluster waits for a closer standby or the returning primary instead of accepting unbounded loss. `0` disables. Accept the loss per incident with `pg-ha/accept-failover-lag=<pod>` on the marker. Needs the pg-ha image at 2.1.0 or later (render-enforced). See [RPO gate](#rpo-gate-on-automatic-failover-273). | `0` |
@@ -1790,7 +1790,7 @@ When a node does refuse the agent with `too many clients` (SQLSTATE 53300):
   self-health for up to `ha.agent.saturationGrace` (2m), and the agent waits instead of acting
   on it. Past the grace it counts as not running again: a primary whose slots are all held by
   sessions stuck on hung storage refuses connections the same way, and must still fail over.
-- **A lease-holding standby holds off.** It waits up to `2 x LeaseDuration` before promoting
+- **A lease-holding standby holds off.** It waits up to `ha.agent.saturationGrace` before promoting
   past a full peer whose WAL position it cannot read, unless that peer's fresh gossip shows it
   is not ahead.
 - **It is exported.** `pg_ha_agent_local_saturated` and `pg_ha_agent_peers_saturated` report

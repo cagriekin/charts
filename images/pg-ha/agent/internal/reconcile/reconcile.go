@@ -90,7 +90,7 @@ type PeerState struct {
 	Saturated bool
 	// SaturatedWait: the peer is in a saturation episode -- started by a
 	// too_many_connections refusal, not yet ended by a successful probe -- and within the
-	// grace the observer allows (2x LeaseDuration from the first refusal). It stays set on
+	// grace the observer allows (SaturationGrace from the first refusal). It stays set on
 	// a tick whose probe timed out: the peer may still be alive and ahead. While set, a
 	// lease-holding standby does not promote past this peer unless its fresh gossip shows
 	// it is not ahead.

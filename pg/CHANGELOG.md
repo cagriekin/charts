@@ -93,10 +93,11 @@
   refusals neither count as alive nor restart the clock, so a node alternating between refusals
   and timeouts cannot renew it forever. A lease-holding standby that stays full past the grace
   releases the Lease instead of waiting for a free slot. A lease-holding standby waits up to
-  `2 x LeaseDuration` before promoting past a full peer whose position it cannot read, including
+  `ha.agent.saturationGrace` before promoting past a full peer whose position it cannot read, including
   on ticks where that peer times out instead of refusing, unless that peer's fresh gossip shows it
   is not ahead (only when both positions are known). A full node gossips neither its last-checkpoint LSN nor its
-  checkpoint timeline, which can lag a promotion. New gauges: `pg_ha_agent_local_saturated`,
+  checkpoint timeline, which can lag a promotion, for the whole episode, including the ticks where
+  its own probe times out instead of being refused. New gauges: `pg_ha_agent_local_saturated`,
   `pg_ha_agent_peers_saturated`.
 
 ### Changed

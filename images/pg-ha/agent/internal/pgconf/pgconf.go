@@ -54,7 +54,18 @@ type PgHbaOptions struct {
 // superuser-exposure risk). With MD5Fallback set, an `md5` line is layered above each
 // generated scram rule for clusters carrying md5-stored passwords (#199). User rules
 // are inserted above the network catch-alls so they take precedence (#144 ordering).
-func AssemblePgHba(o PgHbaOptions) string {
+// The role names and the CIDR are interpolated into rule lines, so an empty required one
+// would write a pg_hba.conf the postmaster cannot load; it is an error instead.
+func AssemblePgHba(o PgHbaOptions) (string, error) {
+	if o.ReplicationUser == "" {
+		return "", fmt.Errorf("assemble pg_hba.conf: ReplicationUser is required")
+	}
+	if o.PeerCIDR == "" {
+		return "", fmt.Errorf("assemble pg_hba.conf: PeerCIDR is required")
+	}
+	if o.ClientCertAuth && o.PgpoolCheckUser == "" {
+		return "", fmt.Errorf("assemble pg_hba.conf: PgpoolCheckUser is required under ClientCertAuth")
+	}
 	var b strings.Builder
 	b.WriteString("# Managed by pg-ha-agent (agent mode); edits are overwritten.\n")
 	b.WriteString("local       all           all                              trust\n")
@@ -92,7 +103,7 @@ func AssemblePgHba(o PgHbaOptions) string {
 	default:
 		emitRule(&b, fmt.Sprintf("host        all           all        %s        scram-sha-256", o.PeerCIDR), o.MD5Fallback)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // emitRule writes a pg_hba rule line. With md5Fallback it first writes the same rule
