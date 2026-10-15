@@ -25,7 +25,9 @@
   resolved. Rename the chart value, or hand the role over with
   `COMMENT ON ROLE <name> IS 'managed by the pg chart'` (it is then converted). A name that
   collides with `postgresql.username`, `ha.username`, the monitoring user or a
-  `postgresql.roles[]` entry is refused at render time. In HA the agent provisions them once the
+  `postgresql.roles[]` entry is refused at render time, and so are `all`, `public`, `none` and
+  names starting with `pg_` (PostgreSQL refuses them as role names, and pg_hba reads `all` as
+  every user). In HA the agent provisions them once the
   node is observed as a primary (not on the promotion tick itself, while it may still be in
   recovery). Provisioning turns `pg_stat_statements` tracking off for its own session before any
   password or verifier is sent, so neither is recorded even with `track = all`. A marked role

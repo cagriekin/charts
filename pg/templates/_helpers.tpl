@@ -285,6 +285,12 @@ annotation consumers -- #128.)
 {{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" $u) -}}
 {{- fail (printf "%s is %q: it must be a plain lower-case PostgreSQL identifier (^[a-z_][a-z0-9_]{0,62}$)" $path $u) -}}
 {{- end -}}
+{{- /* "all" is the pg_hba.conf user wildcard: the check role's clientcert exemption line would
+       match every role and disable client-certificate auth cluster-wide. public, none and pg_*
+       are names CREATE ROLE refuses, so provisioning would fail forever. */ -}}
+{{- if or (has $u (list "all" "public" "none")) (hasPrefix "pg_" $u) -}}
+{{- fail (printf "%s is %q, a reserved name (all, public, none, pg_*): PostgreSQL refuses it as a role name or pg_hba.conf reads it as a wildcard" $path $u) -}}
+{{- end -}}
 {{- $u -}}
 {{- end -}}
 

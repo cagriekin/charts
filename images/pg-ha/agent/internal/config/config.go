@@ -412,6 +412,11 @@ func Load(get func(string) string) (*Config, error) {
 		if m.val == "" {
 			continue // reported as missing above
 		}
+		// PostgreSQL refuses these names in CREATE ROLE, so provisioning would fail on every
+		// primary tick and pgpool would wait in Init forever.
+		if m.val == "public" || m.val == "none" || strings.HasPrefix(m.val, "pg_") {
+			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q is a role name PostgreSQL reserves (public, none, pg_*): the role can never be created", m.name, m.val))
+		}
 		for _, o := range []struct{ name, val string }{
 			{"POSTGRES_USER", c.PostgresUser},
 			{"REPMGR_USER", c.RepmgrUser},
@@ -443,6 +448,7 @@ func Load(get func(string) string) (*Config, error) {
 		{"REPMGR_USER", c.RepmgrUser},
 		{"POSTGRES_USER", c.PostgresUser},
 		{"MONITORING_USER", c.MonitoringUser},
+		{"PGPOOL_CHECK_USER", c.PgpoolCheckUser},
 	} {
 		if strings.ContainsAny(u.val, " \t\r\n") {
 			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q must not contain whitespace: it is written verbatim into pg_hba.conf", u.name, u.val))

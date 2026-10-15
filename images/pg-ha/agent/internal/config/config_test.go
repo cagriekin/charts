@@ -119,7 +119,7 @@ func TestLoadRejectsWhitespaceInRoleNames(t *testing.T) {
 // widen which rules match.
 func TestLoadRoleNameStructureIsAnchoredWhereItShouldBe(t *testing.T) {
 	rejected := []string{"all", "ALL", "a,b", `ab"cd`, "+role", "@file"}
-	for _, key := range []string{"REPMGR_USER", "POSTGRES_USER", "MONITORING_USER"} {
+	for _, key := range []string{"REPMGR_USER", "POSTGRES_USER", "MONITORING_USER", "PGPOOL_CHECK_USER"} {
 		for _, v := range rejected {
 			m := fullEnv()
 			m["POSTGRES_USER"] = "app"
@@ -779,6 +779,15 @@ func TestLoadManagedRoles(t *testing.T) {
 		m[c.key] = m[c.other]
 		if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), c.key) {
 			t.Errorf("%s equal to %s must fail, got %v", c.key, c.other, err)
+		}
+	}
+	for _, key := range []string{"APP_USER", "PGPOOL_CHECK_USER"} {
+		for _, v := range []string{"public", "none", "pg_check"} {
+			m := fullEnv()
+			m[key] = v
+			if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("%s=%q is reserved by PostgreSQL and must fail, got %v", key, v, err)
+			}
 		}
 	}
 	m := fullEnv()

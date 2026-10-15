@@ -168,6 +168,22 @@ tests:
     asserts:
       - failedTemplate: {}
 
+  - it: a check role named all (the pg_hba wildcard) is refused
+    template: templates/statefulset.yaml
+    set:
+      pgpool.checkUser.username: all
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.checkUser\.username is "all", a reserved name'
+
+  - it: an application role with a name PostgreSQL reserves is refused
+    template: templates/statefulset.yaml
+    set:
+      postgresql.app.username: pg_app
+    asserts:
+      - failedTemplate:
+          errorPattern: 'postgresql\.app\.username is "pg_app", a reserved name'
+
   - it: the two managed roles must differ
     template: templates/statefulset.yaml
     set:
