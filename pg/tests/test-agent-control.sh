@@ -44,6 +44,7 @@ CERTDIR=$(mktemp -d)
 cleanup() {
   # Kill any port-forward this suite started, then drop the certs.
   [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" 2>/dev/null || true
+  [[ -n "${WATCH_PID:-}" ]] && kill "${WATCH_PID}" 2>/dev/null || true
   rm -rf "${CERTDIR}"
 }
 trap cleanup EXIT
@@ -449,11 +450,22 @@ assert_eq "the rebuilt standby re-qualifies as a switchover candidate" "ok" "${c
 
 # --- the switchover actually moves leadership ---
 
+# The leader clears the request on its next tick, which can land before a kubectl get issued
+# after the 202, so watch the marker across the request instead of reading it afterwards.
+MARKER_WATCH="${CERTDIR}/marker-watch"
+kubectl get configmap "${MARKER}" -n "${NAMESPACE}" --watch \
+  -o jsonpath='{.metadata.annotations.pg-ha/switchover-target}{" "}{.metadata.annotations.pg-ha/switchover-requested-by}{"\n"}' \
+  > "${MARKER_WATCH}" 2>/dev/null &
+WATCH_PID=$!
+sleep 2
 sw_code=$(api_code POST /v1/switchover "{\"leader\":\"${LEADER}\",\"candidate\":\"${CANDIDATE}\"}")
 assert_eq "POST /v1/switchover is accepted (202)" "202" "${sw_code}"
-recorded=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-target}' 2>/dev/null || true)
+sleep 3
+kill "${WATCH_PID}" 2>/dev/null || true
+wait "${WATCH_PID}" 2>/dev/null || true
+recorded=$(awk -v c="${CANDIDATE}" '$1 == c { print $1; exit }' "${MARKER_WATCH}")
 assert_eq "the switchover request is on the marker kubectl uses" "${CANDIDATE}" "${recorded}"
-requested_by=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-requested-by}' 2>/dev/null || true)
+requested_by=$(awk -v c="${CANDIDATE}" '$1 == c { print $2; exit }' "${MARKER_WATCH}")
 assert_eq "the switchover requester is recorded" "ops-admin" "${requested_by}"
 
 echo "  Waiting for leadership to move to ${CANDIDATE} (up to 300s)..."
