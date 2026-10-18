@@ -1145,9 +1145,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Connection reserves. PostgreSQL refuses a NEW connection once max_connections is
        used up, which used to blind the agent: a reconnect to a full node failed, and a full
        primary was then indistinguishable from a dead one. Three pools instead of one:
-         - superuser_reserved_connections: superusers only. Every agent holds one session to
-           every node, so a node needs one slot per node, plus 3 for reconnect overlap, the
-           chart's superuser tooling (backups, hook Jobs) and an operator's psql.
+         - superuser_reserved_connections: superusers only. Every agent holds one READ
+           session to every node, so a node needs one slot per node, plus 3 for reconnect
+           overlap, the agent's short-lived write connection (CHECKPOINT, ALTER SYSTEM and
+           slot create/drop run on a connection of their own since image 2.3.0, #371, so a
+           long statement never holds the session the probes share), the chart's superuser
+           tooling (backups, hook Jobs) and an operator's psql. A write that finds the
+           reserve full gets a 53300, is logged and retried by its caller, and is never read
+           as a node classification -- only the read probe feeds saturation tracking.
            Standalone has no agent: PostgreSQL's own 3.
          - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
            i.e. pgpool's check role: pgpool.reservedConnections, at least 2 per pgpool

@@ -1057,7 +1057,10 @@ func (k *kindRecorder) QueryText(_ context.Context, _ ConnInfo, kind QueryKind, 
 }
 
 // Every statement that changes server state is sent as a write, so the transport never
-// re-sends it after a lost reply; probes are reads.
+// re-sends it after a lost reply and (#371) runs it on a connection of its own; every probe is
+// a read on the cached session. The kind sets the COST as well as the retry rule: a read
+// misfiled as a write pays a dial per tick (the regression #364 removed), a write misfiled as
+// a read may be re-sent and can hold the shared session for seconds. Hence every method.
 func TestProberClassifiesWrites(t *testing.T) {
 	ctx := context.Background()
 	for name, c := range map[string]struct {
@@ -1070,6 +1073,15 @@ func TestProberClassifiesWrites(t *testing.T) {
 		"SetSynchronizedStandbySlots": {func(p *Prober) { _ = p.SetSynchronizedStandbySlots(ctx, ConnInfo{}, []string{"pg_ha_slot_1"}) }, []QueryKind{QueryWrite, QueryWrite}},
 		"InRecovery":                  {func(p *Prober) { _, _, _ = p.InRecovery(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
 		"PhysicalSlots":               {func(p *Prober) { _, _ = p.PhysicalSlots(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"PrimaryWALPosition":          {func(p *Prober) { _, _, _, _ = p.PrimaryWALPosition(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"StandbyReceiveLSN":           {func(p *Prober) { _, _, _ = p.StandbyReceiveLSN(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"StandbyTimeline":             {func(p *Prober) { _, _, _ = p.StandbyTimeline(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"StreamingUpstream":           {func(p *Prober) { _, _, _ = p.StreamingUpstream(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"SystemIdentifier":            {func(p *Prober) { _, _, _ = p.SystemIdentifier(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"RecoveryTimelines":           {func(p *Prober) { _, _, _, _ = p.RecoveryTimelines(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"ReplicationTopology":         {func(p *Prober) { _, _ = p.ReplicationTopology(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"SSLActive":                   {func(p *Prober) { _, _ = p.SSLActive(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
+		"ReplayProgress":              {func(p *Prober) { _, _ = p.ReplayProgress(ctx, ConnInfo{}) }, []QueryKind{QueryRead}},
 	} {
 		k := &kindRecorder{}
 		c.run(&Prober{SQL: k, Timeout: time.Second})
@@ -1082,5 +1094,24 @@ func TestProberClassifiesWrites(t *testing.T) {
 				t.Errorf("%s: kinds = %v, want %v", name, k.kinds, c.want)
 			}
 		}
+	}
+}
+
+// heldQuerier answers every query the way ConnCache does when another read holds the node's
+// session past the caller's deadline (#371).
+type heldQuerier struct{}
+
+func (heldQuerier) QueryText(_ context.Context, ci ConnInfo, _ QueryKind, _ string) (string, error) {
+	return "", fmt.Errorf("connection cache: session to %s:5432 held by another query for 10s: %w", ci.Host, context.DeadlineExceeded)
+}
+
+// A waiter that lost the session never spoke to the node, so it has no evidence either way:
+// Probe reports plain unreachable -- not Saturated (which would assert a live postmaster) and
+// not ConnRefused -- so no saturation episode starts or ends on it.
+func TestProbeClassifiesAHeldSessionAsPlainUnreachable(t *testing.T) {
+	p := &Prober{SQL: heldQuerier{}, Timeout: time.Second}
+	ns := p.Probe(context.Background(), ConnInfo{Host: "pg-1"})
+	if ns.Reachable || ns.Saturated || ns.ConnRefused {
+		t.Errorf("held session must read as plain unreachable: %+v", ns)
 	}
 }

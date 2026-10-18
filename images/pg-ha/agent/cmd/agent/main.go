@@ -767,6 +767,14 @@ func (a *agent) boot(ctx context.Context) error {
 	return nil
 }
 
+// Every SQL statement the agent sends goes through a.prober on THIS goroutine -- observe, the
+// durable-timeline check, act() under opMu, the topology pass, the snapshot's replay read, and
+// the intents the control API queues -- except the peer-probe fan-out in observe(), which runs
+// one goroutine per peer on distinct cache keys and is joined before anything else probes. So
+// no two statements ever contend for one cached session today; the transport is nonetheless
+// built so that a future caller on another goroutine could only ever queue a read behind a
+// read, never behind a long write (#371). Keep it that way: a probe added to a control handler
+// or a background ticker is fine, a cached write path is not.
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
 	// Sampled BEFORE observe() so deriveServingRW can tell whether a demote completed while
@@ -1101,9 +1109,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			}
 		}
 	}
-	// Peers are probed CONCURRENTLY (#298). Each probe is a psql connect bounded only by
-	// PGCONNECT_TIMEOUT, so probing serially costs (unreachable peers) x (connect timeout)
-	// inside the reconcile loop.
+	// Peers are probed CONCURRENTLY (#298). Each probe is bounded only by its deadline (once a
+	// psql connect under PGCONNECT_TIMEOUT, now a dial or a round trip under Prober.Timeout),
+	// so probing serially costs (unreachable peers) x (timeout) inside the reconcile loop.
 	// On a 5-node cluster that has just lost its network, that is ~40s of a tick whose
 	// interval is 5s: /healthz goes stale at reconcileInterval*3, so the agent could be
 	// liveness-killed for the crime of having dead peers -- the pathology that made every
@@ -3410,8 +3418,10 @@ const durableTLNoAdvanceInterval = time.Minute
 // postmaster it supervises -- SIGKILLed by the kubelet, which is the starvation shape every other
 // blocking call in this file is bounded against. A CHECKPOINT is the one call here that is slow
 // while perfectly healthy (a restartpoint flushes dirty shared buffers), so this is a real
-// budget, not a theoretical one. Cutting psql short does not abort the server-side checkpoint; it
-// keeps running and the next interval's read sees the result.
+// budget, not a theoretical one. Cutting the client short does not abort the server-side
+// checkpoint; it keeps running and the next interval's read sees the result. The CHECKPOINT is a
+// write, so it runs on a connection of its own (#371): overrunning this budget costs that
+// connection, never the cached read session the next tick's probes use.
 const durableTLBudget = 10 * time.Second
 
 // ensureDurableTimeline forces a restartpoint when this standby's DURABLE timeline lags the one
@@ -3472,8 +3482,8 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
 		// BACK OFF here too (#298 review). The commonest way this errors is the budget above
 		// expiring on a restartpoint that is genuinely slow -- a full flush of dirty shared
-		// buffers on a standby saturated with replay I/O -- and cutting psql short does not
-		// abort the server-side checkpoint. Returning on the normal interval therefore issued a
+		// buffers on a standby saturated with replay I/O -- and cutting the client short does
+		// not abort the server-side checkpoint. Returning on the normal interval therefore issued a
 		// FRESH CHECKPOINT every 15s at exactly the node this backoff exists to protect, which
 		// is the hammering durableTLNoAdvanceInterval was introduced to stop, reached by the
 		// other branch.

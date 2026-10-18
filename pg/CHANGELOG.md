@@ -1,5 +1,25 @@
 # pg chart changelog
 
+## 2.5.1 - 2026-10-18
+
+### Changed
+
+- **pg-ha image 2.3.0: the agent's writes run on a connection of their own (#371).** The
+  transport introduced in 2.5.0 kept one session per node and ran every statement on it,
+  serialised. Statements that change state -- `CHECKPOINT` for the durable-timeline repair,
+  `ALTER SYSTEM` + `pg_reload_conf()` for synchronized standby slots, slot create/drop -- now
+  run on a connection dialled for the statement and closed after it, shown as
+  `application_name = pg-ha-agent-write` while it runs. Reads keep the cached session
+  (`pg-ha-agent`), so a probe can only ever queue behind another read, never behind a
+  restartpoint flushing dirty buffers; a deadline-cut `CHECKPOINT` no longer takes the cached
+  session down with it (one redial per overrun before); and a write is never re-sent after a
+  lost reply by construction. On today's agent every statement already runs on the reconcile
+  goroutine, so no probe was actually starved -- this makes the transport correct for the next
+  caller on another goroutine and removes the redial. The persistent session count, and so the
+  `superuser_reserved_connections` formula (one per node + 3), is unchanged; the write draws
+  briefly from the +3 headroom and a 53300 there is logged and retried, never read as a node
+  state. `ha.image.tag` and the etcd bootstrap image move to `2.3.0-pg18`. **The pods roll once.**
+
 ## 2.5.0 - 2026-10-13
 
 ### Upgrade notes

@@ -129,8 +129,9 @@ type Prober struct {
 	// entrypoint, pg_ctl). It is no longer how SQL reaches a node.
 	Exec Exec
 	// SQL is the transport every probe goes through. Required. The agent sets a
-	// ConnCache -- one persistent connection per node (#364); the unit tests set an
-	// ExecQuerier over a fake Exec, whose fakes answer by inspecting the psql argument list.
+	// ConnCache -- one persistent connection per node for reads, a connection per call for
+	// writes (#364, #371); the unit tests set an ExecQuerier over a fake Exec, whose fakes
+	// answer by inspecting the psql argument list.
 	SQL Querier
 	// Timeout is the per-probe deadline. Required (positive).
 	Timeout time.Duration
@@ -352,6 +353,11 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // refuses to promote (#125) -- observed as a migrated cluster that could not fail over at all
 // until something forced a checkpoint. Making the durable value current while the node is still
 // streaming is what closes that window.
+//
+// A write, so it runs on a connection of its own (#371): a restartpoint flushes dirty shared
+// buffers and can hold its connection for seconds, which must never be the session the probes
+// share. The deadline bounds the client only -- the server-side restartpoint runs to completion
+// either way -- and cutting it short no longer costs the cached read session a redial.
 func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
 	_, err := p.psql(ctx, ci, QueryWrite, "CHECKPOINT;")
 	return err

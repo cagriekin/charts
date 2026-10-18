@@ -89,6 +89,28 @@ echo "${STANDBY}" > "${SCRIPT_DIR}/.agent_standby"
 result=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT 1" "testuser" "testdb")
 assert_eq "can connect to primary" "1" "${result}"
 
+# --- agent sessions (#364, #371): one cached read session from each agent on every node, no
+# write connection in steady state, and the superuser reserve sized from exactly that count.
+# Sessions dial lazily, but by the time a primary has settled every agent has probed every node.
+for pod in "${POD0}" "${POD1}"; do
+  reads=""; s=0
+  while [[ ${s} -lt 30 ]]; do
+    reads=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT count(*) FROM pg_stat_activity WHERE application_name='pg-ha-agent'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "")
+    [[ "${reads}" == "2" ]] && break
+    sleep 3; s=$((s + 3))
+  done
+  assert_eq "#371: ${pod} holds one read session from each of the 2 agents" "2" "${reads}"
+  writes_seen=0
+  for i in 1 2 3; do
+    w=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT count(*) FROM pg_stat_activity WHERE application_name='pg-ha-agent-write'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "")
+    [[ "${w}" != "0" ]] && writes_seen=$((writes_seen + 1))
+    sleep 2
+  done
+  assert_eq "#371: ${pod} has no write connection open in steady state (3 samples)" "0" "${writes_seen}"
+  su=$(pg_exec "${NAMESPACE}" "${pod}" "SHOW superuser_reserved_connections" "repmgr" "repmgr" 2>/dev/null | xargs || echo "")
+  assert_eq "#371: ${pod} reserves one superuser slot per node + 3" "5" "${su}"
+done
+
 REPL_VALUE="replicated-$(date +%s)"
 pg_exec "${NAMESPACE}" "${PRIMARY}" "DROP TABLE IF EXISTS repl_test" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE repl_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
