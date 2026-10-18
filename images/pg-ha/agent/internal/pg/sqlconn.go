@@ -341,11 +341,7 @@ func (c *ConnCache) writeOnce(ctx context.Context, deadline time.Time, ci ConnIn
 	c.writes.Add(1)
 	c.mu.Unlock()
 	defer c.writes.Done()
-	secs := int(time.Until(deadline).Seconds())
-	if secs < 1 {
-		secs = 1
-	}
-	conn, err := c.dial(ctx, connString(ci, secs, appNameWrite), ci.Password)
+	conn, err := c.dial(ctx, connString(ci, connectTimeoutSecs(deadline), appNameWrite), ci.Password)
 	if err != nil {
 		return "", err
 	}
@@ -370,13 +366,19 @@ func keepOnServerError(err error, e *cacheEntry) bool {
 	return errors.As(err, &pgErr) && !e.conn.closed()
 }
 
-func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+// connectTimeoutSecs mirrors the caller's deadline as libpq's connect_timeout, so a dial
+// never outlives the query it serves. connect_timeout=0 means "wait forever" to libpq and
+// pgconn, so an already-passed deadline floors at 1; ctx still bounds the dial.
+func connectTimeoutSecs(deadline time.Time) int {
 	secs := int(time.Until(deadline).Seconds())
-	// connect_timeout=0 means "wait forever" to libpq and pgconn; ctx still bounds the dial.
 	if secs < 1 {
 		secs = 1
 	}
-	conn, err := c.dial(ctx, connString(ci, secs, appNameRead), ci.Password)
+	return secs
+}
+
+func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+	conn, err := c.dial(ctx, connString(ci, connectTimeoutSecs(deadline), appNameRead), ci.Password)
 	if err != nil {
 		return err
 	}

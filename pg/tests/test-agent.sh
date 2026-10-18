@@ -103,7 +103,9 @@ for pod in "${POD0}" "${POD1}"; do
   writes_seen=0
   for i in 1 2 3; do
     w=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT count(*) FROM pg_stat_activity WHERE application_name='pg-ha-agent-write'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "")
-    [[ "${w}" != "0" ]] && writes_seen=$((writes_seen + 1))
+    # Only a positive count is a write in flight; an empty answer (the query itself failed)
+    # is a sampling miss, not evidence of a connection, and must not fail the assertion.
+    [[ "${w}" =~ ^[0-9]+$ && "${w}" != "0" ]] && writes_seen=$((writes_seen + 1))
     sleep 2
   done
   assert_eq "#371: ${pod} has no write connection open in steady state (3 samples)" "0" "${writes_seen}"
