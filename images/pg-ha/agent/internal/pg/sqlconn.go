@@ -22,12 +22,18 @@ type Querier interface {
 	QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, sql string) (string, error)
 }
 
-// QueryKind says whether a statement may be sent twice. ConnCache retries a query whose
-// reused socket failed on a fresh connection; for a read that is always safe, but a write
-// may already have run on the server when the reply was lost, and running it again changes
-// what the caller sees (a slot already dropped reads as "nothing to drop") or repeats work
-// (CHECKPOINT, ALTER SYSTEM). Writes therefore fail on the stale socket and the next tick
-// runs them on a fresh connection, after re-reading state.
+// QueryKind selects the transport path (#371). A READ runs on the node's cached session and,
+// when its reused socket fails, is retried once on a fresh dial: re-running a read is always
+// safe. A WRITE (CHECKPOINT, ALTER SYSTEM, a slot create or drop) runs on a connection dialled
+// for that one statement and closed after it, and is never re-sent: it may already have run
+// on the server when the reply was lost, and running it again changes what the caller sees (a
+// slot already dropped reads as "nothing to drop") or repeats work. Keeping writes off the
+// cached session is also what keeps a probe from ever queueing behind a long statement: a
+// restartpoint can hold a connection for seconds, and before the split a deadline-cut
+// CHECKPOINT took the cached read session down with it (pgconn closes on deadline), so the
+// next probe paid a redial. Writes are O(topology events), not O(ticks), so the dial per
+// write costs nothing the #364 cost argument cared about. Classifying matters both ways: a
+// read misfiled as a write pays a dial per tick; a write misfiled as a read may be re-sent.
 type QueryKind int
 
 const (
@@ -85,10 +91,15 @@ func (p pgConn) exec(ctx context.Context, sql string) ([][][]byte, error) {
 func (p pgConn) closed() bool              { return p.c.IsClosed() }
 func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
 
-// ConnCache is the agent's transport: one persistent server connection per node,
-// dialled on first use and kept across reconcile ticks, so a probe is one round trip on
-// an open socket instead of a process start, a TCP connect, an authentication exchange
-// and a backend fork (#364).
+// ConnCache is the agent's transport: one persistent server connection per node FOR
+// READS, dialled on first use and kept across reconcile ticks, so a probe is one round trip
+// on an open socket instead of a process start, a TCP connect, an authentication exchange
+// and a backend fork (#364). A WRITE never touches that session: it gets a connection of its
+// own for the one statement (see QueryKind, #371), so the cached session is only ever shared
+// between reads, which take milliseconds on a healthy node. Steady state is therefore still
+// one session per agent per node -- the count the chart's superuser_reserved_connections is
+// sized from -- plus, while a write runs, one short-lived extra that draws from the same
+// reserve's headroom.
 //
 // Liveness is bounded twice. The caller's deadline bounds every query: pgconn cancels
 // and closes the connection when it passes, so a stale socket cannot hide a dead peer
@@ -111,8 +122,9 @@ func (p pgConn) close(ctx context.Context) { _ = p.c.Close(ctx) }
 // which is required (no .pgpass fallback: every caller passes the replication password
 // config.Load requires, so an empty one is a bug, refused up front). The password is set on
 // the parsed config, never written into the connection string, so a parse error (which
-// pgx quotes with only partial password redaction) cannot leak it. Sessions identify as
-// application_name=pg-ha-agent in pg_stat_activity.
+// pgx quotes with only partial password redaction) cannot leak it. Sessions identify in
+// pg_stat_activity as application_name=pg-ha-agent (the cached read session) and
+// pg-ha-agent-write (a write in flight), so a long CHECKPOINT is attributable at a glance.
 type ConnCache struct {
 	// dial opens a connection for dsn, authenticating with password (required; QueryText
 	// refuses an empty one).
@@ -125,7 +137,16 @@ type ConnCache struct {
 	isClosed bool
 	// evicting tracks background closes of evicted connections, so Close can wait for them.
 	evicting sync.WaitGroup
+	// writes tracks per-call write connections in flight (writeOnce), so Close can wait for
+	// them -- bounded by its ctx -- instead of leaving a statement to be cut by process exit.
+	writes sync.WaitGroup
 }
+
+// Application names the two transport paths present to the server (pg_stat_activity).
+const (
+	appNameRead  = "pg-ha-agent"
+	appNameWrite = "pg-ha-agent-write"
+)
 
 // evictCloseTimeout bounds the Terminate exchange of one evicted connection. Evicted
 // connections belong to nodes the agent stopped probing, so the close runs in the
@@ -145,11 +166,16 @@ const connIdleTTL = 5 * time.Minute
 // result that feeds survivor ranking and failover.
 const tcpUserTimeout = 5 * time.Second
 
-// cacheEntry serialises use of one connection: pgconn connections are not safe for
-// concurrent use, and the control API can probe the same node the reconcile loop is
-// probing. Holding the entry lock for the whole query keeps the two in order. The lock is
-// a one-slot channel rather than a sync.Mutex so a waiter gives up at its own deadline
-// instead of queueing past it behind a query hung on a dead peer.
+// cacheEntry serialises use of one cached connection: pgconn connections are not safe for
+// concurrent use. Only READS use the entry (writes dial their own connection, #371), and a
+// read on a healthy node takes milliseconds, so a waiter that outlives its own deadline is
+// looking at a node that is not answering reads -- the same verdict the holder is about to
+// reach -- not at a busy one. Today the agent gives the lock no waiters at all: every Prober
+// call runs on the reconcile goroutine, and the one parallel path, the peer-probe fan-out in
+// observe(), touches a distinct key per goroutine; only Close and the idle sweep (a try-lock)
+// ever contend with a query in flight. A new caller on another goroutine changes none of
+// that for reads. The lock is a one-slot channel rather than a sync.Mutex so a waiter gives
+// up at its own deadline instead of queueing past it behind a query hung on a dead peer.
 type cacheEntry struct {
 	sem  chan struct{}
 	conn sqlConn
@@ -214,6 +240,9 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 	if !ok {
 		return "", errors.New("connection cache: query context has no deadline")
 	}
+	if kind == QueryWrite {
+		return c.writeOnce(ctx, deadline, ci, sql)
+	}
 	key := ci.Host + ":" + strconv.Itoa(ci.Port) + ":" + ci.User + ":" + ci.DB
 	c.mu.Lock()
 	if c.isClosed {
@@ -245,8 +274,13 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 		}(old)
 	}
 
+	waitStart := c.now()
 	if err := e.lock(ctx); err != nil {
-		return "", err
+		// Self-explaining in a log line: the deadline passed while another query held the
+		// session, which (reads only, see cacheEntry) means that query is itself stuck on this
+		// node. Wrapped, so errors.Is(err, context.DeadlineExceeded) still holds for callers
+		// and neither IsTooManyConnections nor IsConnRefused matches it.
+		return "", fmt.Errorf("connection cache: session to %s held by another query for %s: %w", key, c.now().Sub(waitStart).Round(time.Millisecond), err)
 	}
 	defer e.unlock()
 	// Close may have swept this entry while we waited for it; dialling now would open a
@@ -254,10 +288,10 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 	if c.closing() {
 		return "", errors.New("connection cache is closed")
 	}
-	// A reused socket that fails may only mean the peer restarted since the last tick, so a
-	// READ gets one fresh dial inside the same deadline: the probe then reports what a fresh
-	// connection sees rather than a stale one's error. A fresh dial is never retried, and
-	// neither is a write (see QueryKind).
+	// A reused socket that fails may only mean the peer restarted since the last tick, so the
+	// read gets one fresh dial inside the same deadline: the probe then reports what a fresh
+	// connection sees rather than a stale one's error. A fresh dial is never retried. (Only
+	// reads reach this loop; a write has its own path above.)
 	for {
 		reused := e.conn != nil && !e.conn.closed()
 		if !reused {
@@ -273,7 +307,7 @@ func (c *ConnCache) QueryText(ctx context.Context, ci ConnInfo, kind QueryKind, 
 			return "", err
 		}
 		c.drop(ctx, e)
-		if !reused || kind != QueryRead || ctx.Err() != nil {
+		if !reused || ctx.Err() != nil {
 			return "", err
 		}
 		// Close may have started while the query ran; a redial now would open a session it
@@ -290,6 +324,39 @@ func (c *ConnCache) closing() bool {
 	return c.isClosed
 }
 
+// writeOnce runs one write statement on a connection dialled for it and closed after it
+// (#371). No cache entry, no lock, no retry: the statement cannot delay a read, cannot be
+// cut short by a read's deadline, and cannot be re-sent after a lost reply. The idle sweep
+// is not run and lastUsed is not touched, so a write to a departed node leaves nothing
+// behind. The close runs under its own short deadline so a statement that overran the
+// caller's ctx still sends Terminate instead of leaking a backend until the server notices.
+func (c *ConnCache) writeOnce(ctx context.Context, deadline time.Time, ci ConnInfo, sql string) (string, error) {
+	c.mu.Lock()
+	if c.isClosed {
+		c.mu.Unlock()
+		return "", errors.New("connection cache is closed")
+	}
+	// Added under c.mu for the same reason as evicting: Close sets isClosed under this lock
+	// before it waits, so an Add after the unlock could slip past its Wait.
+	c.writes.Add(1)
+	c.mu.Unlock()
+	defer c.writes.Done()
+	conn, err := c.dial(ctx, connString(ci, connectTimeoutSecs(deadline), appNameWrite), ci.Password)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), evictCloseTimeout)
+		defer cancel()
+		conn.close(cctx)
+	}()
+	rows, err := conn.exec(ctx, sql)
+	if err != nil {
+		return "", err
+	}
+	return formatRows(rows), nil
+}
+
 // keepOnServerError reports whether err is a server-side ERROR (permission denied, a
 // RAISE, a duplicate slot) that left the session usable: such an error would recur on a
 // fresh dial, so the connection is kept and the statement not retried. A FATAL (e.g.
@@ -299,13 +366,19 @@ func keepOnServerError(err error, e *cacheEntry) bool {
 	return errors.As(err, &pgErr) && !e.conn.closed()
 }
 
-func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+// connectTimeoutSecs mirrors the caller's deadline as libpq's connect_timeout, so a dial
+// never outlives the query it serves. connect_timeout=0 means "wait forever" to libpq and
+// pgconn, so an already-passed deadline floors at 1; ctx still bounds the dial.
+func connectTimeoutSecs(deadline time.Time) int {
 	secs := int(time.Until(deadline).Seconds())
-	// connect_timeout=0 means "wait forever" to libpq and pgconn; ctx still bounds the dial.
 	if secs < 1 {
 		secs = 1
 	}
-	conn, err := c.dial(ctx, connString(ci, secs), ci.Password)
+	return secs
+}
+
+func (c *ConnCache) redial(ctx context.Context, deadline time.Time, e *cacheEntry, ci ConnInfo) error {
+	conn, err := c.dial(ctx, connString(ci, connectTimeoutSecs(deadline), appNameRead), ci.Password)
 	if err != nil {
 		return err
 	}
@@ -364,6 +437,15 @@ func (c *ConnCache) Close(ctx context.Context) error {
 		c.drop(ctx, e)
 		e.unlock()
 	}
+	// A write in flight closes its own connection when its statement returns; wait for that
+	// up to ctx, so a Terminate is sent rather than the socket going with the process.
+	writesDone := make(chan struct{})
+	go func() { c.writes.Wait(); close(writesDone) }()
+	select {
+	case <-writesDone:
+	case <-ctx.Done():
+		errs = append(errs, fmt.Errorf("writes in flight: %w", ctx.Err()))
+	}
 	// Background closes of evicted entries are already bounded by evictCloseTimeout.
 	c.evicting.Wait()
 	return errors.Join(errs...)
@@ -374,14 +456,14 @@ func (c *ConnCache) Close(ctx context.Context) error {
 // libpq and pgconn expect (backslash-escaped, single-quoted), so a database or user name
 // with a space or quote cannot inject keywords -- the conninfo-injection class the agent
 // guards the Lease holder name against (#298) applies here too.
-func connString(ci ConnInfo, connectTimeoutSecs int) string {
+func connString(ci ConnInfo, connectTimeoutSecs int, appName string) string {
 	parts := []string{
 		"host=" + quoteConnValue(ci.Host),
 		"port=" + strconv.Itoa(ci.Port),
 		"user=" + quoteConnValue(ci.User),
 		"dbname=" + quoteConnValue(ci.DB),
 		"connect_timeout=" + strconv.Itoa(connectTimeoutSecs),
-		"application_name=pg-ha-agent",
+		"application_name=" + appName,
 	}
 	return strings.Join(parts, " ")
 }

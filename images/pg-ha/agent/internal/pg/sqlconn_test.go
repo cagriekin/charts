@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// fakeSQLConn scripts one connection: each exec pops the next reply.
+// fakeSQLConn scripts one connection: each exec pops the next reply. Counters are guarded
+// so the concurrency tests (#371) can read them under -race while another goroutine runs a
+// statement; most tests touch them from one goroutine and pay nothing for it.
 type fakeSQLConn struct {
+	mu       sync.Mutex
 	replies  []fakeReply
 	execs    int
 	isClosed bool
@@ -24,6 +28,8 @@ type fakeReply struct {
 }
 
 func (f *fakeSQLConn) exec(_ context.Context, _ string) ([][][]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.execs++
 	if len(f.replies) == 0 {
 		return nil, errors.New("fake: no reply scripted")
@@ -32,8 +38,43 @@ func (f *fakeSQLConn) exec(_ context.Context, _ string) ([][][]byte, error) {
 	f.replies = f.replies[1:]
 	return r.rows, r.err
 }
-func (f *fakeSQLConn) closed() bool          { return f.isClosed }
-func (f *fakeSQLConn) close(context.Context) { f.closes++; f.isClosed = true }
+func (f *fakeSQLConn) closed() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.isClosed }
+func (f *fakeSQLConn) close(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+	f.isClosed = true
+}
+func (f *fakeSQLConn) stats() (execs, closes int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.execs, f.closes
+}
+
+// blockingConn holds its statement open until released (or the ctx ends): the shape of a
+// restartpoint flushing dirty buffers, used to prove a write never holds the read session.
+type blockingConn struct {
+	fakeSQLConn
+	started chan struct{} // closed when exec begins
+	release chan struct{} // exec returns once this is closed
+}
+
+func newBlockingConn() *blockingConn {
+	return &blockingConn{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *blockingConn) exec(ctx context.Context, _ string) ([][][]byte, error) {
+	b.mu.Lock()
+	b.execs++
+	b.mu.Unlock()
+	close(b.started)
+	select {
+	case <-b.release:
+		return [][][]byte{row("done")}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 func row(cells ...string) [][]byte {
 	out := make([][]byte, len(cells))
@@ -54,13 +95,39 @@ func cacheWith(conns ...*fakeSQLConn) (*ConnCache, *[]string) {
 	return c, dsns
 }
 
+// cacheWithConns is cacheWith over arbitrary sqlConn implementations (the blocking fakes).
+func cacheWithConns(conns ...sqlConn) (*ConnCache, *[]string) {
+	dsns := &[]string{}
+	i := 0
+	var mu sync.Mutex
+	c := &ConnCache{
+		dial: func(_ context.Context, dsn, _ string) (sqlConn, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			*dsns = append(*dsns, dsn)
+			if i >= len(conns) {
+				return nil, errors.New("fake: no more connections")
+			}
+			conn := conns[i]
+			i++
+			return conn, nil
+		},
+		idleTTL: time.Hour,
+		now:     time.Now,
+	}
+	return c, dsns
+}
+
 // cacheWithPasswords is cacheWith that also records the password handed to each dial.
 func cacheWithPasswords(conns ...*fakeSQLConn) (*ConnCache, *[]string, *[]string) {
 	dsns := &[]string{}
 	passwords := &[]string{}
 	i := 0
+	var mu sync.Mutex // the concurrency tests dial from two goroutines
 	c := &ConnCache{
 		dial: func(_ context.Context, dsn, password string) (sqlConn, error) {
+			mu.Lock()
+			defer mu.Unlock()
 			*dsns = append(*dsns, dsn)
 			*passwords = append(*passwords, password)
 			if i >= len(conns) {
@@ -173,11 +240,16 @@ func TestConnCacheDialHonoursTheCallerDeadline(t *testing.T) {
 
 // connString quotes every value: a name with a space or quote cannot inject keywords.
 func TestConnStringQuotesValues(t *testing.T) {
-	got := connString(ConnInfo{Host: "h", Port: 5432, User: "it's me", DB: "my db", Password: `p\ss'wd`}, 7)
+	got := connString(ConnInfo{Host: "h", Port: 5432, User: "it's me", DB: "my db", Password: `p\ss'wd`}, 7, appNameRead)
 	for _, want := range []string{`host='h'`, "port=5432", `user='it\'s me'`, `dbname='my db'`, "connect_timeout=7", "application_name=pg-ha-agent"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("%s lacks %s", got, want)
 		}
+	}
+	// The write path announces itself, so a long CHECKPOINT is attributable in pg_stat_activity
+	// and the read-session count ("one per agent per node") stays exact.
+	if w := connString(ci, 7, appNameWrite); !strings.Contains(w, "application_name=pg-ha-agent-write") {
+		t.Errorf("write DSN lacks its application name: %s", w)
 	}
 }
 
@@ -366,6 +438,24 @@ func TestConnCacheEvictsIdleEntries(t *testing.T) {
 	if _, ok := c.entries[ci.Host+":5432:repmgr:repmgr"]; !ok {
 		t.Error("the entry in use was evicted")
 	}
+	// A write to the departed node (#371) runs on its own connection: it recreates no entry
+	// and refreshes no lastUsed, so the sweep's view of who is idle is unchanged.
+	before := c.entries[ci.Host+":5432:repmgr:repmgr"].lastUsed
+	writeConn := &fakeSQLConn{replies: []fakeReply{{rows: nil}}}
+	c.dial = func(_ context.Context, _, _ string) (sqlConn, error) { return writeConn, nil }
+	clock = clock.Add(10 * time.Second)
+	if _, err := c.QueryText(probeCtx(t), departed, QueryWrite, "CHECKPOINT;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.entries[departed.Host+":5432:repmgr:repmgr"]; ok || len(c.entries) != 1 {
+		t.Errorf("a write must not create or revive a cache entry: entries=%d", len(c.entries))
+	}
+	if c.entries[ci.Host+":5432:repmgr:repmgr"].lastUsed != before {
+		t.Error("a write must not touch another entry's lastUsed")
+	}
+	if _, c2 := writeConn.stats(); c2 != 1 {
+		t.Errorf("the write connection must be closed: closes=%d", c2)
+	}
 }
 
 // An idle entry whose lock is held (a query hung past idleTTL) is skipped, not waited on.
@@ -549,27 +639,172 @@ func (s *stallingCloseConn) close(ctx context.Context) {
 	s.fakeSQLConn.close(ctx)
 }
 
-// A write whose reused socket fails is NOT re-sent: the server may already have run it with
-// the reply lost, and a second run would change the answer (a dropped slot reads as nothing
-// to drop) or repeat work. The stale connection is still dropped, so the next call dials.
-func TestConnCacheDoesNotRetryAWriteOnAStaleConnection(t *testing.T) {
+// #371: a write never touches the cached socket. It runs on a connection dialled for it, so a
+// stale cached session is irrelevant to the write, and a later read is what discovers the stale
+// socket and redials, exactly as before.
+func TestConnCacheWriteIgnoresTheCachedSocket(t *testing.T) {
 	stale := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {err: errors.New("unexpected EOF")}}}
+	writeConn := &fakeSQLConn{replies: []fakeReply{{rows: nil}}}
 	fresh := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}}}
-	c, dsns := cacheWith(stale, fresh)
+	c, dsns := cacheWith(stale, writeConn, fresh)
 	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err == nil {
-		t.Fatal("a write on a failed reused socket must return the error, not retry")
-	}
-	if stale.closes != 1 || len(*dsns) != 1 || fresh.execs != 0 {
-		t.Errorf("want the stale conn dropped and no second dial: closes=%d dials=%d freshExecs=%d", stale.closes, len(*dsns), fresh.execs)
-	}
 	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err != nil {
-		t.Fatalf("the next call must dial fresh and succeed: %v", err)
+		t.Fatalf("the write must run on its own connection regardless of the cached socket: %v", err)
 	}
-	if len(*dsns) != 2 {
-		t.Errorf("want the next call to dial: dials=%d", len(*dsns))
+	if e, c2 := writeConn.stats(); e != 1 || c2 != 1 {
+		t.Errorf("the write connection must run the statement once and be closed: execs=%d closes=%d", e, c2)
+	}
+	if _, c1 := stale.stats(); c1 != 0 || len(*dsns) != 2 {
+		t.Errorf("the write must leave the cached session alone: staleCloses=%d dials=%d", c1, len(*dsns))
+	}
+	if got, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil || got != "t" {
+		t.Fatalf("the read must find the stale socket and redial: %q %v", got, err)
+	}
+	if _, c1 := stale.stats(); c1 != 1 || len(*dsns) != 3 {
+		t.Errorf("want the stale conn dropped by the read and one more dial: staleCloses=%d dials=%d", c1, len(*dsns))
+	}
+}
+
+// #371, the point of the split: a write that holds its connection for seconds (a restartpoint
+// flushing dirty buffers) never delays a read to the same node, because it is not on the read
+// session. The read runs on the cached connection while the write is still in flight.
+func TestConnCacheWriteDoesNotHoldTheReadSession(t *testing.T) {
+	readConn := &fakeSQLConn{replies: []fakeReply{{rows: [][][]byte{row("t")}}, {rows: [][][]byte{row("f")}}}}
+	writeConn := newBlockingConn()
+	c, dsns := cacheWithConns(readConn, writeConn)
+	if _, err := c.QueryText(probeCtx(t), ci, QueryRead, "q"); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;")
+		writeErr <- err
+	}()
+	<-writeConn.started
+	start := time.Now()
+	got, err := c.QueryText(probeCtx(t), ci, QueryRead, "q")
+	if err != nil || got != "f" {
+		t.Fatalf("read during the write: %q %v", got, err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the read waited on the write: %s", took)
+	}
+	close(writeConn.release)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if e, _ := readConn.stats(); e != 2 || len(*dsns) != 2 {
+		t.Errorf("want both reads on the cached session and exactly one extra dial for the write: readExecs=%d dials=%d", e, len(*dsns))
+	}
+	if _, c2 := writeConn.stats(); c2 != 1 {
+		t.Errorf("the write connection must be closed after its statement: closes=%d", c2)
+	}
+	if e := c.entries[ci.Host+":5432:repmgr:repmgr"]; e == nil || e.conn != sqlConn(readConn) {
+		t.Error("the cached entry must still hold the read connection")
+	}
+	if !strings.Contains((*dsns)[0], "application_name=pg-ha-agent") || strings.Contains((*dsns)[0], "-write") {
+		t.Errorf("read DSN: %s", (*dsns)[0])
+	}
+	if !strings.Contains((*dsns)[1], "application_name=pg-ha-agent-write") {
+		t.Errorf("write DSN: %s", (*dsns)[1])
+	}
+}
+
+// A write that fails is not retried and its connection is closed; it leaves no cache entry
+// behind and the cached read session, if any, is untouched.
+func TestConnCacheWriteFailureIsNotRetriedAndClosesItsConnection(t *testing.T) {
+	writeConn := &fakeSQLConn{replies: []fakeReply{{err: errors.New("unexpected EOF")}}}
+	c, dsns := cacheWith(writeConn, &fakeSQLConn{})
+	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err == nil {
+		t.Fatal("want the error")
+	}
+	if e, c2 := writeConn.stats(); e != 1 || c2 != 1 || len(*dsns) != 1 {
+		t.Errorf("want one statement, one close, one dial: execs=%d closes=%d dials=%d", e, c2, len(*dsns))
+	}
+	if len(c.entries) != 0 {
+		t.Errorf("a write must not create a cache entry: %d", len(c.entries))
+	}
+}
+
+// A read that waits on a held session gives up at its deadline with an error that says so,
+// still reads as a deadline to callers, and matches neither saturation nor refusal, so Probe
+// reports plain "unreachable" and no saturation episode starts.
+func TestConnCacheReadWaiterReportsTheHeldSession(t *testing.T) {
+	holder := newBlockingConn()
+	c, dsns := cacheWithConns(holder, &fakeSQLConn{})
+	holderErr := make(chan error, 1)
+	go func() {
+		_, err := c.QueryText(probeCtx(t), ci, QueryRead, "q")
+		holderErr <- err
+	}()
+	<-holder.started
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.QueryText(ctx, ci, QueryRead, "q")
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the waiter outlived its deadline: %s", took)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want a deadline error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "held by another query") || !strings.Contains(err.Error(), ci.Host) {
+		t.Errorf("the error must name the held session: %v", err)
+	}
+	if IsTooManyConnections(err) || IsConnRefused(err) {
+		t.Error("a held session is neither saturation nor refusal")
+	}
+	if len(*dsns) != 1 {
+		t.Errorf("the waiter must not dial: dials=%d", len(*dsns))
+	}
+	close(holder.release)
+	if err := <-holderErr; err != nil {
+		t.Fatalf("holder: %v", err)
+	}
+}
+
+// Close waits for a write in flight up to its own deadline, reports it when it does not finish,
+// and does not pull the connection from under the statement; the write path closes it.
+func TestConnCacheCloseWaitsForAWriteInFlightUpToItsDeadline(t *testing.T) {
+	writeConn := newBlockingConn()
+	c, _ := cacheWithConns(writeConn)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;")
+		writeErr <- err
+	}()
+	<-writeConn.started
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := c.Close(ctx)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("Close outlived its deadline: %s", took)
+	}
+	if err == nil || !strings.Contains(err.Error(), "writes in flight") {
+		t.Errorf("Close must report the write still running: %v", err)
+	}
+	if _, c2 := writeConn.stats(); c2 != 0 {
+		t.Error("Close must not close a connection under a running statement")
+	}
+	close(writeConn.release)
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, c2 := writeConn.stats(); c2 != 1 {
+		t.Errorf("the write path must close its connection: closes=%d", c2)
+	}
+}
+
+func TestConnCacheWriteAfterCloseIsRefused(t *testing.T) {
+	c, dsns := cacheWith(&fakeSQLConn{})
+	if err := c.Close(probeCtx(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.QueryText(probeCtx(t), ci, QueryWrite, "CHECKPOINT;"); err == nil || len(*dsns) != 0 {
+		t.Errorf("a write after Close must be refused without dialling: err=%v dials=%d", err, len(*dsns))
 	}
 }
 

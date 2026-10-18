@@ -642,7 +642,13 @@ node reaches `max_connections`; a refused *new* connection ("too many clients") 
 the node is alive -- see [Application role and connection reserves](#application-role-and-connection-reserves).
 The sessions show as
 `application_name = pg-ha-agent` in `pg_stat_activity`: expect one from each agent on every
-node, so a 3-node cluster holds three such sessions per node. Before 2.2.0 every probe was a
+node, so a 3-node cluster holds three such sessions per node. Statements that change state
+(`CHECKPOINT` for the durable-timeline repair, `ALTER SYSTEM` for synchronized standby slots,
+slot create/drop) do not use that session: each runs on a connection of its own, opened for the
+statement and closed after it, shown as `application_name = pg-ha-agent-write` while it runs
+(image 2.3.0, #371). A probe therefore never queues behind a long restartpoint, a write is never
+re-sent after a lost reply, and the persistent count stays one per agent per node; at most one
+short-lived extra session per node exists while a write is in flight. Before 2.2.0 every probe was a
 fresh `psql` process, which in this image resolves to Debian's Perl wrapper; at six to nine probes
 per tick that cost over half a CPU core per *idle* pod on slow vCPUs.
 
@@ -1753,7 +1759,7 @@ The chart splits connections into three pools:
 
 | Pool | Who | Size |
 |------|-----|------|
-| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one session to every node). Standalone: 3 |
+| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one read session to every node; its short-lived write connection shares the 3). Standalone: 3 |
 | `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x pgpool.replicaCount + 1`, `3 x` with `pgpool.metrics.enabled`) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
 | the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
 
