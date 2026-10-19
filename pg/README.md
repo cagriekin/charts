@@ -142,7 +142,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections **over loopback TCP** — the bootstrap's socket-only transient postmaster no longer counts, #350 — so first-boot recovery and WAL replay cannot be killed by the liveness probe) | `true` |
 | `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
-| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288) | `180` |
+| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288, and in standalone mode how long the postStart hook waits for the real server before failing, floor 300s, #370) | `180` |
 
 The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350): loopback is the one
 address the bootstrap's transient postmaster and the stock image's init-time server never open,
@@ -169,7 +169,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
-| `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
+| `postgresql.pgHba` | List of pg_hba.conf entries, written by the agent (HA) or by the postStart hook once the real server answers (standalone; the hook reports what it did in the container log, #370) | `[]` |
 | `postgresql.extraVolumes` | Extra pod-level volumes (see [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica)) | `[]` |
 | `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
 | `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
@@ -1774,8 +1774,10 @@ start: no elevated attribute, the password from the release Secret. In HA mode t
 this on the primary; standalone does it in the postStart hook. Roles the chart creates are marked
 with `COMMENT ON ROLE ... IS 'managed by the pg chart'`. A same-named role without that mark is
 never converted: provisioning stops with an error naming it (logged by the agent; a failed
-postStart, and so a container restart, in standalone). Rename the chart value, or hand the role
-over by giving it the mark.
+postStart, and so a container restart, in standalone). In standalone the hook first waits for
+the real server as long as `postgresql.startupProbe` would (floor 300 s, #370) and writes its
+outcome to the container log (`kubectl logs … | grep postStart:`). Rename the chart value, or
+hand the role over by giving it the mark.
 
 - **`postgresql.app.username` (default `app_user`)** owns `postgresql.database`. The exception
   is `postgres`, the default and the maintenance database: its owner could drop it or set

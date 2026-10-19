@@ -105,6 +105,11 @@ postgresql:
   # postgres opens at all, and crash-recovery WAL replay can take longer still, both
   # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is
   # the total startup budget (1800s here); keep the steady-state livenessProbe window tight.
+  # IN STANDALONE MODE THE SAME BUDGET BOUNDS THE POSTSTART HOOK'S WAIT for the real server
+  # (#370): Kubernetes starts no probe until the hook returns, so the hook's wait is the only
+  # bound on a standalone start, and it is this one (floor 300s, so a first boot is never cut
+  # mid-initdb). It is therefore also how long a standalone crash recovery may take before the
+  # container is restarted; raise failureThreshold for a node whose WAL replay needs longer.
   # THIS BUDGET BOUNDS A STANDBY'S FIRST CLONE. Since #288 the clone runs in the main container
   # (the agent does it) rather than in a probe-free init container, so periodSeconds x
   # failureThreshold is the wall-clock limit on a pg_basebackup of your existing database. Exceed
@@ -505,6 +510,12 @@ postgresql:
       #     while the hook waits, the startup/liveness probes have not begun yet.
       # Use it for idempotent setup only, and put anything load-bearing in a Job or in
       # postgresql.initdbScripts instead of here.
+      # STANDALONE (ha.enabled=false) is different and NOT best effort: its hook also applies
+      # postgresql.pgHba and provisions the managed roles, so it waits for the real server as
+      # long as postgresql.startupProbe would (periodSeconds x failureThreshold, floor 300s,
+      # #370) and then FAILS the hook, loudly, in the container log and the
+      # FailedPostStartHook event -- a node that never comes up inside the startup budget would
+      # have been restarted by the probe anyway. Your additionalCommands run after that gate.
       additionalCommands: ""
 
 # ==========================================================================================

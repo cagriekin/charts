@@ -2344,3 +2344,24 @@ values.yaml, and the merge has already folded the alias into it, so the answer w
 {{- define "pg.usesDeprecatedRepmgrValues" -}}
 {{- if .Values.repmgr -}}true{{- end -}}
 {{- end -}}
+
+{{- /* How long the STANDALONE postStart hook waits for the real postmaster before failing
+       the hook (#370, #358). Kubernetes starts no probe until postStart returns, so this wait
+       is the only bound on a standalone start; it is the startup probe's own budget,
+       periodSeconds x failureThreshold: a server the hook gives up on at N seconds is one the
+       startup probe would have killed at N seconds anyway, so the hook adds no crash loop of
+       its own, and postgresql.startupProbe.failureThreshold -- already the documented
+       crash-recovery knob -- tunes both. Floored at 300s, the pre-#370 constant: a budget
+       shorter than a first boot (initdb, the temporary server, initdb.d) kills the container
+       mid-initdb, and PG_VERSION exists by then, so docker-entrypoint skips init on every later
+       start and the volume is dead -- a startup probe tuned tight for a small HA clone must not
+       be able to cause that. 1800s, the default probe budget, when the probe is disabled, so
+       disabling it never shortens the wait. `int`: the schema leaves the probe fields untyped,
+       so a quoted "180" must still multiply. */ -}}
+{{- define "pg.standalonePostStartBudgetSeconds" -}}
+{{- $budget := 1800 -}}
+{{- if .Values.postgresql.startupProbe.enabled -}}
+{{- $budget = mul (int .Values.postgresql.startupProbe.periodSeconds) (int .Values.postgresql.startupProbe.failureThreshold) -}}
+{{- end -}}
+{{- max $budget 300 -}}
+{{- end -}}

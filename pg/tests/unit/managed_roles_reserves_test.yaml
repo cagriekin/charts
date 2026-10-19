@@ -371,6 +371,8 @@ tests:
   # The standalone hook waits for the REAL server (loopback TCP) before provisioning roles:
   # docker-entrypoint's first-boot server listens only on the socket. pg_isready needs -U --
   # the container's uid has no passwd entry, and without it pg_isready reports "no attempt".
+  # It waits the startup probe's budget on the wall clock (#370), names the knob when it gives
+  # up, and only then runs pgHba, the reload and the roles.
   - it: the whole standalone hook is gated on the real server on loopback (pgHba, reload, roles)
     template: templates/statefulset.yaml
     set:
@@ -379,7 +381,49 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
-          pattern: '^real_server=""\nfor i in \$\(seq 1 300\); do\n  if pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q && psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -tAc "SELECT 1"[\s\S]*if ! psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1[\s\S]*did not come up on 127\.0\.0\.1 with database \$POSTGRES_DB within 300s'
+          pattern: 'hook_budget=1800\n[\s\S]*while :; do\n  pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q; ready_rc=\$\?\n  if \[ "\$ready_rc" -eq 0 \] && psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -tAc "SELECT 1"[\s\S]*within \$\{hook_budget\}s \(postgresql\.startupProbe\.periodSeconds x failureThreshold, floor 300\)[\s\S]*if ! psql -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: seq 1 300
+
+  # #370: the budget is periodSeconds x failureThreshold of the startup probe ...
+  - it: the standalone hook budget follows the startup probe (#370)
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      postgresql.startupProbe.periodSeconds: 10
+      postgresql.startupProbe.failureThreshold: 60
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'hook_budget=600\n'
+  # ... never below 300s: a budget shorter than a first boot would kill the container mid-initdb
+  # and leave a volume docker-entrypoint never initialises again (PG_VERSION already exists).
+  - it: the standalone hook budget is floored at 300s (#370)
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      postgresql.startupProbe.periodSeconds: 5
+      postgresql.startupProbe.failureThreshold: 30
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'hook_budget=300\n'
+  # ... and disabling the probe falls back to its default budget rather than shortening the wait.
+  - it: the standalone hook budget is 1800s when the startup probe is disabled (#370)
+    template: templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      postgresql.startupProbe.enabled: false
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'hook_budget=1800\n'
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe
 
   # Standalone first boot: include_dir goes in through docker-entrypoint-initdb.d, before the
   # first real start, so postmaster-level conf.d settings (reserved_connections) are live from

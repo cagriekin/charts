@@ -1093,107 +1093,162 @@ spec:
                            here needs to run earlier: include_dir goes in before the first start
                            (the initdb.d script on a fresh volume, setup-config on every later
                            start), since a reload cannot apply postmaster-level settings.
-                           Bounded and loud: a server that never gets there fails the hook. */}}
-                    real_server=""
-                    for i in $(seq 1 300); do
-                      if pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q && psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1" > /dev/null 2>&1; then
-                        real_server=1
-                        {{- if .Values.postgresql.pgHba }}
-                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        {{- /* Insert the operator's rules as ONE ordered block, anchored on the
-                               first NON-LOOPBACK host rule (#298).
 
-                               pg_hba is first-match-wins, which fixes all three properties here:
-                                - BEFORE the network catch-alls, or the rule is never consulted;
-                                - AFTER initdb's `local ... trust` and its `127.0.0.1/32` /
-                                  `::1/128` host rules, or a catch-all that also matches loopback
-                                  (`host all all all reject`) beats them and breaks in-pod TCP
-                                  clients -- `kubectl port-forward` + psql among them;
-                                - in the operator's own order, so a `trust` written before a
-                                  `reject` still wins. One pass, not one per entry: per-entry
-                                  passes re-anchor on the previous insert and reverse the list.
+                           Bounded and loud, with the STARTUP PROBE'S budget (#370, #358).
+                           Kubernetes starts no probe until postStart returns and puts no timeout
+                           of its own on an exec hook, so this wait is the only bound on a
+                           standalone start; a fixed 300s here killed a node whose crash recovery
+                           took longer, which then replayed from the same point and was killed
+                           again -- a crash loop the node could not leave. The budget is now
+                           periodSeconds x failureThreshold of postgresql.startupProbe
+                           (pg.standalonePostStartBudgetSeconds, floor 300s): a server this hook
+                           gives up on at N seconds is one the startup probe would have killed at
+                           N seconds anyway, so the hook adds no loop of its own, and the documented
+                           crash-recovery knob tunes both. Exhausting it still fails the hook --
+                           pgpool's wait-check-role init container waits forever on roles that were
+                           never created, so a silent exit 0 (the pre-#365 behaviour, #358) is the
+                           worse failure. Messages go to the hook's own stderr (the kubelet copies
+                           it into the FailedPostStartHook event) AND to PID 1's stderr, i.e. the
+                           container log: the postmaster -- or docker-entrypoint during first boot
+                           -- runs as this uid, so /proc/1/fd/2 opens without any capability; where
+                           it does not (a runAsUser override that gosu's to another uid) the write
+                           is dropped silently and the event still carries the text. Progress lines
+                           go to the container log only, so the event stays one message. */}}
+                    log()  { printf 'postStart: %s\n' "$*" >&2; { printf 'postStart: %s\n' "$*" > /proc/1/fd/2; } 2>/dev/null || true; }
+                    note() { { printf 'postStart: %s\n' "$*" > /proc/1/fd/2; } 2>/dev/null || true; }
+                    state() {
+                      case "$ready_rc" in
+                        0) echo "postgres accepts connections on 127.0.0.1 but database $POSTGRES_DB refuses a session (not created yet?)" ;;
+                        1) echo "postgres is starting up or in crash recovery on 127.0.0.1 (pg_isready=1)" ;;
+                        *) echo "nothing listening on 127.0.0.1 yet (pg_isready=$ready_rc; first-boot initialisation runs here)" ;;
+                      esac
+                    }
+                    hook_budget={{ include "pg.standalonePostStartBudgetSeconds" . }}
+                    ready_rc=""
+                    last_note=0
+                    while :; do
+                      pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q; ready_rc=$?
+                      if [ "$ready_rc" -eq 0 ] && psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1" > /dev/null 2>&1; then
+                        break
+                      fi
+                      if [ "$SECONDS" -ge "$hook_budget" ]; then
+                        log "the server did not come up on 127.0.0.1 with database $POSTGRES_DB within ${hook_budget}s (postgresql.startupProbe.periodSeconds x failureThreshold, floor 300); last state: $(state); pgHba entries and the managed roles ($APP_USER, $PGPOOL_CHECK_USER) were not applied. Raise postgresql.startupProbe.failureThreshold if crash recovery legitimately takes longer."
+                        exit 1
+                      fi
+                      if [ $((SECONDS - last_note)) -ge 30 ]; then
+                        note "waiting for the real server (${SECONDS}s of ${hook_budget}s): $(state)"
+                        last_note=$SECONDS
+                      fi
+                      sleep 1
+                    done
+                    waited=$SECONDS
+                    applied="managed roles $APP_USER, $PGPOOL_CHECK_USER"
+                    {{- if .Values.postgresql.pgHba }}
+                    HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
+                    {{- /* Insert the operator's rules as ONE ordered block, anchored on the
+                           first NON-LOOPBACK host rule (#298).
 
-                               RE-EMITTED WHOLE, not topped up with the missing entries (#298
-                               review). One pass fixes the order WITHIN a batch; it does not fix
-                               the order ACROSS pod starts, because a rule this hook inserted
-                               earlier is itself a non-loopback `host` rule sitting above the
-                               original anchor -- so it BECOMES the anchor, and a rule appended
-                               to postgresql.pgHba in a later `helm upgrade` (the only one a
-                               top-up would carry, the rest being already present) landed ABOVE
-                               the rules declared before it. First-match-wins means the newest
-                               entry then silently outranked every earlier one, which is the
-                               exact inversion the one-pass design was written to prevent.
-                               Stripping every declared rule and re-inserting the full list at
-                               the anchor makes the block idempotent and the order authoritative
-                               on every start, whatever it was before. Line-equality is the same
-                               identity test the old `grep -qF` used.
+                           pg_hba is first-match-wins, which fixes all three properties here:
+                            - BEFORE the network catch-alls, or the rule is never consulted;
+                            - AFTER initdb's `local ... trust` and its `127.0.0.1/32` /
+                              `::1/128` host rules, or a catch-all that also matches loopback
+                              (`host all all all reject`) beats them and breaks in-pod TCP
+                              clients -- `kubectl port-forward` + psql among them;
+                            - in the operator's own order, so a `trust` written before a
+                              `reject` still wins. One pass, not one per entry: per-entry
+                              passes re-anchor on the previous insert and reverse the list.
 
-                               ONE awk pass does the strip AND the insert, and the anchor is
-                               chosen BEFORE the strip (#298 review). A separate strip pass could
-                               delete the anchor itself: standalone mode runs the OFFICIAL
-                               postgres image, whose docker-entrypoint appends the file's only
-                               non-loopback host rule as single-spaced
-                               `host all all all <method>` -- the exact shape an operator writes
-                               -- so a postgresql.pgHba entry byte-identical to it was stripped,
-                               the second pass then found nothing to anchor on, and NONE of the
-                               entries were applied (the old grep-filtered form at least applied
-                               the rest). Selecting the anchor while that line is still present,
-                               and dropping it only via `!($0 in want)` after the block has been
-                               emitted in its place, keeps the collision case correct and
-                               idempotent: the declared list simply lands where the colliding
-                               rule was.
+                           RE-EMITTED WHOLE, not topped up with the missing entries (#298
+                           review). One pass fixes the order WITHIN a batch; it does not fix
+                           the order ACROSS pod starts, because a rule this hook inserted
+                           earlier is itself a non-loopback `host` rule sitting above the
+                           original anchor -- so it BECOMES the anchor, and a rule appended
+                           to postgresql.pgHba in a later `helm upgrade` (the only one a
+                           top-up would carry, the rest being already present) landed ABOVE
+                           the rules declared before it. First-match-wins means the newest
+                           entry then silently outranked every earlier one, which is the
+                           exact inversion the one-pass design was written to prevent.
+                           Stripping every declared rule and re-inserting the full list at
+                           the anchor makes the block idempotent and the order authoritative
+                           on every start, whatever it was before. Line-equality is the same
+                           identity test the old `grep -qF` used.
 
-                               The agent path is unaffected -- pgconf.AssemblePgHba places the
-                               whole list itself, in order, with loopback first (#144).
+                           ONE awk pass does the strip AND the insert, and the anchor is
+                           chosen BEFORE the strip (#298 review). A separate strip pass could
+                           delete the anchor itself: standalone mode runs the OFFICIAL
+                           postgres image, whose docker-entrypoint appends the file's only
+                           non-loopback host rule as single-spaced
+                           `host all all all <method>` -- the exact shape an operator writes
+                           -- so a postgresql.pgHba entry byte-identical to it was stripped,
+                           the second pass then found nothing to anchor on, and NONE of the
+                           entries were applied (the old grep-filtered form at least applied
+                           the rest). Selecting the anchor while that line is still present,
+                           and dropping it only via `!($0 in want)` after the block has been
+                           emitted in its place, keeps the collision case correct and
+                           idempotent: the declared list simply lands where the colliding
+                           rule was.
 
-                               cp onto the existing file, not mv: mv replaces the inode and the
-                               file would inherit the redirect's 0644 instead of initdb's 0600.
-                               Skipped entirely when the result is byte-identical, so a steady
-                               state start neither rewrites the file nor churns its mtime.
-                               A loud message rather than a silent skip if there is no host rule
-                               to anchor on. */}}
-                        PGCHART_INS="${HBA_FILE}.pgchart.ins"
-                        : > "$PGCHART_INS"
-                        {{- range .Values.postgresql.pgHba }}
-                        printf '%s\n' '{{ . }}' >> "$PGCHART_INS"
-                        {{- end }}
-                        if [ -s "$PGCHART_INS" ]; then
-                          if awk -v insfile="$PGCHART_INS" '
-                                NR==FNR { want[$0]; next }
-                                !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
-                                  while ((getline l < insfile) > 0) print l
-                                  close(insfile); done=1
-                                }
-                                !($0 in want) { print }
-                                END { if (!done) exit 3 }' "$PGCHART_INS" "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
-                            if [ "$(cat "${HBA_FILE}.pgchart.tmp")" != "$(cat "$HBA_FILE")" ]; then
-                              cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
-                            fi
-                          else
-                            echo "postStart: no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
-                          fi
-                          rm -f "${HBA_FILE}.pgchart.tmp"
+                           The agent path is unaffected -- pgconf.AssemblePgHba places the
+                           whole list itself, in order, with loopback first (#144).
+
+                           cp onto the existing file, not mv: mv replaces the inode and the
+                           file would inherit the redirect's 0644 instead of initdb's 0600.
+                           Skipped entirely when the result is byte-identical, so a steady
+                           state start neither rewrites the file nor churns its mtime.
+                           A loud message rather than a silent skip if there is no host rule
+                           to anchor on. */}}
+                    PGCHART_INS="${HBA_FILE}.pgchart.ins"
+                    : > "$PGCHART_INS"
+                    {{- range .Values.postgresql.pgHba }}
+                    printf '%s\n' '{{ . }}' >> "$PGCHART_INS"
+                    {{- end }}
+                    if [ -s "$PGCHART_INS" ]; then
+                      if awk -v insfile="$PGCHART_INS" '
+                            NR==FNR { want[$0]; next }
+                            !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
+                              while ((getline l < insfile) > 0) print l
+                              close(insfile); done=1
+                            }
+                            !($0 in want) { print }
+                            END { if (!done) exit 3 }' "$PGCHART_INS" "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
+                        if [ "$(cat "${HBA_FILE}.pgchart.tmp")" != "$(cat "$HBA_FILE")" ]; then
+                          cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
+                          applied="{{ len .Values.postgresql.pgHba }} pg_hba entries written, $applied"
+                        else
+                          applied="{{ len .Values.postgresql.pgHba }} pg_hba entries already in place, $applied"
                         fi
-                        rm -f "$PGCHART_INS"
-                        {{- end }}
-                        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
-                        {{- /* Chart-managed non-superuser roles (postgresql.app, pgpool.checkUser):
-                               standalone has no agent, so this hook provisions them on every start,
-                               the same definition pg.EnsureRole asserts in HA mode (test-template.sh
-                               checks the two stay identical) -- created if
-                               absent and marked with COMMENT ON ROLE, refused if a same-named role
-                               without that mark exists (converting it would silently demote someone
-                               else's role), then LOGIN without any elevated attribute, the password from
-                               the Secret, and the kind's privileges. Passwords reach psql only
-                               through the environment (\getenv), statement logging and
-                               pg_stat_statements tracking are turned off before they are sent, and VERBOSITY terse keeps the dynamic ALTER
-                               out of the error CONTEXT. A failure fails the hook: the kubelet
-                               restarts the container and records the message in a
-                               FailedPostStartHook event, where it is visible, instead of pgpool
-                               waiting forever on a role that was never created. The gate above
-                               guarantees this runs against the real server. */}}
-                        if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 \
-                             -v r_app="$APP_USER" -v r_check="$PGPOOL_CHECK_USER" -v d="$POSTGRES_DB" <<'SQL'
+                      else
+                        log "no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries"
+                        applied="pg_hba entries NOT applied (no anchor), $applied"
+                      fi
+                      rm -f "${HBA_FILE}.pgchart.tmp"
+                    fi
+                    rm -f "$PGCHART_INS"
+                    {{- end }}
+                    {{- /* The reload result used to be discarded; a failed one is reported but not
+                           fatal: the server is up, the roles below still apply, and the pg_hba
+                           change takes effect on the next reload or restart. */}}
+                    reload=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_reload_conf()" 2>&1) || true
+                    if [ "$reload" != "t" ]; then
+                      log "pg_reload_conf() did not succeed (${reload:-no output}); pg_hba changes take effect on the next reload"
+                    fi
+                    {{- /* Chart-managed non-superuser roles (postgresql.app, pgpool.checkUser):
+                           standalone has no agent, so this hook provisions them on every start,
+                           the same definition pg.EnsureRole asserts in HA mode (test-template.sh
+                           checks the two stay identical) -- created if
+                           absent and marked with COMMENT ON ROLE, refused if a same-named role
+                           without that mark exists (converting it would silently demote someone
+                           else's role), then LOGIN without any elevated attribute, the password from
+                           the Secret, and the kind's privileges. Passwords reach psql only
+                           through the environment (\getenv), statement logging and
+                           pg_stat_statements tracking are turned off before they are sent, and VERBOSITY terse keeps the dynamic ALTER
+                           out of the error CONTEXT. A failure fails the hook: the kubelet
+                           restarts the container and records the message in a
+                           FailedPostStartHook event, where it is visible, instead of pgpool
+                           waiting forever on a role that was never created. The gate above
+                           guarantees this runs against the real server. */}}
+                    if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 \
+                         -v r_app="$APP_USER" -v r_check="$PGPOOL_CHECK_USER" -v d="$POSTGRES_DB" <<'SQL'
                     \set VERBOSITY terse
                     \getenv app_pw APP_PASSWORD
                     \getenv check_pw PGPOOL_CHECK_PASSWORD
@@ -1215,56 +1270,50 @@ spec:
                       v_marker TEXT := 'managed by the pg chart';
                     BEGIN
                       FOR r IN SELECT * FROM (VALUES
-                          (current_setting('myvars.app'), current_setting('myvars.app_pw'), 'app'),
-                          (current_setting('myvars.chk'), current_setting('myvars.chk_pw'), 'pgpool-check')) AS t(name, pw, kind)
+                      (current_setting('myvars.app'), current_setting('myvars.app_pw'), 'app'),
+                      (current_setting('myvars.chk'), current_setting('myvars.chk_pw'), 'pgpool-check')) AS t(name, pw, kind)
                       LOOP
-                        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name) THEN
-                          EXECUTE format('CREATE ROLE %I', r.name);
-                          EXECUTE format('COMMENT ON ROLE %I IS %L', r.name, v_marker);
-                        ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = r.name), 'pg_authid') IS DISTINCT FROM v_marker THEN
-                          RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(r.name), quote_ident(r.name), quote_literal(v_marker);
+                    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.name) THEN
+                      EXECUTE format('CREATE ROLE %I', r.name);
+                      EXECUTE format('COMMENT ON ROLE %I IS %L', r.name, v_marker);
+                    ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = r.name), 'pg_authid') IS DISTINCT FROM v_marker THEN
+                      RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(r.name), quote_ident(r.name), quote_literal(v_marker);
+                    END IF;
+                    EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', r.name, r.pw);
+                    IF r.kind = 'pgpool-check' THEN
+                      EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', r.name);
+                      IF current_setting('myvars.db') = 'postgres' AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public')
+                         AND has_schema_privilege(r.name, 'public', 'CREATE') THEN
+                        EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', r.name);
+                      END IF;
+                    ELSE
+                      IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+                                 WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = r.name)
+                                   AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+                        EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', r.name);
+                      END IF;
+                      IF current_setting('myvars.db') = 'postgres' THEN
+                        EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_setting('myvars.db'), r.name);
+                        IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
+                          EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', r.name);
                         END IF;
-                        EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', r.name, r.pw);
-                        IF r.kind = 'pgpool-check' THEN
-                          EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', r.name);
-                          IF current_setting('myvars.db') = 'postgres' AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public')
-                             AND has_schema_privilege(r.name, 'public', 'CREATE') THEN
-                            EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', r.name);
-                          END IF;
-                        ELSE
-                          IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
-                                     WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = r.name)
-                                       AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
-                            EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', r.name);
-                          END IF;
-                          IF current_setting('myvars.db') = 'postgres' THEN
-                            EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_setting('myvars.db'), r.name);
-                            IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
-                              EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', r.name);
-                            END IF;
-                          ELSE
-                            EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('myvars.db'), r.name);
-                          END IF;
-                        END IF;
+                      ELSE
+                        EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('myvars.db'), r.name);
+                      END IF;
+                    END IF;
                       END LOOP;
                     END
                     $$;
                     SQL
-                        then
-                          echo "postStart: provisioning the managed roles ($APP_USER, $PGPOOL_CHECK_USER) failed; see the psql error above" >&2
-                          exit 1
-                        fi
-                        {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
-                        {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
-                        {{- end }}
-                        break
-                      fi
-                      sleep 1
-                    done
-                    if [ -z "$real_server" ]; then
-                      echo "postStart: the server did not come up on 127.0.0.1 with database $POSTGRES_DB within 300s; pgHba entries and the managed roles ($APP_USER, $PGPOOL_CHECK_USER) were not applied" >&2
+                    then
+                      log "provisioning the managed roles ($APP_USER, $PGPOOL_CHECK_USER) failed; see the psql error above"
                       exit 1
                     fi
+                    {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+                    {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 20 }}
+                    applied="$applied, additionalCommands"
+                    {{- end }}
+                    log "real server up on 127.0.0.1 after ${waited}s; applied: $applied"
 {{- else }}
           lifecycle:
 {{- /* No preStop hook: the agent is PID 1 and owns SIGTERM shutdown (release the Lease,

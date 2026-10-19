@@ -20,6 +20,22 @@
   briefly from the +3 headroom and a 53300 there is logged and retried, never read as a node
   state. `ha.image.tag` and the etcd bootstrap image move to `2.3.0-pg18`. **The pods roll once.**
 
+### Fixed
+
+- **The standalone postStart hook no longer kills a node whose crash recovery outlasts 300 s
+  (#370, #358).** Kubernetes starts no probe until postStart returns and puts no timeout on an
+  exec hook, so the hook's fixed 300-iteration wait was the only bound on a standalone start: a
+  crash recovery longer than ~5 min was killed mid-replay, replayed from the same point and was
+  killed again. The hook now waits the startup probe's own budget on the wall clock
+  (`postgresql.startupProbe.periodSeconds x failureThreshold`, 1800 s by default, never below
+  300 s so a first boot cannot be cut mid-initdb) -- a server it gives up on is one the startup
+  probe would have killed at the same moment, and `failureThreshold`, already the documented
+  crash-recovery knob, tunes both. It writes a progress line every 30 s and its outcome (how
+  long it waited, what it applied) to the container log through PID 1's stderr, so `kubectl
+  logs` shows it; the pre-#365 silent `exit 0` that left `postgresql.pgHba` rules unapplied
+  (#358) is not reinstated, and exhausting the budget still fails the hook with a message that
+  names the knob. A failed `pg_reload_conf()` is now reported (not fatal).
+
 ## 2.5.0 - 2026-10-13
 
 ### Upgrade notes
