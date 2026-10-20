@@ -44,7 +44,7 @@ data:
 {{- $customKeys = append $customKeys $key }}
 {{- end }}
 {{- end }}
-  # Connection reserves (see pg.superuserReservedConnections). Sorts after custom.conf,
+  # Connection reserves (see pg.superuserReservedConnections / ha.superuserReservedConnections). Sorts after custom.conf,
   # and pg.validateConnectionReserves refuses these keys there, so this is their only
   # source.
   reserved-connections.conf: |

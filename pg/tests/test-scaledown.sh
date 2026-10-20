@@ -5,8 +5,9 @@ set -euo pipefail
 # repmgr.nodes. The primary reconciles repmgr.nodes against the live ordinal range and
 # unregisters records for pods the StatefulSet no longer runs.
 #
-# The agent's own cleanupGhostNodes runs on the lease holder each tick,
-# bounded by REPMGR_NODE_COUNT (which the scale-down `helm upgrade` re-renders). Keeping
+# The agent's own cleanupGhostNodes runs on the lease holder each tick, bounded by the
+# StatefulSet's spec.replicas, which the scale-down `helm upgrade` changes without rolling a
+# single pod (#373; asserted below on the controller revision). Keeping
 # this suite is the point of the port -- it is the only end-to-end #139 regression, and
 # the Go unit tests cover ghostNodeIDs' arithmetic but not the live unregister.
 #
@@ -102,6 +103,12 @@ PRE_SLOT2=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
 echo "  pre-scale: primary=${PRE_PRIMARY} pg_ha_slot_2_present=${PRE_SLOT2:-?}"
 
+# #373: a scale must roll NOTHING. Record the StatefulSet's pod-template revision and the
+# survivors' UIDs before the upgrade; both must be the same objects afterwards.
+PRE_REV=$(kubectl get sts "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.status.updateRevision}')
+PRE_UID0=$(kubectl get pod "${FULLNAME}-0" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')
+PRE_UID1=$(kubectl get pod "${FULLNAME}-1" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')
+
 # Scale down to 2 instances (replicaCount=1 -> ordinals 0,1). The StatefulSet trims the
 # top ordinal, so pod-2 (a standby) is removed; its repmgr.nodes row (node_id 1002) is
 # now a ghost the primary must unregister (#139).
@@ -112,6 +119,21 @@ helm upgrade "${RELEASE}" "${CHART_DIR}" \
   --wait --timeout 10m
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300
+
+# #373: the scale changed replicas and nothing else -- same revision, same pods. Before, the
+# re-rendered REPMGR_NODE_COUNT (and, in 2.5.0, the node-count-derived superuser reserve)
+# rolled both survivors, so a scale-down was also a failover.
+POST_REV=$(kubectl get sts "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.status.updateRevision}')
+assert_eq "#373: scaling down left the StatefulSet revision unchanged (no pod rolled)" "${PRE_REV}" "${POST_REV}"
+assert_eq "#373: pod-0 is the same pod it was before the scale" "${PRE_UID0}" "$(kubectl get pod "${FULLNAME}-0" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
+assert_eq "#373: pod-1 is the same pod it was before the scale" "${PRE_UID1}" "$(kubectl get pod "${FULLNAME}-1" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}')"
+# ... and the agents learned the new count from spec.replicas, not from a restart.
+saw_count=0; elapsed=0
+while [[ ${elapsed} -lt 60 ]]; do
+  if kubectl logs "${FULLNAME}-0" -n "${NAMESPACE}" -c postgresql 2>/dev/null | grep -q "node count changed with spec.replicas.*to=2"; then saw_count=1; break; fi
+  sleep 5; elapsed=$((elapsed + 5))
+done
+assert_eq "#373: the agent logged the node count moving 3 -> 2 from spec.replicas" "1" "${saw_count}"
 
 # The lease holder's agent unregisters the ghost on its next reconcile tick; poll until
 # gone. Agent mode is Parallel, so the surviving pods roll concurrently -- give the lease
@@ -129,10 +151,11 @@ assert_eq "the departed ordinal 2 left the topology after scale-down (#139)" "1"
 # The loop above is not sufficient: under native, "ordinal 2 left the topology" is satisfied
 # on its very first poll, because the departed pod's pg_stat_replication row vanishes the
 # instant the pod dies -- it says nothing about whether a survivor is streaming yet. And this
-# scale-down is also a FAILOVER: the lease race consistently puts the primary on the trimmed
-# ordinal, so the same `helm upgrade` rolls both survivors in Parallel and the lease flaps
-# (observed: pod-0 -> pod-1 -> pod-0, converging after ~30s). Sampling inside that window made
-# the two assertions below fail on a cluster that then converged to exactly the asserted state.
+# scale-down can be a FAILOVER: the lease race can put the primary on the trimmed ordinal, in
+# which case a survivor promotes and the other follows it (before #373 the same `helm upgrade`
+# also rolled both survivors in Parallel and the lease flapped pod-0 -> pod-1 -> pod-0,
+# converging after ~30s). Sampling inside that window made the two assertions below fail on a
+# cluster that then converged to exactly the asserted state.
 echo "  Waiting for the surviving standby to stream from the new primary (up to 180s)..."
 converged=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do

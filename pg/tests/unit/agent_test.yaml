@@ -100,6 +100,21 @@ tests:
               - get
               - update
           any: true
+      # #373: the expected node count is spec.replicas of the agent's own StatefulSet, read
+      # each tick instead of a REPMGR_NODE_COUNT env rendered from replicaCount (which rolled
+      # every pod on every scale). Read-only, one object.
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - statefulsets
+            resourceNames:
+              - test-pg
+            verbs:
+              - get
+          any: true
       # The leases rule grants no "patch" (asserted by the exact contains above):
       # client-go's LeaseLock renews with Get+Update only, so the verb was pure attack
       # surface on the pod's token (#298 review). rules[*].verbs cannot be asserted

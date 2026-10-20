@@ -54,7 +54,7 @@ HELM_REPO_URL="${HELM_REPO_URL:-https://cagriekin.github.io/charts}"
 # collide. Derived per major here rather than pinned in the fixture on purpose: a fixture pin
 # would fall under set-pg-major.sh's tag rewrite, which would drag the "from" image forward to
 # the chart's own tag and destroy the premise.
-FROM_IMAGE_BASE="${FROM_IMAGE_BASE:-trixie-5.5.0-32}"   # set-pg-major: keep (an older RELEASED image is the point)
+FROM_IMAGE_BASE="${FROM_IMAGE_BASE:-trixie-5.5.0-32-pg18}"   # set-pg-major: keep (an older RELEASED image is the point)
 PG_MAJOR=$(awk '/^(repmgr|ha):/{r=1} r&&/^    majorVersion:/{gsub(/"/,"",$2); print $2; exit}' "${CHART_DIR}/values.yaml")
 [ -n "${PG_MAJOR}" ] || { echo "could not resolve majorVersion from ${CHART_DIR}/values.yaml" >&2; exit 1; }
 # Normalize rather than append: set-pg-major.sh rewrites the keep-marked line above to

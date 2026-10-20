@@ -73,7 +73,12 @@ inside the main container where it can be fenced.
 
 ### agent mode
 
-The chart's `ENVIRONMENT.md` lists the full set. Since 2.2.0 the agent also requires
+The chart's `ENVIRONMENT.md` lists the full set. Since 2.4.0 the agent reads the expected node
+count from `spec.replicas` of its own StatefulSet (named after the pod, minus the ordinal) each
+tick, so `REPMGR_NODE_COUNT` is optional: it is only the fallback until the first successful
+read. That read needs `get` on the StatefulSet, which the pg/pgvector chart grants from 2.6.0;
+on an older chart the agent logs the denied read once and keeps using the env (#373).
+Since 2.2.0 the agent also requires
 `APP_USER`/`APP_PASSWORD` and `PGPOOL_CHECK_USER`/`PGPOOL_CHECK_PASSWORD`, plus `POSTGRES_USER` and
 `POSTGRES_DB`, so **image 2.2.0 needs the pg/pgvector chart 2.5.0 or newer**; on an older chart the
 agent refuses to start. On the primary it provisions those two non-superuser roles over the local
@@ -143,7 +148,9 @@ re-points the Services itself.
 ### Scale Up/Down
 
 - **Scale up**: the new pod's agent clones from the current primary through its own slot, which
-  the primary pre-creates so no WAL gap can open before the clone attaches.
+  the primary pre-creates so no WAL gap can open before the clone attaches. The primary learns
+  of the new ordinal from the StatefulSet's `spec.replicas` on the next tick (#373), not from a
+  re-rendered env, so a scale rolls no existing pod.
 - **Scale down**: the primary reclaims the departed ordinal's replication slot once its pod is
   gone, so nothing is left pinning WAL. There is no `repmgr.nodes` to strand rows in.
 - **Scale back up with stale PVC**: the agent compares its timeline against the primary's and rewinds with `pg_rewind`, re-cloning only if that cannot proceed (#290: the init container no longer does this)

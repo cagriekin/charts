@@ -97,7 +97,7 @@ func logStartupConfig(log *slog.Logger, cfg *config.Config) {
 		"leaseDuration", cfg.LeaseDuration,
 		"renewDeadline", cfg.RenewDeadline,
 		"retryPeriod", cfg.RetryPeriod,
-		"nodeCount", cfg.NodeCount,
+		"nodeCountFallback", cfg.NodeCount, // #373: spec.replicas is read each tick; this env only covers the gap
 		"headlessService", cfg.HeadlessService,
 		"masterService", cfg.MasterService,
 		"markerName", cfg.MarkerName,
@@ -245,6 +245,22 @@ type agent struct {
 	// ends when some node is observed serving read-write again -- rather than on every
 	// re-acquisition (the counter carries the per-refusal signal).
 	lagRefusedLatch bool
+
+	// nodeCount is the EXPECTED pod count, spec.replicas of this agent's own StatefulSet,
+	// refreshed at the top of every tick (#373). Zero until the first successful read; the
+	// consumers go through expectedNodes(), which falls back to the REPMGR_NODE_COUNT env
+	// while this is zero. Reconcile goroutine only.
+	//
+	// Read live rather than rendered into the pod, because the rendered env was the one
+	// thing in the pod template that moved with postgresql.replicaCount: scaling the
+	// database rolled every PostgreSQL pod, the primary included, to deliver a new integer
+	// -- and delivered it LAST to the primary, so the primary ran a whole rollout on the
+	// old count (the trap orphanSlot documents). spec.replicas is what the controller is
+	// converging on, so it is right on the tick after the scale, on every node at once.
+	nodeCount int
+	// nodeCountWarned latches the "cannot read the StatefulSet" warning so a denied or
+	// unreachable Get is logged once per episode, not every tick.
+	nodeCountWarned bool
 
 	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
 	// the OnLost fence callback never drive the supervisor concurrently (single
@@ -777,6 +793,7 @@ func (a *agent) boot(ctx context.Context) error {
 // or a background ticker is fine, a cached write path is not.
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
+	a.refreshNodeCount(ctx)
 	// Sampled BEFORE observe() so deriveServingRW can tell whether a demote completed while
 	// this tick was looking (#298 review; see the fenceGen field).
 	gen := a.fenceGen.Load()
@@ -1017,6 +1034,47 @@ func markerTamperSuspected(o reconcile.Observation) (bool, string) {
 	return false, ""
 }
 
+// refreshNodeCount reads spec.replicas of this agent's StatefulSet into a.nodeCount (#373).
+//
+// Bounded by the fence budget like every other apiserver call on the reconcile goroutine
+// (#288 review): tick()'s context has no deadline, and a blackholed Get would otherwise
+// stall the loop until the kubelet killed the container over a stale /healthz. On failure
+// the last value stands -- or, before any read has succeeded, the env fallback -- and the
+// warning is logged once per episode: a StatefulSet that cannot be read is a cluster
+// running an older chart's RBAC, and that is a one-line "upgrade the chart" message, not a
+// log line every five seconds.
+func (a *agent) refreshNodeCount(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer cancel()
+	n, err := a.kube.StatefulSetReplicas(rctx, a.base)
+	if err != nil {
+		if !a.nodeCountWarned {
+			a.log.Warn("read the StatefulSet's spec.replicas; using the last known node count (the REPMGR_NODE_COUNT env until the first read succeeds). Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)", "statefulset", a.base, "fallback", a.expectedNodes(), "err", err)
+			a.nodeCountWarned = true
+		}
+		return
+	}
+	if a.nodeCountWarned {
+		a.log.Info("StatefulSet readable again; node count follows spec.replicas", "statefulset", a.base, "nodeCount", n)
+		a.nodeCountWarned = false
+	}
+	if n != a.nodeCount && a.nodeCount != 0 {
+		a.log.Info("node count changed with spec.replicas; peers and slots follow it on this tick, no pod rolled", "from", a.nodeCount, "to", n)
+	}
+	a.nodeCount = n
+}
+
+// expectedNodes is how many pods the StatefulSet should have: the live spec.replicas when
+// it has been read, else the REPMGR_NODE_COUNT env (#373). Never negative: a negative env
+// once reached `make` in the peer fan-out and PANICKED PID 1 (#298), so probe nothing
+// instead.
+func (a *agent) expectedNodes() int {
+	if a.nodeCount > 0 {
+		return a.nodeCount
+	}
+	return max(0, a.cfg.NodeCount)
+}
+
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	local := a.prober.Probe(ctx, a.selfConn())
 	ls := reconcile.LocalState{
@@ -1127,12 +1185,14 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		refused bool
 		set     bool
 	}
-	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a negative
-	// value reaches here and `make` with a negative length PANICS -- which for PID 1 is a
-	// crash-loop over the postmaster it supervises. Probe nothing instead (#298).
-	probes := make([]peerProbe, max(0, a.cfg.NodeCount))
+	// expectedNodes() is spec.replicas read this tick, or the env fallback clamped at zero:
+	// config.Load only requires REPMGR_NODE_COUNT to PARSE, so a negative value once reached
+	// `make` here and PANICKED -- which for PID 1 is a crash-loop over the postmaster it
+	// supervises (#298). Probe nothing instead.
+	nodeCount := a.expectedNodes()
+	probes := make([]peerProbe, nodeCount)
 	var pwg sync.WaitGroup
-	for i := 0; i < a.cfg.NodeCount; i++ {
+	for i := 0; i < nodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
 		if name == a.cfg.PodName {
 			continue
@@ -4249,8 +4309,8 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// OUTSIDE opMu and the fence budget, so a slow LIST cannot delay a marker write, a
 	// routing switch or a lost-leadership fence. The duplicate call is a gauge's cost, paid off
 	// the critical path.
-	// The live pod set from the API, not NodeCount: that env var is baked in at render time and
-	// is stale on every pod that has not rolled yet (see orphanSlot).
+	// The live pod set from the API, not the expected count: a pod not yet created cannot be
+	// streaming, so expected-vs-streaming is judged on what exists (see orphanSlot).
 	// tctx, not ctx (#288 review, round 2). tick()'s context is the run loop's -- no deadline --
 	// and this LIST is uncached, so an apiserver that blackholes it would block the reconcile
 	// goroutine indefinitely: no further metr.Beat(), /healthz stale after ~3x the interval, and
@@ -4560,8 +4620,8 @@ func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
 //
 // Two directions, both idempotent:
 //
-//   - CREATE for every expected peer ordinal. Driven by the EXPECTED pod set (NodeCount),
-//     not by observed standbys: a slot must exist BEFORE its standby tries to stream, and
+//   - CREATE for every expected peer ordinal. Driven by the EXPECTED pod set (spec.replicas
+//     via expectedNodes, #373), not by observed standbys: a slot must exist BEFORE its standby tries to stream, and
 //     after a promote the surviving standbys will follow this node within a tick. Waiting
 //     to observe them first would leave every Follow racing slot creation, which is the
 //     ordering the issue calls out. This is also why the call sits ahead of the routing
@@ -4581,7 +4641,8 @@ func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
 // and the whole point is that an unreclaimed slot silently fills the volume.
 func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]string, bool) {
-	if a.cfg.NodeCount <= 0 {
+	nodeCount := a.expectedNodes()
+	if nodeCount <= 0 {
 		return nil, false
 	}
 	self := a.selfConn()
@@ -4593,17 +4654,19 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 	// The live pod set is read FIRST because both passes need it, and because reading it
 	// after the creates is what made them fight: the drop pass judges against the live set
 	// while the create pass judged against NodeCount, so any ordinal inside [0, NodeCount)
-	// with no live pod was created on one tick and reclaimed on the next, forever. After a
-	// replicaCount 2->1 scale-down the ordinal-0 primary still holds the OLD
-	// REPMGR_NODE_COUNT until the StatefulSet rolls it LAST, so that oscillation ran for the
-	// whole rollout, logging a create and a drop every tick.
+	// with no live pod was created on one tick and reclaimed on the next, forever. When the
+	// count was the rendered REPMGR_NODE_COUNT env, a replicaCount 2->1 scale-down left the
+	// ordinal-0 primary on the OLD count until the StatefulSet rolled it LAST, so that
+	// oscillation ran for the whole rollout, logging a create and a drop every tick. The
+	// count now follows spec.replicas (#373) and the trimmed pod lingers only until it is
+	// gone, but the two passes must still agree for that window.
 	live, liveErr := a.livePodOrdinals(ctx)
 	if liveErr != nil {
-		// No authoritative view of what exists. Creation still runs off NodeCount -- an
+		// No authoritative view of what exists. Creation still runs off the expected count -- an
 		// unnecessary slot costs only a later drop -- but nothing is reclaimed: dropping on a
 		// stale or guessed pod set is how a needed slot gets destroyed, and an orphan
 		// surviving one more tick costs only WAL, which the alert covers if it persists.
-		a.log.Warn("list live pods for slot reconcile; creating from NodeCount and skipping the drop pass this tick", "err", liveErr)
+		a.log.Warn("list live pods for slot reconcile; creating from the expected node count and skipping the drop pass this tick", "err", liveErr)
 	}
 
 	selfOrd, selfOK := podname.Ordinal(a.cfg.PodName)
@@ -4624,7 +4687,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 	// the pre-pass snapshot below over-reports them as present (#298 review; see the create
 	// loop's error branch).
 	recycleFailed := map[string]bool{}
-	for ord := 0; preCreate && ord < a.cfg.NodeCount; ord++ {
+	for ord := 0; preCreate && ord < nodeCount; ord++ {
 		if selfOK && ord == selfOrd {
 			continue // the primary does not stream from itself
 		}
@@ -4774,9 +4837,9 @@ func (a *agent) ownedStandbySlots(slots []pg.SlotState, live map[int]bool) []str
 // livePodOrdinals reads the StatefulSet's actual pod set from the API and returns the set
 // of ordinals present (#289).
 //
-// The API, not REPMGR_NODE_COUNT: that env var is baked into each pod at render time, so
-// during a scale-up rollout it is stale on every pod that has not rolled yet -- see
-// orphanSlot. A pod whose name carries no parseable ordinal is ignored rather than failing
+// The API, not the expected count (spec.replicas, #373): during a scale-up the new ordinal
+// is expected before its pod exists, and during a scale-down the trimmed pod lingers after it
+// stopped being expected -- see orphanSlot. A pod whose name carries no parseable ordinal is ignored rather than failing
 // the whole read; it cannot own an agent-minted slot either way.
 func (a *agent) livePodOrdinals(ctx context.Context) (map[int]bool, error) {
 	names, err := a.kube.ListPodNames(ctx, a.cfg.PodSelector)
@@ -4979,16 +5042,19 @@ func slotNameFor(pod string) string {
 // active slot atomically in SQL, which is both safer and race-free.
 //
 // liveOrdinals is every pod ordinal the Kubernetes API currently reports for this
-// StatefulSet, and it -- not REPMGR_NODE_COUNT -- is the authority on what exists. That
+// StatefulSet, and it -- not the expected count -- is the authority on what exists. That
 // distinction is the whole safety argument here:
 //
-//   - NodeCount is read once at process boot from an env var baked into the pod template,
-//     so during a scale-up rollout every pod that has not rolled yet (including, typically,
-//     the ordinal-0 primary, which the StatefulSet rolls LAST) still holds the OLD count.
-//     Deciding ownership from it would make the stale primary classify a brand-new
-//     standby's just-created slot as a scale-down ghost and drop it -- while that standby
-//     is briefly inactive between pg_basebackup finishing and its postmaster reattaching
-//     -- reintroducing exactly the WAL gap this whole change exists to close.
+//   - The node count was once read at process boot from an env var baked into the pod
+//     template, so during a scale-up rollout every pod that had not rolled yet (including,
+//     typically, the ordinal-0 primary, which the StatefulSet rolls LAST) still held the
+//     OLD count. Deciding ownership from it would make the stale primary classify a
+//     brand-new standby's just-created slot as a scale-down ghost and drop it -- while that
+//     standby is briefly inactive between pg_basebackup finishing and its postmaster
+//     reattaching -- reintroducing exactly the WAL gap this whole change exists to close.
+//     The count now follows spec.replicas each tick (#373), but it is still the EXPECTED
+//     set, one Get old and subject to the env fallback; what exists is a different question
+//     with a different source, and ownership is decided on the latter.
 //   - A pod that is mid-restart, still starting, or has never gossiped is present in the
 //     live pod list, so its slot is protected. Inactivity alone is NOT evidence that a
 //     consumer is gone for good; it is also what a routine restart looks like.

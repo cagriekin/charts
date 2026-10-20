@@ -1,6 +1,6 @@
 # pg chart changelog
 
-## 2.5.1 - 2026-10-18
+## 2.6.0 - 2026-10-20
 
 ### Changed
 
@@ -35,6 +35,28 @@
   logs` shows it; the pre-#365 silent `exit 0` that left `postgresql.pgHba` rules unapplied
   (#358) is not reinstated, and exhausting the budget still fails the hook with a message that
   names the knob. A failed `pg_reload_conf()` is now reported (not fatal).
+- **Scaling `postgresql.replicaCount` no longer restarts any PostgreSQL pod (#373).** Two
+  things in the pod spec moved with the node count, and each one rolled every pod, the primary
+  included, on every scale. `superuser_reserved_connections` was derived from
+  `replicaCount + 1 + 3` and rendered into the checksummed PostgreSQL ConfigMap; it is now its
+  own value, `ha.superuserReservedConnections` (default 8, at least `replicaCount + 1 + 3`,
+  render-enforced), exactly as `pgpool.reservedConnections` already works and for the same
+  reason: the setting needs a PostgreSQL restart. Scaling within the value changes nothing in
+  the config; scaling past it fails the render with a message naming the knob. And the agent's
+  `REPMGR_NODE_COUNT` env was `replicaCount + 1`; **pg-ha image 2.4.0** reads `spec.replicas`
+  of its own StatefulSet each tick instead (the Role gains `get` on that one object), so the
+  pod spec no longer mentions the node count at all and a scale is just the StatefulSet adding
+  or trimming the top ordinal -- no revision change, no restart. That also removes the
+  stale-count window the old env had: every agent, the primary first, sees the new count on
+  the tick after the scale, instead of the primary learning it last when the rollout reached
+  it. The env is still honoured as a fallback until the first successful read, and a chart
+  paired with an older image tag (which requires the env to boot) fails the render.
+  **Upgrade notes:** the upgrade to 2.6.0 itself rolls the PostgreSQL pods once -- the rendered
+  reserve moves from `replicaCount + 4` to 8 (5 to 8 at the default `replicaCount: 1`), the
+  env leaves the pod spec, and the image tag moves -- and at the default `max_connections` of
+  100 the reserves leave 85 application slots with pgpool instead of 88. After it, scaling
+  `postgresql.replicaCount` up to 4 rolls nothing; past 4 raise `ha.superuserReservedConnections`
+  first (that one is a restart, which is why it is a value and not a derivation).
 
 ## 2.5.0 - 2026-10-13
 

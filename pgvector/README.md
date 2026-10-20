@@ -242,6 +242,7 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
 | `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
 | `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
+| `ha.superuserReservedConnections` | `superuser_reserved_connections` on every node: at least `postgresql.replicaCount + 1 + 3`, render-enforced. Its own value because it needs a PostgreSQL restart, so scaling within it rolls nothing (#373) | `8` |
 | `ha.resources.requests.cpu` | **Not consumed since #286.** The agent runs inside the `postgresql` container, so its CPU/memory come from `postgresql.resources`; these four keys are kept only so an existing values file still renders | `50m` |
 | `ha.resources.requests.memory` | **Not consumed since #286** — see above | `128Mi` |
 | `ha.resources.limits.cpu` | **Not consumed since #286** — see above | `500m` |
@@ -571,6 +572,14 @@ kubectl get lease my-pgvector-leader -o jsonpath='{.spec.holderIdentity}'
 kubectl exec -it my-pgvector-0 -- psql -U repmgr -d repmgr \
   -c "SELECT application_name, state, sync_state, replay_lag FROM pg_stat_replication"
 ```
+
+### Scaling
+
+Changing `postgresql.replicaCount` **rolls no pod** (#373): the superuser reserve is its own
+value (`ha.superuserReservedConnections`, render-checked against the node count) and the agent
+reads the expected node count from its StatefulSet's `spec.replicas` each tick instead of an env
+rendered into the pod. Scaling past what the reserve covers (4 replicas at the default of 8)
+fails the render naming the knob.
 
 ### Scaling down
 

@@ -46,10 +46,15 @@ type Config struct {
 	SaturationGrace time.Duration
 
 	HeadlessService string // for building peer FQDNs <pod>.<headless>
-	NodeCount       int    // total pods (replicaCount+1) for peer enumeration
-	MasterService   string // write Service whose selector the agent patches
-	MarkerName      string // durable primary-marker ConfigMap
-	PodSelector     string // label selector for the postgresql pods (pg-role labeling)
+	// NodeCount is the REPMGR_NODE_COUNT env: total pods (replicaCount+1) for peer
+	// enumeration. Optional since image 2.4.0 (#373): the agent reads spec.replicas of its own
+	// StatefulSet each tick and uses this only until that first read succeeds, so the chart
+	// no longer renders it (a value that moved with replicaCount rolled every pod). Zero when
+	// unset; a set value must still parse.
+	NodeCount     int
+	MasterService string // write Service whose selector the agent patches
+	MarkerName    string // durable primary-marker ConfigMap
+	PodSelector   string // label selector for the postgresql pods (pg-role labeling)
 
 	RepmgrUser     string
 	RepmgrDB       string
@@ -277,6 +282,15 @@ func (l *loader) intv(key string) int {
 	return n
 }
 
+// optIntv is intv for a variable that may be absent: unset is zero, not missing, but a
+// set value must still parse (#373).
+func (l *loader) optIntv(key string) int {
+	if l.get(key) == "" {
+		return 0
+	}
+	return l.intv(key)
+}
+
 // Load reads the config using get (os.Getenv in production). It returns an error
 // listing every missing/invalid variable so misconfiguration is fixed in one pass.
 func Load(get func(string) string) (*Config, error) {
@@ -291,7 +305,7 @@ func Load(get func(string) string) (*Config, error) {
 		ReconcileInterval: l.dur("RECONCILE_INTERVAL"),
 		SaturationGrace:   l.dur("SATURATION_GRACE"),
 		HeadlessService:   l.str("HEADLESS_SERVICE"),
-		NodeCount:         l.intv("REPMGR_NODE_COUNT"),
+		NodeCount:         l.optIntv("REPMGR_NODE_COUNT"),
 		MasterService:     l.str("MASTER_SERVICE"),
 		MarkerName:        l.str("PRIMARY_MARKER"),
 		PodSelector:       l.str("POD_SELECTOR"),

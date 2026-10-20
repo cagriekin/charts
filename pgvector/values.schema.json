@@ -435,6 +435,11 @@
         },
         "initContainerResources": {
           "$ref": "#/definitions/resources"
+        },
+        "superuserReservedConnections": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "superuser_reserved_connections on every PostgreSQL node in HA mode; at least postgresql.replicaCount + 1 + 3 (render-enforced). Its own value because it needs a PostgreSQL restart, so a value derived from replicaCount rolled every database pod on every scale (#373)."
         }
       },
       "description": "DEPRECATED alias for ha.* (#291). Structurally IDENTICAL to ha on purpose: the issue requires both spellings to validate during the alias window, so making this permissive would silently drop enum and type checking for every key an existing values file still spells the old way. Keys under it are merged over the ha.* defaults key by key. Generated from the ha shape -- keep them identical; test-template.sh asserts it."
@@ -899,6 +904,11 @@
         },
         "initContainerResources": {
           "$ref": "#/definitions/resources"
+        },
+        "superuserReservedConnections": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "superuser_reserved_connections on every PostgreSQL node in HA mode; at least postgresql.replicaCount + 1 + 3 (render-enforced). Its own value because it needs a PostgreSQL restart, so a value derived from replicaCount rolled every database pod on every scale (#373)."
         }
       }
     },

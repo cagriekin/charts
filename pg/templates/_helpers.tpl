@@ -1153,7 +1153,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            tooling (backups, hook Jobs) and an operator's psql. A write that finds the
            reserve full gets a 53300, is logged and retried by its caller, and is never read
            as a node classification -- only the read probe feeds saturation tracking.
-           Standalone has no agent: PostgreSQL's own 3.
+           ha.superuserReservedConnections, at least replicaCount + 1 + 3 (render-enforced):
+           a value of its own, like pgpool.reservedConnections below and for the same reason
+           (#373) -- the setting needs a PostgreSQL restart, and deriving it from
+           postgresql.replicaCount rolled every database pod, the primary included, on every
+           scale step. Standalone has no agent: PostgreSQL's own 3.
          - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
            i.e. pgpool's check role: pgpool.reservedConnections, at least 2 per pgpool
            replica (a health check and a streaming check; 3 with pgpool.metrics, whose
@@ -1163,7 +1167,16 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        source of truth and the sizing cannot silently drift from the topology. */ -}}
 {{- define "pg.superuserReservedConnections" -}}
 {{- if .Values.ha.enabled -}}
-{{- add .Values.postgresql.replicaCount 1 3 -}}
+{{- $want := add .Values.postgresql.replicaCount 1 3 -}}
+{{- $raw := .Values.ha.superuserReservedConnections -}}
+{{- if or (eq (kindOf $raw) "invalid") (eq (kindOf $raw) "string") (ne (toString (int $raw)) (toString $raw)) -}}
+{{- fail (printf "ha.superuserReservedConnections must be an integer (got %v): it sets superuser_reserved_connections on every PostgreSQL node, at least postgresql.replicaCount + 1 + 3 = %d here" $raw $want) -}}
+{{- end -}}
+{{- $have := int $raw -}}
+{{- if lt $have $want -}}
+{{- fail (printf "ha.superuserReservedConnections is %d, but postgresql.replicaCount=%d means %d nodes, each agent holding one session to every node: needs at least %d (one per node plus 3). Raise ha.superuserReservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own (#373)." $have (int .Values.postgresql.replicaCount) (add .Values.postgresql.replicaCount 1) $want) -}}
+{{- end -}}
+{{- $have -}}
 {{- else -}}
 3
 {{- end -}}
@@ -1204,7 +1217,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $_ := (.Values.postgresql.configuration | default dict) -}}
 {{- $lk := lower ($k | toString) -}}
 {{- if or (eq $lk "superuser_reserved_connections") (eq $lk "reserved_connections") -}}
-{{- fail (printf "postgresql.configuration.%s is set, but the chart owns the connection reserves: superuser_reserved_connections is sized from the node count (one slot per agent session, plus headroom) and reserved_connections from pgpool.reservedConnections (pgpool's check role). Remove the key; raise max_connections if the application pool is too small." $k) -}}
+{{- fail (printf "postgresql.configuration.%s is set, but the chart owns the connection reserves: superuser_reserved_connections comes from ha.superuserReservedConnections (at least one slot per agent session plus headroom, render-enforced) and reserved_connections from pgpool.reservedConnections (pgpool's check role). Remove the key; raise max_connections if the application pool is too small." $k) -}}
 {{- end -}}
 {{- end -}}
 {{- /* Only when declared: postgresql.majorVersion is otherwise required just for extension
@@ -1217,7 +1230,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- $res := atoi (include "pg.reservedConnections" .) -}}
 {{- $max := atoi (include "pg.maxConnections" .) -}}
 {{- if ge (add $su $res) $max -}}
-{{- fail (printf "max_connections is %d, but the chart reserves %d superuser slots (superuser_reserved_connections: one per node plus 3) and %d for pgpool's checks (reserved_connections: pgpool.reservedConnections), leaving no slot for applications. Raise postgresql.configuration.max_connections above %d." $max $su $res (add $su $res)) -}}
+{{- fail (printf "max_connections is %d, but the chart reserves %d superuser slots (superuser_reserved_connections: ha.superuserReservedConnections, at least one per node plus 3) and %d for pgpool's checks (reserved_connections: pgpool.reservedConnections), leaving no slot for applications. Raise postgresql.configuration.max_connections above %d." $max $su $res (add $su $res)) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1288,7 +1301,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        catch. */ -}}
 {{- $chartEnv := list
       "PGDATA" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB"
-      "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "REPMGR_NODE_COUNT" "HEADLESS_SERVICE"
+      "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "HEADLESS_SERVICE"
       "NAMESPACE" "PRIMARY_MARKER" "POD_NAME" "POD_SELECTOR" "POD_CIDR" "MASTER_SERVICE"
       "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
       "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
@@ -2012,6 +2025,27 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
 {{- if semverCompare "< 2.1.0" $ver -}}
 {{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart %s ships it), or set maximumLagOnFailover to 0." $lag $tag .Chart.Version) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "pg.validateAgentImageFloor" -}}
+{{- /* Chart 2.6.0 stopped rendering REPMGR_NODE_COUNT into the postgresql container and
+       grants the agent `get` on its own StatefulSet instead (#373): the agent reads
+       spec.replicas each tick, so scaling the database rolls nothing. An agent older than
+       image 2.4.0 REQUIRES that env at boot -- config.Load lists it as missing and exits --
+       so pairing this chart with an older chart-scheme tag is a crash-loop of every
+       PostgreSQL pod at once, over a values file helm accepted. Refuse it here instead.
+       Same shape as pg.validateLagGateImage: only a tag of the chart's own scheme
+       (<semver>-pg<major>) is checked, a custom tag being the operator's statement that they
+       know what the image runs; agent-mode only, since standalone runs no agent. */ -}}
+{{- if eq (include "pg.agentMode" .) "true" -}}
+{{- $tag := .Values.ha.image.tag | toString -}}
+{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-pg[0-9]+$" $tag -}}
+{{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
+{{- if semverCompare "< 2.4.0" $ver -}}
+{{- fail (printf "ha.image.tag is %q, but chart %s needs the pg-ha image at 2.4.0 or later: this chart no longer sets REPMGR_NODE_COUNT (the agent reads its StatefulSet's spec.replicas instead, so scaling rolls no pod, #373), and an older agent refuses to boot without it -- every PostgreSQL pod would crash-loop at once. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.4.0-pg<major> or later, or stay on a chart before 2.6.0 for that image." $tag .Chart.Version) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

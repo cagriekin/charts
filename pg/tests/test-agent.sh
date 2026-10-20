@@ -110,7 +110,7 @@ for pod in "${POD0}" "${POD1}"; do
   done
   assert_eq "#371: ${pod} has no write connection open in steady state (3 samples)" "0" "${writes_seen}"
   su=$(pg_exec "${NAMESPACE}" "${pod}" "SHOW superuser_reserved_connections" "repmgr" "repmgr" 2>/dev/null | xargs || echo "")
-  assert_eq "#371: ${pod} reserves one superuser slot per node + 3" "5" "${su}"
+  assert_eq "#371/#373: ${pod} runs with ha.superuserReservedConnections (8) live" "8" "${su}"
 done
 
 REPL_VALUE="replicated-$(date +%s)"
