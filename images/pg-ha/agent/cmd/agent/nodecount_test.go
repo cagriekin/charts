@@ -116,7 +116,8 @@ func TestRefreshNodeCountKeepsTheLastCountOnScaleToZero(t *testing.T) {
 	a := nodeCountAgent(t, sts(3))
 	a.refreshNodeCount(context.Background())
 	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(sts(0)), "ns")
-	if !a.refreshNodeCount(context.Background()) || a.expectedNodes() != 3 {
-		t.Fatalf("after spec.replicas=0: known=%v expectedNodes=%d, want true and the last read 3", a.refreshNodeCount(context.Background()), a.expectedNodes())
+	known := a.refreshNodeCount(context.Background())
+	if !known || a.expectedNodes() != 3 {
+		t.Fatalf("after spec.replicas=0: known=%v expectedNodes=%d, want true and the last read 3", known, a.expectedNodes())
 	}
 }

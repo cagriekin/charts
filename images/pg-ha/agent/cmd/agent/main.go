@@ -259,7 +259,8 @@ type agent struct {
 	// converging on, so it is right on the tick after the scale, on every node at once.
 	nodeCount int
 	// nodeCountWarned latches the "cannot read the StatefulSet" warning so a denied or
-	// unreachable Get is logged once per episode, not every tick.
+	// unreachable Get is logged once per episode, not every tick -- while a fallback count
+	// exists. With none the tick is skipped outright, and that is warned every tick.
 	nodeCountWarned bool
 
 	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
@@ -1060,39 +1061,51 @@ func markerTamperSuspected(o reconcile.Observation) (bool, string) {
 // before any read has succeeded, the env fallback -- and the warning is logged once per
 // episode: a StatefulSet that cannot be read is a cluster running an older chart's RBAC,
 // and that is a one-line "upgrade the chart" message, not a log line every five seconds.
+// The exception is no fallback at all: then the agent is not degraded but STOPPED (tick()
+// returns before observe), and that is warned every tick, because nothing else shows it.
 func (a *agent) refreshNodeCount(ctx context.Context) bool {
 	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget()/2)
 	defer cancel()
 	n, err := a.kube.StatefulSetReplicas(rctx, a.base)
-	if err != nil {
-		if !a.nodeCountWarned {
-			fallback := a.expectedNodes()
-			msg := "cannot read the StatefulSet's spec.replicas; using the last known node count (the REPMGR_NODE_COUNT env until the first read succeeds). Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)"
-			if fallback == 0 {
-				msg = "cannot read the StatefulSet's spec.replicas and no REPMGR_NODE_COUNT env is set: the node count is unknown, so the reconcile tick is skipped until a read succeeds. Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)"
-			}
-			a.log.Warn(msg, "statefulset", a.base, "fallback", fallback, "err", err)
+	switch {
+	case err != nil:
+		fallback := a.expectedNodes()
+		if fallback == 0 {
+			// Not latched: with no count from any source the agent does nothing at all
+			// (tick() returns before observe), while /healthz -- struck above it -- stays
+			// green and the lease is still contested by dcs.Run. A stalled agent that
+			// said so once, minutes ago, is invisible; one line per tick is the only
+			// evidence an operator gets (#373 review).
+			a.log.Warn("cannot read the StatefulSet's spec.replicas and no REPMGR_NODE_COUNT env is set: the node count is unknown, so the reconcile tick is skipped until a read succeeds. Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)", "statefulset", a.base, "err", err)
+			a.nodeCountWarned = true
+		} else if !a.nodeCountWarned {
+			a.log.Warn("cannot read the StatefulSet's spec.replicas; using the last known node count (the REPMGR_NODE_COUNT env until the first read succeeds). Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)", "statefulset", a.base, "fallback", fallback, "err", err)
 			a.nodeCountWarned = true
 		}
-		return a.expectedNodes() > 0
-	}
-	if a.nodeCountWarned {
-		a.log.Info("StatefulSet readable again; node count follows spec.replicas", "statefulset", a.base, "nodeCount", n)
-		a.nodeCountWarned = false
-	}
-	if n <= 0 {
+	case n <= 0:
 		// spec.replicas: 0 is a valid StatefulSet (an operator's scale-to-zero for
 		// maintenance), but zero is this field's "unknown" and every pod of such a
 		// StatefulSet is on its way out anyway. Keep the last known count rather than
 		// forgetting it: the consumers keep probing peers that are being deleted, which is
 		// harmless, and the scale back up logs its from/to like any other change.
-		return a.expectedNodes() > 0
+		a.clearNodeCountWarning(n)
+	default:
+		a.clearNodeCountWarning(n)
+		if n != a.nodeCount && a.nodeCount != 0 {
+			a.log.Info("node count changed with spec.replicas; peers and slots follow it on this tick, no pod rolled", "from", a.nodeCount, "to", n)
+		}
+		a.nodeCount = n
 	}
-	if n != a.nodeCount && a.nodeCount != 0 {
-		a.log.Info("node count changed with spec.replicas; peers and slots follow it on this tick, no pod rolled", "from", a.nodeCount, "to", n)
-	}
-	a.nodeCount = n
 	return a.expectedNodes() > 0
+}
+
+// clearNodeCountWarning closes a "cannot read the StatefulSet" episode after a successful
+// read, logging the recovery once.
+func (a *agent) clearNodeCountWarning(n int) {
+	if a.nodeCountWarned {
+		a.log.Info("StatefulSet readable again; node count follows spec.replicas", "statefulset", a.base, "nodeCount", n)
+		a.nodeCountWarned = false
+	}
 }
 
 // expectedNodes is how many pods the StatefulSet should have: the live spec.replicas when

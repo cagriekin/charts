@@ -518,7 +518,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.2.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.4.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -581,7 +581,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 ha:
   image:
-    tag: 2.0.0-pg17
+    tag: 2.4.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
 # `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
@@ -592,7 +592,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.0.0-pg17
+      tag: 2.4.0-pg17
 ```
 
 The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
@@ -2909,7 +2909,7 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
-| 2.0.0 *(current)* | `cagriekin/pg-ha:2.0.0-pg18` / `:2.0.0-pg17` | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 2.6.0 *(current)* | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |
 | 1.11.0 – 1.13.0 | `trixie-5.5.0-31` | 18.x (default) or 17.x | as above |
