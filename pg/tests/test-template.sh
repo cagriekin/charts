@@ -2216,7 +2216,7 @@ pgpool_375_colon=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=tru
 assert_contains "#375: a ':' in pgpool.admin.username fails the render naming the knob" "${pgpool_375_colon}" "pgpool.admin.username"
 # The schema pattern speaks first (helm validates values before rendering); the template
 # guard is the second layer for a chart consumer that skips schema validation.
-assert_contains "#375: ... from the schema" "${pgpool_375_colon}" "does not match pattern"
+assert_contains "#375: ... from the schema (Helm 3.14 and Helm 4 wordings)" "${pgpool_375_colon}" "[Dd]oes not match pattern"
 pgpool_375_byo_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.admin.existingSecret.enabled=true --set pgpool.admin.existingSecret.name=x >/dev/null 2>&1 || pgpool_375_byo_rc=$?
 assert_eq "#375: an existing admin Secret renders; its username is checked by the init container at boot" "0" "${pgpool_375_byo_rc}"
 pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
