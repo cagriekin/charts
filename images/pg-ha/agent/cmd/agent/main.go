@@ -799,8 +799,9 @@ func (a *agent) tick(ctx context.Context) {
 		// is "single node": PeersPending cannot arm (no peer is unreachable), `newer` is
 		// nil, and a lease-holding cold boot with primary-state data would StartLocal
 		// read-write past the #125/#171 check, while the primary would pre-create no
-		// slots. A StatefulSet always has at least one replica, so an unknown count is the
-		// only way to reach zero; skip the tick and try again next interval (#373).
+		// slots. A read of spec.replicas: 0 keeps the last known count (see
+		// refreshNodeCount), so an unknown count is the only way to reach zero; skip the
+		// tick and try again next interval (#373).
 		return
 	}
 	// Sampled BEFORE observe() so deriveServingRW can tell whether a demote completed while
@@ -1047,15 +1048,20 @@ func markerTamperSuspected(o reconcile.Observation) (bool, string) {
 // and reports whether a node count is known from ANY source afterwards: this read, an
 // earlier one, or the REPMGR_NODE_COUNT env. False means the tick has nothing to go on.
 //
-// Bounded by the fence budget like every other apiserver call on the reconcile goroutine
-// (#288 review): tick()'s context has no deadline, and a blackholed Get would otherwise
-// stall the loop until the kubelet killed the container over a stale /healthz. On failure
-// the last value stands -- or, before any read has succeeded, the env fallback -- and the
-// warning is logged once per episode: a StatefulSet that cannot be read is a cluster
-// running an older chart's RBAC, and that is a one-line "upgrade the chart" message, not a
-// log line every five seconds.
+// Bounded like every other apiserver call on the reconcile goroutine (#288 review):
+// tick()'s context has no deadline, and a blackholed Get would otherwise stall the loop
+// until the kubelet killed the container over a stale /healthz. HALF the fence budget, not
+// a whole one: this Get sits ahead of observe()'s gossip and marker reads, each of which
+// already spends a full budget against a blackholed apiserver, and three full budgets add
+// up to 3x the reconcile interval -- the /healthz staleness threshold -- which would have
+// the kubelet kill the serving primary precisely while the apiserver is unreachable (#298).
+// A single-object GET does not need the whole budget; the sub-budget keeps the lease
+// holder's worst-case tick under the threshold. On failure the last value stands -- or,
+// before any read has succeeded, the env fallback -- and the warning is logged once per
+// episode: a StatefulSet that cannot be read is a cluster running an older chart's RBAC,
+// and that is a one-line "upgrade the chart" message, not a log line every five seconds.
 func (a *agent) refreshNodeCount(ctx context.Context) bool {
-	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget()/2)
 	defer cancel()
 	n, err := a.kube.StatefulSetReplicas(rctx, a.base)
 	if err != nil {
@@ -1073,6 +1079,14 @@ func (a *agent) refreshNodeCount(ctx context.Context) bool {
 	if a.nodeCountWarned {
 		a.log.Info("StatefulSet readable again; node count follows spec.replicas", "statefulset", a.base, "nodeCount", n)
 		a.nodeCountWarned = false
+	}
+	if n <= 0 {
+		// spec.replicas: 0 is a valid StatefulSet (an operator's scale-to-zero for
+		// maintenance), but zero is this field's "unknown" and every pod of such a
+		// StatefulSet is on its way out anyway. Keep the last known count rather than
+		// forgetting it: the consumers keep probing peers that are being deleted, which is
+		// harmless, and the scale back up logs its from/to like any other change.
+		return a.expectedNodes() > 0
 	}
 	if n != a.nodeCount && a.nodeCount != 0 {
 		a.log.Info("node count changed with spec.replicas; peers and slots follow it on this tick, no pod rolled", "from", a.nodeCount, "to", n)

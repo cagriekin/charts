@@ -108,3 +108,15 @@ func TestRefreshNodeCountReportsWhetherACountIsKnown(t *testing.T) {
 		t.Fatalf("a failed re-read keeps the last count known; expectedNodes=%d", a.expectedNodes())
 	}
 }
+
+// spec.replicas: 0 (a scale-to-zero) is a valid StatefulSet but zero is this field's
+// "unknown": the last known count is kept rather than forgotten, so the ticks keep running
+// through the pods' own termination and the scale back up logs as a change.
+func TestRefreshNodeCountKeepsTheLastCountOnScaleToZero(t *testing.T) {
+	a := nodeCountAgent(t, sts(3))
+	a.refreshNodeCount(context.Background())
+	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(sts(0)), "ns")
+	if !a.refreshNodeCount(context.Background()) || a.expectedNodes() != 3 {
+		t.Fatalf("after spec.replicas=0: known=%v expectedNodes=%d, want true and the last read 3", a.refreshNodeCount(context.Background()), a.expectedNodes())
+	}
+}
