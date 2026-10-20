@@ -2058,6 +2058,65 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
+{{- define "pg.validatePgpoolAdminUsername" -}}
+{{- /* pcp.conf is `user:md5(password)` and pgpool splits each line at the FIRST ':', so a PCP
+       admin username containing ':' can never authenticate -- and since #365 the probes
+       authenticate over PCP, so that username restarted pgpool in a loop on every replica
+       (#375). A newline cannot be carried by the line-based pcp.conf/.pcppass either. Only
+       the chart-managed Secret is visible at render time; an existing Secret gets the same
+       refusal from the init container at boot. */ -}}
+{{- if and .Values.pgpool.enabled (not ((.Values.pgpool.admin).existingSecret).enabled) -}}
+{{- $u := (.Values.pgpool.admin).username | default "" | toString -}}
+{{- if or (contains ":" $u) (contains "\n" $u) -}}
+{{- fail (printf "pgpool.admin.username=%q contains ':' or a newline, which pgpool's pcp.conf (user:md5 per line, split at the first ':') cannot carry: no PCP client could ever authenticate as it, and the pgpool probes authenticate over PCP (#375). Choose a PCP admin username without ':' or newlines." $u) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.pgpoolPcpPrelude -- the shell the pgpool container's three PCP callers share: the re-attach
+loop and the liveness and readiness probes (#375). One copy so they cannot disagree on how the
+PCP credentials are read or on what an authentication fault looks like.
+
+  PCP_USER comes from its own file, written by the init container, not from parsing pcp.conf:
+  `cut -d: -f1 pcp.conf` truncated a username at its first ':' (the init container now refuses
+  such a username outright, because pgpool splits pcp.conf there too).
+
+  pcp_info runs the one PCP call that lists every backend and classifies the outcome, because a
+  probe must tell "pgpool is not answering" (restart it) from "pgpool answered and refused my
+  credentials" (a restart cannot mint credentials; before #365 that fault only stalled the
+  re-attach loop, and the probes must stay that harmless). The wording is stable: a credential
+  fault prints the server's `FATAL:  authentication failed for user "..."` (the client's own
+  fallback is `ERROR: authentication failed`), while nothing answering prints `ERROR:
+  connection to host ... failed` -- both checked against the pinned image, the first live.
+
+  pcp_auth_note logs a credential episode ONCE, to the container log: pgpool is PID 1 after the
+  exec, so /proc/1/fd/2 is `kubectl logs -c pgpool`, whereas a probe's own output is kept by the
+  kubelet only while the probe FAILS -- and a fail-open probe never does. The marker file lives in
+  the emptyDir beside .pcppass and is shared by both probes, so the two together log one line per
+  episode and one on recovery.
+*/ -}}
+{{- define "pg.pgpoolPcpPrelude" -}}
+PCPPASSFILE=/usr/local/etc/.pcppass; export PCPPASSFILE
+PCP_USER=$(cat /usr/local/etc/pcp_user)
+pcp_info() {
+  if info=$(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then return 0; fi
+  case "$info" in *"authentication failed"*) return 2;; esac
+  return 1
+}
+pcp_auth_note() {
+  m=/usr/local/etc/.pcp-auth-failed
+  if [ "$1" = fail ]; then
+    [ -e "$m" ] && return 0
+    : > "$m"
+    echo "[probe] PCP authentication failed (pcp.conf and .pcppass disagree, or pgpool loaded a different pcp.conf): the probes cannot see pgpool's state and pass fail-open until this clears. Fix pgpool.admin / the admin Secret and roll the Deployment (#375): $info" >/proc/1/fd/2
+  elif [ -e "$m" ]; then
+    rm -f "$m"
+    echo "[probe] PCP authentication works again" >/proc/1/fd/2
+  fi
+}
+{{- end -}}
+
 {{- define "pg.validatePgpoolReattach" -}}
 {{- /* The re-attach loop (#361) is part of the chart's default pgpool command, so a custom
        pgpool.command silently drops the only thing that re-attaches a detached read backend

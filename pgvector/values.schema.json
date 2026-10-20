@@ -492,6 +492,23 @@
             }
           }
         },
+        "admin": {
+          "type": "object",
+          "description": "PCP (pgpool admin) credentials. The username may not contain ':' -- pcp.conf is user:md5 per line, split at the first ':', so no PCP client could ever authenticate as such a user, and the probes authenticate over PCP (#375). An existing Secret is held to the same rule by the init container at boot.",
+          "properties": {
+            "username": { "type": "string", "pattern": "^[^:]*$" },
+            "password": { "type": "string" },
+            "existingSecret": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "name": { "type": "string" },
+                "usernameKey": { "type": "string" },
+                "passwordKey": { "type": "string" }
+              }
+            }
+          }
+        },
         "reattach": {
           "type": "object",
           "properties": {

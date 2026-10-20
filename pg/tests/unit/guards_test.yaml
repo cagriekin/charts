@@ -89,6 +89,27 @@ tests:
       - failedTemplate:
           errorPattern: 'is a 1\.x image tag .*chart 2\.0\.0 cannot run it'
 
+  # #375: pcp.conf is user:md5 split at the first ':', so a PCP admin user containing one can
+  # never authenticate -- and since the probes authenticate over PCP it restarted pgpool in a
+  # loop. Refused by the schema pattern and by pg.validatePgpoolAdminUsername (either wording).
+  - it: a ':' in pgpool.admin.username fails fast (#375)
+    set:
+      pgpool.enabled: true
+      pgpool.admin.username: "ops:admin"
+    asserts:
+      - failedTemplate:
+          errorPattern: "(does not match pattern|contains ':' or a newline)"
+  - it: an existing admin Secret renders; its username is checked by the init container at boot (#375)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.admin.existingSecret.enabled: true
+      pgpool.admin.existingSecret.name: my-pcp
+    asserts:
+      - notFailedTemplate: {}
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: 'case "\$PCP_USER" in \*:\*\|\*"\$nl"\*\)'
   - it: pgpool.autoFailback is rejected
     templates:
       - templates/statefulset.yaml

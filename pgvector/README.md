@@ -331,7 +331,7 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 | `pgpool.resetQueryList` | Queries to run when returning connection to pool | `ABORT; RESET ALL; DEALLOCATE ALL` |
 | `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
 | `pgpool.allowClearTextFrontendAuth` | Allow clear-text password authentication from clients | `false` |
-| `pgpool.admin.username` | PGPool-II admin (PCP) user, stored in the chart-managed Secret | `admin` |
+| `pgpool.admin.username` | PGPool-II admin (PCP) user, stored in the chart-managed Secret. May not contain `:` (`pcp.conf` is `user:md5` per line, split at the first `:`); refused at render time, and at boot for an existing Secret (#375) | `admin` |
 | `pgpool.admin.password` | PGPool-II admin (PCP) password, stored in the chart-managed Secret | `admin` |
 | `pgpool.admin.existingSecret.enabled` | Use an existing Secret for the admin credentials instead of the chart-managed one | `false` |
 | `pgpool.admin.existingSecret.name` | Name of the existing Secret (required when enabled) | `""` |

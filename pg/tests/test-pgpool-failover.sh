@@ -165,5 +165,65 @@ assert_eq "#361: the re-attach loop re-attaches the RO backend once the Service 
 assert_contains "#361: ... and says so in the pgpool log" "$(kubectl logs -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool --since=10m 2>/dev/null | grep -m1 '\[reattach\]' || true)" "re-attaching"
 assert_eq "#361: no restart across the whole episode" "${restarts_before}" "$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].restartCount}')"
 
+# --- #32 revisited: the failover above must not have flipped pgpool's readiness either ---
+assert_eq "#374: pgpool is Ready after the failover (the 60s readiness window outlasts a normal failover)" "true" "$(kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].ready}')"
+
+pgpool_ready() { kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].ready}' 2>/dev/null || echo ""; }
+pgpool_restarts() { kubectl get pod -n "${NAMESPACE}" "${PGPOOL_POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="pgpool")].restartCount}' 2>/dev/null || echo ""; }
+pgpool_log_count() { kubectl logs -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool 2>/dev/null | grep -cF -- "$1" || true; }
+
+# --- #375: a PCP authentication fault must not restart pgpool, and must be logged once ---
+# Since 2.5.0 the probes authenticate over PCP; a fault there (a ':' in the admin username,
+# any pcp.conf/.pcppass drift) failed liveness every 10s and restarted every replica in a loop.
+# Reproduce the drift in place: overwrite .pcppass (the emptyDir is writable) with a wrong
+# password, then outwait the liveness window (6 x 10s) with margin. pgpool must keep serving,
+# stay Ready, not restart, and say so exactly once in its own log; restoring the password must
+# be acknowledged once too.
+echo "  #375: breaking PCP authentication in place (wrong password in .pcppass)..."
+restarts_375=$(pgpool_restarts)
+# Deltas, not totals: a rerun into a surviving pod (helm upgrade --install changes nothing)
+# keeps the previous episode's lines in the same container log.
+fault_lines_before=$(pgpool_log_count '[probe] PCP authentication failed')
+recovery_lines_before=$(pgpool_log_count '[probe] PCP authentication works again')
+kubectl exec -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool -- sh -c 'cp /usr/local/etc/.pcppass /usr/local/etc/.pcppass.good && printf "127.0.0.1:9898:%s:wrong\n" "$(cat /usr/local/etc/pcp_user)" > /usr/local/etc/.pcppass'
+sleep 90
+assert_eq "#375: pgpool is not restarted over a PCP authentication fault" "${restarts_375}" "$(pgpool_restarts)"
+assert_eq "#375: ... and stays Ready" "true" "$(pgpool_ready)"
+W375="pcp-auth-broken-$(date +%s)"
+w375=$(via_pgpool "${STANDBY}" "INSERT INTO pp_fo (v) VALUES ('${W375}'); SELECT v FROM pp_fo WHERE v='${W375}'" || true)
+assert_contains "#375: ... and keeps serving writes" "${w375}" "${W375}"
+assert_eq "#375: the fault is logged once in the pgpool container log" "$((fault_lines_before + 1))" "$(pgpool_log_count '[probe] PCP authentication failed')"
+echo "  #375: restoring .pcppass..."
+kubectl exec -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool -- sh -c 'mv /usr/local/etc/.pcppass.good /usr/local/etc/.pcppass'
+sleep 25
+assert_eq "#375: the recovery is logged once" "$((recovery_lines_before + 1))" "$(pgpool_log_count '[probe] PCP authentication works again')"
+assert_eq "#375: still no restart" "${restarts_375}" "$(pgpool_restarts)"
+
+# --- #374: an unreachable primary must make pgpool unready (readiness, not liveness) ---
+# pgpool's own view of backend 0 can never say down (ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER), so
+# readiness asks the backend itself with pg_isready. Make the RW Service unroutable without
+# touching the pod: the agent re-asserts only the statefulset.kubernetes.io/pod-name key of the
+# selector each tick, so an EXTRA key it never writes survives it and empties the endpoints.
+echo "  #374: emptying the RW Service (extra selector key the agent does not own)..."
+kubectl patch svc "${FULLNAME}" -n "${NAMESPACE}" --type merge -p '{"spec":{"selector":{"pg-role":"no-such-role"}}}' >/dev/null
+unready=false; s=0
+while [[ ${s} -lt 150 ]]; do
+  if [[ "$(pgpool_ready)" == "false" ]]; then unready=true; echo "  pgpool unready after ${s}s"; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#374: pgpool leaves Ready once the primary stops answering" "true" "${unready}"
+assert_eq "#374: ... without a restart (readiness, not liveness)" "${restarts_375}" "$(pgpool_restarts)"
+pgpool_eps=$(kubectl get endpointslices -n "${NAMESPACE}" -l "kubernetes.io/service-name=${FULLNAME}-pgpool" -o jsonpath='{range .items[*].endpoints[*]}{.conditions.ready}{" "}{end}' 2>/dev/null || true)
+assert_not_contains "#374: ... and the pgpool Service has no ready endpoint" "${pgpool_eps}" "true"
+echo "  #374: restoring the RW Service selector..."
+kubectl patch svc "${FULLNAME}" -n "${NAMESPACE}" --type merge -p '{"spec":{"selector":{"pg-role":null}}}' >/dev/null
+ready_again=false; s=0
+while [[ ${s} -lt 120 ]]; do
+  if [[ "$(pgpool_ready)" == "true" ]]; then ready_again=true; echo "  pgpool Ready again after ${s}s"; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#374: pgpool is Ready again once the primary answers" "true" "${ready_again}"
+assert_eq "#374: no restart across the whole episode" "${restarts_375}" "$(pgpool_restarts)"
+
 end_suite
 print_summary

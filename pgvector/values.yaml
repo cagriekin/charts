@@ -731,6 +731,9 @@ pgpool:
   # Re-attaches a detached backend once pg_isready answers again (#361) -- a manual
   # pcp_detach_node included; disable this for pgpool-level manual control. Part of the
   # default pgpool command; pgpool.command with this enabled fails the render.
+  # The probes share its PCP credentials: readiness is PCP + backend 0 answering pg_isready
+  # + a free child (#374), liveness is PCP + one backend not down; a PCP authentication
+  # fault is fail-open and logged once as `[probe]` (#375). See the pg chart values.
   reattach:
     enabled: true
     interval: 10
@@ -775,6 +778,9 @@ pgpool:
 
   # PCP (pgpool admin) credentials. Rendered into a chart-managed Secret
   # unless existingSecret.enabled selects a pre-created Secret instead.
+  # The username may not contain ':' (#375): pcp.conf is `user:md5` per line, split at the
+  # first ':', so such a user can never authenticate; refused at render time (and at boot
+  # for an existing Secret).
   admin:
     username: admin
     password: admin
