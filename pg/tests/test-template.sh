@@ -1926,7 +1926,7 @@ assert_not_contains "#370: the 300-iteration counter is gone" "${standalone_hook
 assert_contains_literal "#370: the wall clock ends the wait, not an iteration count" "${standalone_hook}" 'if [ "$SECONDS" -ge "$hook_budget" ]; then'
 assert_contains "#370: progress names crash recovery (pg_isready=1)" "${standalone_hook}" "starting up or in crash recovery"
 assert_contains "#370: progress names not-listening (pg_isready=2)" "${standalone_hook}" "nothing listening on 127.0.0.1"
-assert_contains "#370: the interrupted-first-boot signature is named (accepting, database missing)" "${standalone_hook}" "refuses a session (not created yet?)"
+assert_contains "#370: the accepting-but-no-session state names both causes (interrupted first boot, local pg_hba rule)" "${standalone_hook}" "database not created yet -- an interrupted first boot -- or a local pg_hba rule rejects it"
 assert_contains "#370: the failure names the knob to raise" "${standalone_hook}" "Raise postgresql.startupProbe.failureThreshold"
 assert_contains_literal "#370: the success line names the wait and what was applied" "${standalone_hook}" 'real server up on 127.0.0.1 after ${waited}s; applied: $applied'
 assert_contains "#370: messages reach the container log through PID 1's stderr" "${standalone_hook}" "/proc/1/fd/2"
@@ -1939,6 +1939,9 @@ assert_contains "#370: the budget never drops under 300s (a first boot must be a
 sa_nosp=$(helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set postgresql.startupProbe.enabled=false --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#370: no startup probe -> the default 1800s budget" "${sa_nosp}" "hook_budget=1800"
 assert_not_contains "#370: ... with no startup probe rendered in that case" "${sa_nosp}" "startupProbe:"
+assert_contains "#370: with the probe disabled the failure names the real remedy, not a knob that is not consulted" "${sa_nosp}" "Enable postgresql.startupProbe and raise its failureThreshold"
+assert_not_contains "#370: ... and the enabled-probe hint is not shown" "${sa_nosp}" "were not applied. Raise postgresql.startupProbe.failureThreshold"
+assert_contains_literal "#370: the reload reply is read without a psqlrc in the way" "${standalone_hook}" 'reload=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" --no-psqlrc -q -tAc "SELECT pg_reload_conf()"'
 assert_contains "#370: the agent-mode hook keeps its own best-effort wait" "${repmgr_no_addcmd_poststart:-empty}" "for i in {1..90}; do"
 assert_not_contains "#370: the agent-mode hook carries no standalone budget" "${repmgr_no_addcmd_poststart:-empty}" "hook_budget"
 
