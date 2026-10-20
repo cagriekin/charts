@@ -86,7 +86,7 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 		"leaseDuration=15s",
 		"renewDeadline=10s",
 		"retryPeriod=2s",
-		"nodeCount=3",
+		"nodeCountFallback=3",
 		"headlessService=pg-headless",
 		"masterService=pg",
 		"markerName=pg-primary",

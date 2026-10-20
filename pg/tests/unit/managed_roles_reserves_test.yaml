@@ -2,15 +2,59 @@ suite: connection reserves and chart-managed roles
 release:
   name: test-pg
 tests:
-  # --- reserved-connections.conf: sized from the topology, always rendered ---
-  - it: HA without pgpool reserves one superuser slot per node plus 3, none for pgpool
+  # --- reserved-connections.conf: always rendered; the superuser reserve is its own value
+  # (ha.superuserReservedConnections, #373) validated against the topology, not derived from it,
+  # so a scale within it changes nothing in the ConfigMap and rolls no pod ---
+  - it: HA without pgpool renders ha.superuserReservedConnections, none for pgpool
     template: templates/postgresql-configmap.yaml
     set:
       postgresql.replicaCount: 2
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
-          pattern: 'superuser_reserved_connections = 6\n\s*reserved_connections = 0'
+          pattern: 'superuser_reserved_connections = 8\n\s*reserved_connections = 0'
+  - it: the superuser reserve covers replicaCount 4 at the default (#373)
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.replicaCount: 4
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 8\n'
+  - it: a replicaCount the superuser reserve cannot cover is refused, naming the knob (#373)
+    template: templates/statefulset.yaml
+    set:
+      postgresql.replicaCount: 5
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ha\.superuserReservedConnections is 8, but postgresql\.replicaCount=5 means 6 nodes.*needs at least 9'
+  - it: a raised superuser reserve renders for a large cluster (#373)
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.replicaCount: 5
+      ha.superuserReservedConnections: 12
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 12\n'
+  - it: the superuser reserve is honoured under the deprecated repmgr alias (#373)
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.replicaCount: 5
+      repmgr.superuserReservedConnections: 12
+    asserts:
+      - matchRegex:
+          path: data["reserved-connections.conf"]
+          pattern: 'superuser_reserved_connections = 12\n'
+  # The schema refuses a non-integer first (both Helm wordings); the helper's own guard is the
+  # backstop for a render that bypasses the schema.
+  - it: a non-integer superuser reserve is refused (#373)
+    template: templates/statefulset.yaml
+    set:
+      ha.superuserReservedConnections: eight
+    asserts:
+      - failedTemplate:
+          errorPattern: "(got string, want integer|Invalid type\\. Expected: integer|ha\\.superuserReservedConnections must be an integer)"
 
   - it: HA with pgpool reserves pgpool.reservedConnections for the check role
     template: templates/postgresql-configmap.yaml
@@ -20,7 +64,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
-          pattern: 'superuser_reserved_connections = 5\n\s*reserved_connections = 7'
+          pattern: 'superuser_reserved_connections = 8\n\s*reserved_connections = 7'
 
   - it: pgpool replicas beyond what reservedConnections covers are refused
     template: templates/statefulset.yaml
@@ -111,16 +155,16 @@ tests:
   - it: a max_connections the reserves would exhaust is refused
     template: templates/statefulset.yaml
     set:
-      postgresql.configuration.max_connections: "12"
+      postgresql.configuration.max_connections: "15"
       pgpool.enabled: true
     asserts:
       - failedTemplate:
-          errorPattern: 'max_connections is 12, but the chart reserves 5 superuser slots .* and 7 for pgpool''s checks'
+          errorPattern: 'max_connections is 15, but the chart reserves 8 superuser slots .* and 7 for pgpool''s checks'
 
   - it: a max_connections just above the reserves renders
     template: templates/statefulset.yaml
     set:
-      postgresql.configuration.max_connections: "13"
+      postgresql.configuration.max_connections: "16"
       pgpool.enabled: true
     asserts:
       - notFailedTemplate: {}

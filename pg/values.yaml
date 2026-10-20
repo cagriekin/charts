@@ -546,7 +546,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.3.0-pg18
+    tag: 2.4.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -904,6 +904,18 @@ ha:
       memory: 1Gi
 
   terminationGracePeriodSeconds: 120
+
+  # superuser_reserved_connections on every PostgreSQL node (HA only; standalone keeps
+  # PostgreSQL's 3). Every agent holds one read session to every node, so a node needs one
+  # slot per node, plus 3 for reconnect overlap, the agent's short-lived write connection,
+  # the chart's superuser tooling (backups, hook Jobs) and an operator's psql: at least
+  # postgresql.replicaCount + 1 + 3 (render-enforced). A value of its own rather than derived
+  # from replicaCount, like pgpool.reservedConnections and for the same reason (#373): the
+  # setting needs a PostgreSQL restart, so a derived value rolled every database pod -- the
+  # primary included -- on every scale step. 8 covers up to replicaCount 4 (5 nodes); scaling
+  # within it rolls nothing, scaling past it fails the render until this is raised. It takes
+  # slots from applications: at the default max_connections of 100, 8 + pgpool's 7 leave 85.
+  superuserReservedConnections: 8
 
 
 pgpool:
@@ -1647,4 +1659,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.3.0-pg18
+      tag: 2.4.0-pg18

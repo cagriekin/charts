@@ -72,8 +72,8 @@ func (c *Client) PublishStatus(ctx context.Context, podName string, st NodeStatu
 // mid-restart, still starting, or has never published gossip is absent from that map but
 // very much present in the cluster -- and treating it as gone is how a replication slot
 // that is still needed gets reclaimed (#289). The live pod list is also the only source
-// that stays correct during a scale-up rollout, when REPMGR_NODE_COUNT is baked into each
-// pod's env at render time and is therefore STALE on every pod that has not rolled yet.
+// that answers "what exists": the expected count (StatefulSetReplicas, #373) says what the
+// controller is converging on, and the two differ for exactly the window that matters here.
 func (c *Client) ListPodNames(ctx context.Context, labelSelector string) ([]string, error) {
 	pods, err := c.cs.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
 	if err != nil {

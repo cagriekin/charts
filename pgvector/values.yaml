@@ -371,7 +371,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.3.0-pg18
+    tag: 2.4.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -640,6 +640,11 @@ ha:
   database: repmgr
 
   terminationGracePeriodSeconds: 120
+
+  # superuser_reserved_connections on every node (HA only): at least replicaCount + 1 + 3,
+  # render-enforced. Its own value because it needs a PostgreSQL restart, so a derived one
+  # rolled every pod on every scale (#373). 8 covers up to replicaCount 4. See the pg chart.
+  superuserReservedConnections: 8
 
 
   resources:
@@ -1315,4 +1320,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.3.0-pg18
+      tag: 2.4.0-pg18

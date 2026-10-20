@@ -38,6 +38,10 @@
 {{- include "pg.validateLeaseTimings" . }}
 {{- include "pg.validateHaImageGeneration" . }}
 {{- include "pg.validateEtcdBootstrapImage" . }}
+{{- /* After the generation, lag-gate and etcd-drift checks on purpose: each of those names a
+       more specific mistake, and the floor (#373) should only speak when the tag is otherwise
+       a sound 2.x pin that is simply too old for this chart. */}}
+{{- include "pg.validateAgentImageFloor" . }}
 {{- if and (not .Values.ha.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true" }}
 {{- end }}
@@ -847,8 +851,16 @@ spec:
               value: {{ .Values.ha.database | quote }}
             - name: HEADLESS_SERVICE
               value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
+            {{- /* No REPMGR_NODE_COUNT (#373). It was `replicaCount + 1` rendered into this
+                   template -- with the node-count-derived superuser reserve of 2.5.0, one of
+                   the two things in the pod spec that moved when the database was scaled -- so
+                   every scale rolled every PostgreSQL pod, the primary included, to deliver a
+                   new integer, and delivered it to the primary LAST (the stale-count trap the
+                   agent's slot code documents). The agent now reads spec.replicas of its own
+                   StatefulSet each tick (image 2.4.0+; the chart's Role grants `get` on exactly
+                   that object), so this spec no longer depends on replicaCount at all. The
+                   agent still accepts the env as a fallback for the ticks before its first
+                   successful read. */}}
             # Lets the entrypoint stale-primary guard read the durable primary
             # marker (#125) to tell a first install from a PVC-loss recreate, so
             # it only settles/retries the empty-data peer scan in the recreate

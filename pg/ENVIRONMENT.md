@@ -30,7 +30,7 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint (creates the role), agent (replication auth) |
 | `REPMGR_DB` | string | yes | `ha.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
 | `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
-| `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
+| `REPMGR_NODE_COUNT` | number | no | not set by the chart since 2.6.0 (#373) | agent: fallback node count only until its first successful read of the StatefulSet's `spec.replicas`, which is where the expected node count comes from (it needs `get` on the StatefulSet, granted by the chart's Role). Rendering it from `replicaCount` rolled every pod on every scale. |
 | `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | agent |
 | `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | agent (#125 highwater) |
 

@@ -52,6 +52,22 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+// #373: REPMGR_NODE_COUNT is optional since 2.4.0 -- the agent reads spec.replicas of its own
+// StatefulSet each tick and the chart no longer renders the env. Absent parses as zero; a
+// present value must still be a number, so a typo is a boot failure rather than "no peers".
+func TestLoadNodeCountIsOptionalButMustParse(t *testing.T) {
+	m := fullEnv()
+	delete(m, "REPMGR_NODE_COUNT")
+	c, err := Load(getter(m))
+	if err != nil || c.NodeCount != 0 {
+		t.Fatalf("absent REPMGR_NODE_COUNT: err=%v NodeCount=%d, want nil and 0", err, c.NodeCount)
+	}
+	m["REPMGR_NODE_COUNT"] = "three"
+	if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), "REPMGR_NODE_COUNT") {
+		t.Fatalf("a non-numeric REPMGR_NODE_COUNT must fail naming the variable, got %v", err)
+	}
+}
+
 func TestLoadReportsAllMissing(t *testing.T) {
 	m := fullEnv()
 	delete(m, "POD_NAME")

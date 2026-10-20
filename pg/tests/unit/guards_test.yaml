@@ -1092,6 +1092,22 @@ tests:
 
   # The RPO gate (#273) is read by the agent from image 2.1.0 on; an older chart-scheme tag would
   # leave the operator believing a guard is armed when nothing is, so the pairing fails fast.
+  # #373: the chart stopped rendering REPMGR_NODE_COUNT; an agent before image 2.4.0 requires it
+  # at boot, so the pairing is a crash-loop of every pod and fails at render time instead.
+  - it: a pre-2.4.0 chart-scheme image tag fails fast (#373)
+    set:
+      ha.image.tag: 2.3.0-pg18
+      etcd.rbac.bootstrapImage.tag: 2.3.0-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'needs the pg-ha image at 2.4.0 or later'
+  - it: a custom image tag is not held to the floor (#373)
+    set:
+      ha.image.tag: mirror-build-7
+      etcd.rbac.bootstrapImage.tag: mirror-build-7
+    template: templates/statefulset.yaml
+    asserts:
+      - notFailedTemplate: {}
   - it: maximumLagOnFailover with a pre-2.1.0 image tag fails fast (#273)
     set:
       ha.agent.maximumLagOnFailover: 1048576

@@ -71,6 +71,15 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+  # The agent's own StatefulSet, read-only (#373): spec.replicas is where it learns how
+  # many nodes the cluster should have -- for peer probing and for pre-creating a
+  # replication slot per expected standby -- instead of a REPMGR_NODE_COUNT env rendered
+  # from postgresql.replicaCount, which rolled every PostgreSQL pod on every scale. Scoped
+  # to the one object; `get` only, the agent never writes it.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: ["{{ include "pg.fullname" . }}"]
+    verbs: ["get"]
 {{- if eq (include "pg.controlRestoreEnabled" .) "true" }}
   # Control-API restore triggering (#276). READ THIS BEFORE ENABLING IT.
   #

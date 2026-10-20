@@ -518,12 +518,13 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.2.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.4.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
 | `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
 | `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
+| `ha.superuserReservedConnections` | `superuser_reserved_connections` on every PostgreSQL node: at least `postgresql.replicaCount + 1 + 3` (one slot per agent session per node plus headroom), render-enforced. Its own value because it needs a PostgreSQL restart, so scaling the database within it rolls nothing (#373) -- see [Application role and connection reserves](#application-role-and-connection-reserves) | `8` |
 | `ha.resources.requests.cpu` | **Not consumed since #286.** The agent runs inside the `postgresql` container, so its CPU/memory come from `postgresql.resources`; these four keys are kept only so an existing values file still renders | `50m` |
 | `ha.resources.requests.memory` | **Not consumed since #286** — see above | `128Mi` |
 | `ha.resources.limits.cpu` | **Not consumed since #286** — see above | `500m` |
@@ -580,7 +581,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 ha:
   image:
-    tag: 2.0.0-pg17
+    tag: 2.4.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
 # `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
@@ -591,7 +592,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.0.0-pg17
+      tag: 2.4.0-pg17
 ```
 
 The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
@@ -720,7 +721,7 @@ Slots are named `pg_ha_slot_<pod ordinal>` — ordinal-derived, so a pod restart
 | Phase | Behavior |
 |-------|----------|
 | Before a clone | The slot is created on the upstream *first*, then `pg_basebackup --slot` streams through it — so no WAL gap can open between the base backup starting and the walreceiver attaching. `primary_slot_name` holds it for the ongoing stream. |
-| Every primary tick | The lease holder creates a slot for every **expected** peer ordinal (`replicaCount + 1`, not observed standbys — a slot must exist *before* its standby streams) and drops orphans. Dropping is decided from the **live pod set read from the Kubernetes API**, never from `REPMGR_NODE_COUNT` — that variable is baked into each pod at render time, so during a scale-up rollout a not-yet-rolled primary still holds the old count and would drop a brand-new standby's slot. A failed pod list skips the drop pass for that tick. |
+| Every primary tick | The lease holder creates a slot for every **expected** peer ordinal (the StatefulSet's `spec.replicas`, read each tick (#373), not observed standbys — a slot must exist *before* its standby streams) and drops orphans. Dropping is decided from the **live pod set read from the Kubernetes API**, never from the expected count — what *should* exist and what *does* are different questions, and a drop decided on the former would reclaim a brand-new standby's slot in the window before its postmaster attaches. A failed pod list skips the drop pass for that tick. |
 | On promote | Slot creation is sequenced **ahead of the routing switch**, so surviving standbys never race slot creation when they follow the new primary — but under its own sub-budget (half the fence budget), so a slow slot query cannot spend the promote's whole window and leave the cutover unfunded. |
 | Active slots | **Never dropped.** The `AND NOT active` predicate is in the SQL, so the guard is atomic with the drop; a read-then-decide would leave a window for a standby to reattach in between. Inactivity alone is never treated as evidence a consumer is gone — that is also what a routine restart looks like — which is why liveness is decided by pod existence, not by the slot's `active` flag. |
 | Paused | No slot mutation at all — `Decide` returns `NoOp` before any primary branch while `pg-ha/pause` is set. |
@@ -731,7 +732,7 @@ Reclaimed as orphans: an agent-minted slot for a **departed** ordinal (no such p
 
 The standby policy depends on whether a standby can legitimately *be* an upstream, i.e. on `cascadingReplication`. With it **off**, a standby is never an upstream — its own slot lives on its upstream, not locally — so every agent-minted slot found locally is a leftover and there is no pod set to consult. With it **on** that premise is false: its children's slots live there, and reclaiming them every tick would delete exactly what cascading depends on (a child whose walreceiver is reconnecting is inactive for that instant, and `AND NOT active` would let the drop through). So the primary's own predicate is used instead, keeping any slot whose ordinal still has a live pod. `AND NOT active` is still what makes either safe. Listing slots on a standby needs a different reference LSN, since `pg_current_wal_lsn()` raises `recovery is in progress` there; the query branches on `pg_is_in_recovery()` and uses the last *received* LSN instead. Verified on a real streaming pair: a leftover slot on a live standby reports its reserved WAL, is reclaimed, and the standby keeps streaming — while an active slot on the primary is still refused.
 
-Slot creation is driven by the expected pod set but **skipped for ordinals with no live pod**, so the create pass agrees with the drop pass. Judging the two against different sources made them fight: after a `replicaCount` 2→1 scale-down the ordinal-0 primary still holds the old `REPMGR_NODE_COUNT` until the StatefulSet rolls it *last*, so it created a slot on one tick and reclaimed it on the next for the whole rollout. A pod that has been created but is still cloning is already in the live set, so its slot is still minted before it streams — and `Clone`, `Follow` and a rewind-based rejoin each ensure their own slot on the upstream, so even a tick of latency is covered.
+Slot creation is driven by the expected pod set but **skipped for ordinals with no live pod**, so the create pass agrees with the drop pass. Judging the two against different sources made them fight: when the expected count was a `REPMGR_NODE_COUNT` env rendered into each pod, a `replicaCount` 2→1 scale-down left the ordinal-0 primary on the old count until the StatefulSet rolled it *last*, so it created a slot on one tick and reclaimed it on the next for the whole rollout. Since #373 the expected count is the StatefulSet's `spec.replicas`, read each tick, so every agent sees a scale on the next tick and no pod rolls for it. A pod that has been created but is still cloning is already in the live set, so its slot is still minted before it streams — and `Clone`, `Follow` and a rewind-based rejoin each ensure their own slot on the upstream, so even a tick of latency is covered.
 
 `ha.agent.cascadingReplication` works with `mechanism: native` since #294. Two changes made it safe. The primary no longer **pre-creates** a slot per live ordinal when cascading is on: a cascaded standby streams from a peer, so the slot minted on the primary would sit inactive forever and retain WAL until `max_slot_wal_keep_size` invalidated it — the exact failure slot ownership exists to prevent. Nothing is lost, because followers self-provision on their real upstream. And a standby no longer reclaims every agent-minted slot it finds, since its children's slots live there.
 
@@ -1759,7 +1760,7 @@ The chart splits connections into three pools:
 
 | Pool | Who | Size |
 |------|-----|------|
-| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: one per node + 3 (every agent holds one read session to every node; its short-lived write connection shares the 3). Standalone: 3 |
+| `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: `ha.superuserReservedConnections` (8; at least `postgresql.replicaCount + 1 + 3`, since every agent holds one read session to every node and its short-lived write connection shares the 3; render-enforced). Its own value because it needs a PostgreSQL restart: scaling the database within it rolls nothing, past it the render fails until it is raised (#373). Standalone: 3 |
 | `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x pgpool.replicaCount + 1`, `3 x` with `pgpool.metrics.enabled`) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
 | the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
 
@@ -2050,6 +2051,18 @@ kubectl exec -it my-postgres-pg-0 -- psql -U repmgr -d repmgr \
 The agent also exports this as metrics — `pg_ha_agent_replicas_streaming`,
 `pg_ha_agent_replicas_expected`, `pg_ha_agent_replication_slots` and the slot-WAL gauges — with
 shipped PrometheusRules, which is the better place to watch it from than a shell.
+
+### Scaling
+
+Changing `postgresql.replicaCount` **rolls no pod** (#373). Nothing in the PostgreSQL pod spec
+depends on the node count: `superuser_reserved_connections` is its own value
+(`ha.superuserReservedConnections`, render-checked against the node count because it needs a
+restart), and the agent learns the expected node count from its StatefulSet's `spec.replicas`
+each tick, through a read-only grant on that one object, rather than from an env rendered into
+the pod. A scale is therefore exactly what the StatefulSet controller does on its own: add or
+trim the top ordinal. Scaling past what `ha.superuserReservedConnections` covers (4 replicas at
+the default of 8) fails the render naming the knob; raising it is the one scale step that
+restarts PostgreSQL, which is why it is not derived.
 
 ### Scaling down
 
@@ -2896,7 +2909,7 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
-| 2.0.0 *(current)* | `cagriekin/pg-ha:2.0.0-pg18` / `:2.0.0-pg17` | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 2.6.0 *(current)* | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |
 | 1.11.0 – 1.13.0 | `trixie-5.5.0-31` | 18.x (default) or 17.x | as above |

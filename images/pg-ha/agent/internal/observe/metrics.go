@@ -147,9 +147,9 @@ func (m *Metrics) IncControlRestoreRequest() { m.controlRestoreRequests.Add(1) }
 
 // TopologyStats is the primary's view of its streaming standbys (#288).
 //
-// Expected comes from the live pod set read from the Kubernetes API, not from
-// REPMGR_NODE_COUNT: that env var is baked in at render time and is stale on every pod that
-// has not rolled yet, which is the same trap orphanSlot documents for #289.
+// Expected comes from the live pod set read from the Kubernetes API, not from the expected
+// node count: a pod the StatefulSet has not created yet cannot be streaming, and counting it
+// would report a shortfall on every scale-up until the clone finished (#289, #373).
 type TopologyStats struct {
 	// Streaming is how many replicas the primary sees in state 'streaming'.
 	Streaming int64

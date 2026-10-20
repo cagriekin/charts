@@ -234,6 +234,16 @@ assert_contains "#273: the knob with a pre-2.1.0 chart-scheme image tag fails th
 assert_contains "#273: ... naming the offending tag" "${lag_old_img}" "2.0.2-pg18"
 lag_pin_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 >/dev/null 2>&1 || lag_pin_rc=$?
 assert_eq "#273: the knob renders with the chart's pinned image" "0" "${lag_pin_rc}"
+# #373: the chart no longer renders REPMGR_NODE_COUNT, and an agent before image 2.4.0 refuses to
+# boot without it, so an older chart-scheme tag is a crash-loop of every pod: fail the render.
+# A custom tag is the operator's business; standalone runs no agent.
+floor_old=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=2.3.0-pg18 --set etcd.rbac.bootstrapImage.tag=2.3.0-pg18 2>&1 || true)
+assert_contains "#373: a pre-2.4.0 chart-scheme image tag fails the render" "${floor_old}" "needs the pg-ha image at 2.4.0 or later"
+assert_contains "#373: ... naming the env the old agent requires" "${floor_old}" "REPMGR_NODE_COUNT"
+floor_custom=0; helm template test-pg "${CHART_DIR}" --set ha.image.tag=mirror-build-7 --set etcd.rbac.bootstrapImage.tag=mirror-build-7 >/dev/null 2>&1 || floor_custom=$?
+assert_eq "#373: a custom tag is not second-guessed" "0" "${floor_custom}"
+floor_sa=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.image.tag=2.3.0-pg18 >/dev/null 2>&1 || floor_sa=$?
+assert_eq "#373: standalone ignores the floor (no agent runs)" "0" "${floor_sa}"
 lag_custom_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=internal-build-42 --set etcd.rbac.bootstrapImage.tag=internal-build-42 >/dev/null 2>&1 || lag_custom_rc=$?
 assert_eq "#273: a custom image tag is not checked" "0" "${lag_custom_rc}"
 lag_sa_rc=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=2.0.2-pg18 >/dev/null 2>&1 || lag_sa_rc=$?
@@ -469,7 +479,7 @@ pkg_major19=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
-  --set repmgr.image.tag=2.0.0-pg19 \
+  --set repmgr.image.tag=2.4.0-pg19 \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "postgresql-19-cron"
@@ -1835,6 +1845,22 @@ done
 cks_pgpool1=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
 cks_pgpool3=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=3 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
 assert_eq "reserves: scaling pgpool 1 -> 3 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool3}"
+# #373: the same for the database itself. superuser_reserved_connections used to be derived from
+# the node count, so adding a standby rolled every pod, the primary included.
+cks_rc1=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+cks_rc4=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=4 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+assert_eq "#373: scaling postgresql.replicaCount 1 -> 4 leaves the PostgreSQL config checksum unchanged" "${cks_rc1}" "${cks_rc4}"
+# ... and more than the checksum: NOTHING in the pod template may depend on replicaCount, or the
+# StatefulSet controller creates a new revision and rolls every pod. Only `replicas:` and the
+# Role's per-ordinal resourceNames legitimately differ, and the Role is not in the pod template.
+sts_rc1=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep -v '^  replicas: ')
+sts_rc4=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=4 --show-only templates/statefulset.yaml 2>&1 | grep -v '^  replicas: ')
+assert_eq "#373: scaling postgresql.replicaCount 1 -> 4 leaves the StatefulSet byte-identical apart from replicas (no roll)" "${sts_rc1}" "${sts_rc4}"
+assert_contains "#373: ... because the superuser reserve is a value, not the node count" "$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=4 --show-only templates/postgresql-configmap.yaml 2>&1)" "superuser_reserved_connections = 8"
+rc5=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=5 2>&1 || true)
+assert_contains "#373: a cluster the reserve cannot cover fails the render naming the knob" "${rc5}" "ha.superuserReservedConnections is 8, but postgresql.replicaCount=5"
+rc5_ok=0; helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=5 --set ha.superuserReservedConnections=9 >/dev/null 2>&1 || rc5_ok=$?
+assert_eq "#373: ... and renders once raised" "0" "${rc5_ok}"
 
 # Test: with no postgresql.configuration the ConfigMap still renders and is wired in, since it
 # carries reserved-connections.conf. The include_dir strip that #107 needed when conf.d could
@@ -2072,7 +2098,7 @@ assert_not_contains "standalone: no POD_CIDR env (agent-only pg_hba ownership)" 
 # dropped env here is a boot crash-loop the other asserts would not catch.
 agent_env_missing=""
 for v in POD_NAME NAMESPACE LEASE_NAME LEASE_DURATION RENEW_DEADLINE RETRY_PERIOD \
-  RECONCILE_INTERVAL HEADLESS_SERVICE REPMGR_NODE_COUNT MASTER_SERVICE PRIMARY_MARKER \
+  RECONCILE_INTERVAL HEADLESS_SERVICE MASTER_SERVICE PRIMARY_MARKER \
   POD_SELECTOR REPMGR_USER REPMGR_DB REPMGR_PASSWORD PGDATA DCS_BACKEND; do
   grep -q "name: ${v}$" <<< "${agent_pg_cont}" || agent_env_missing="${agent_env_missing} ${v}"
 done
@@ -2147,6 +2173,11 @@ assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${
 # update (not patch) or every marker advance would be Forbidden once wired
 assert_contains "agent rbac: marker configmaps grant get+update+patch (marker.go uses Update; #273 records the position by JSON patch)" "${agent_rbac}" '"get", "update", "patch"'
 assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
+# #373: the expected node count comes from the agent's own StatefulSet, read-only and scoped
+agent_sts_rule=$(printf '%s\n' "${agent_rbac}" | grep -A3 'resources: \["statefulsets"\]')
+assert_contains "#373 rbac: statefulsets get granted (spec.replicas is the node count)" "${agent_sts_rule}" 'verbs: \["get"\]'
+assert_contains "#373 rbac: ... scoped to the chart's own StatefulSet" "${agent_sts_rule}" 'resourceNames: \["test-pg"\]'
+assert_eq "#373 rbac: ... and only get" "0" "$(printf '%s' "${agent_sts_rule}" | grep -c 'patch\|update\|delete\|list' || true)"
 # agent mode records decisions in a structured audit log, not core/v1 Events, so
 # the events:create grant (service-updater only) must be dropped (least privilege)
 assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${agent_rbac}" 'resources: ["events"]'
@@ -3505,14 +3536,14 @@ sync_slots_pg16_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=2.0.0-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
+  --set repmgr.image.tag=2.4.0-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
 assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
 # walLevel=logical isolates this to the MAJOR-version guard specifically (both guards
 # would otherwise fire on the default walLevel, and a bare non-zero rc cannot tell which).
 sync_slots_pg16_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=2.0.0-pg16 2>&1 || true)
+  --set repmgr.image.tag=2.4.0-pg16 2>&1 || true)
 assert_contains "#308: PG16 guard message names the version requirement" "${sync_slots_pg16_msg}" "requires PostgreSQL 17+"
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.
@@ -3615,7 +3646,7 @@ assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
 major_rebump=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 \
+  --set repmgr.image.tag=2.4.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && major_rebump_rc=0 || major_rebump_rc=$?
 assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "0" "${major_rebump_rc}"
 
@@ -3625,7 +3656,7 @@ assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "
 # a PG17 server while every extension path the chart builds points at /18/.
 major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
+  --set repmgr.image.tag=2.4.0-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
 assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
 assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match ha.image.majorVersion"
 
@@ -3637,10 +3668,10 @@ pg17_full=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 \
+  --set repmgr.image.tag=2.4.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && pg17_full_rc=0 || pg17_full_rc=$?
 assert_eq "#269: PG17 selection renders" "0" "${pg17_full_rc}"
-assert_contains "#269: PG17 selection uses the -pg17 HA image" "${pg17_full}" "cagriekin/pg-ha:2.0.0-pg17"
+assert_contains "#269: PG17 selection uses the -pg17 HA image" "${pg17_full}" "cagriekin/pg-ha:2.4.0-pg17"
 
 # Extensions are where a wrong major becomes a crash-looping init container: the copy
 # paths are built from postgresql.majorVersion, so they must follow the selection with no
@@ -3650,7 +3681,7 @@ pg17_ext=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 \
+  --set repmgr.image.tag=2.4.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG17 extension lib path" "${pg17_ext}" "/usr/lib/postgresql/17/lib"
 assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/postgresql/17/extension"
@@ -3663,7 +3694,7 @@ pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 \
+  --set repmgr.image.tag=2.4.0-pg17 \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 # pgaudit alone: #294 made native the only mechanism, and native has no repmgr extension to
 # preserve, so the chart merges nothing into the operator's list.
@@ -3674,7 +3705,7 @@ assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_p
 # The two majorVersion values are hand-typed claims; the -pgNN suffix is the artifact. A
 # values file that moves one and not the other must fail at render, not run the wrong major.
 tag_mismatch=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.image.tag=2.0.0-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
+  --set repmgr.image.tag=2.4.0-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
 assert_eq "#269: render fails when the -pg17 tag disagrees with majorVersion" "1" "${tag_mismatch_rc}"
 assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch}" "is built for PostgreSQL 17"
 
@@ -3683,7 +3714,7 @@ assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch
 # entrypoint's require_pg_bindir and the agent then refuse to start the wrong image.
 pgmajor_env=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.0.0-pg17 \
+  --set repmgr.image.tag=2.4.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG_MAJOR env follows repmgr.image.majorVersion" "${pgmajor_env}" "value: \"17\""
 pgmajor_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_env}")
@@ -4091,7 +4122,7 @@ extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
-  --set repmgr.image.tag=2.0.0-pg19 \
+  --set repmgr.image.tag=2.4.0-pg19 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/lib" "${extpaths_19}" "mountPath: /usr/lib/postgresql/19/lib"
 assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
@@ -4240,16 +4271,11 @@ guard_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr
 # repmgr mode runs the image entrypoint directly (no chart-side wrapper)
 assert_contains "stale guard: postgresql container runs the image entrypoint" "${guard_sts}" '"/usr/local/bin/entrypoint.sh"'
 assert_not_contains "stale guard: no chart-side wrapper script" "${guard_sts}" "refusing to start read-write"
-# the entrypoint guard scans peers; the chart passes the node count so the
-# scan bound matches the cluster (replicaCount + 1)
-nodecount=$(printf '%s' "${guard_sts}" | grep -c "name: REPMGR_NODE_COUNT" || true)
-assert_gt "stale guard: REPMGR_NODE_COUNT propagated to repmgr containers" "${nodecount}" "0"
-# replicaCount 1 -> node count 2; assert the value rendered on the env var
-nodecount_val=$(printf '%s' "${guard_sts}" | grep -A1 "name: REPMGR_NODE_COUNT" | grep "value:" | head -1)
-assert_contains "stale guard: node count is replicaCount + 1" "${nodecount_val}" '"2"'
-
-# Test: standalone (non-repmgr) mode uses the postgres image, not the guard
-assert_not_contains "stale guard: standalone has no REPMGR_NODE_COUNT" "${minimal}" "REPMGR_NODE_COUNT"
+# #373: the chart no longer passes a node count. REPMGR_NODE_COUNT was replicaCount + 1 rendered
+# into the pod template, which made every scale roll every pod; the agent reads spec.replicas of
+# its StatefulSet instead, so the env must be gone from BOTH modes and the Role must grant the read.
+assert_not_contains "#373: no REPMGR_NODE_COUNT in the HA pod template" "${guard_sts}" "REPMGR_NODE_COUNT"
+assert_not_contains "#373: no REPMGR_NODE_COUNT in the standalone pod template" "${minimal}" "REPMGR_NODE_COUNT"
 
 # --- pgvector parity (#126) ---
 # pgvector/templates/ are symlinks to pg/templates/ but pgvector/values.yaml is
@@ -6338,7 +6364,7 @@ legacy_img_ha=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=trixie-5
 assert_contains "#298: rejected under the ha.image spelling as well" "${legacy_img_ha}" "is a 1.x image tag"
 # The current scheme renders, and so does any tag that is merely unfamiliar -- the guard is
 # narrow on purpose (a private mirror's tags are not second-guessed).
-for good_tag in "2.0.0-pg18" "2.1.0-pg18" "internal-build-42"; do
+for good_tag in "2.4.0-pg18" "2.5.0-pg18" "internal-build-42"; do
   gt_rc=0
   helm template test-pg "${CHART_DIR}" --set ha.image.tag="${good_tag}" \
     --set etcd.rbac.bootstrapImage.tag="${good_tag}" >/dev/null 2>&1 || gt_rc=$?
@@ -6451,15 +6477,15 @@ assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails th
   "${etcd_drift}" "must match ha.image"
 etcd_lock_rc=0
 helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.4.0-pg18 \
   --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
-  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
+  --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
 assert_eq "#291: moving both halves together renders" "0" "${etcd_lock_rc}"
 # ...and exactly one image reaches the manifests in that case.
 etcd_lock_imgs=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.4.0-pg18 \
   --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
-  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 2>/dev/null \
+  --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 2>/dev/null \
   | grep -oE 'cagriekin/[^"[:space:]]*' | sort -u | wc -l)
 assert_eq "#291: the lockstep render uses exactly one cagriekin image" "1" "${etcd_lock_imgs}"
 # The default (bundled etcd, untouched pins) must be in lockstep already.
@@ -6469,7 +6495,7 @@ assert_eq "#291: the shipped etcd pins are already in lockstep" "0" "${etcd_def_
 # With an EXTERNAL etcd the Job never renders, so a stale pin there is inert, not an error.
 etcd_ext_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
-  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.0.0-pg18 >/dev/null 2>&1 \
+  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.4.0-pg18 >/dev/null 2>&1 \
   || etcd_ext_rc=$?
 assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
 # The DIGEST is part of the reference (#298 review). Both image dicts carry one and both are

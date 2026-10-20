@@ -27,7 +27,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.0.0-pg18
+    tag: 2.4.0-pg18
     pullPolicy: IfNotPresent
 
   enabled: true
