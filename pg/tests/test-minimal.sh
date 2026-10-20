@@ -73,5 +73,10 @@ container_names=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.spec
 assert_not_contains "no repmgrd container" "${container_names}" "repmgrd"
 assert_not_contains "no service-updater container" "${container_names}" "service-updater"
 
+# #370: the standalone postStart hook reports its outcome in the container log.
+hook_log=$(kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql 2>/dev/null | grep "postStart:" || true)
+assert_contains "#370: the hook's outcome is in the container log" "${hook_log}" "real server up on 127.0.0.1 after"
+assert_contains "#370: it names the managed roles it provisioned" "${hook_log}" "applied: managed roles"
+
 end_suite
 print_summary

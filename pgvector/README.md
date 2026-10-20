@@ -157,7 +157,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections **over loopback TCP** — the bootstrap's socket-only transient postmaster no longer counts, #350 — so first-boot recovery and WAL replay cannot be killed by the liveness probe) | `true` |
 | `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
-| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288) | `180` |
+| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288, and in standalone mode the postStart hook's wait for the real server, floor 300s, #370) | `180` |
 
 The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350), the one address the
 bootstrap's transient postmaster and the stock image's init-time server never open, so Ready
@@ -182,7 +182,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
-| `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
+| `postgresql.pgHba` | List of pg_hba.conf entries, written by the agent (HA) or by the postStart hook once the real server answers (standalone, #370) | `[]` |
 | `postgresql.extraVolumes` | Extra pod-level volumes — mount a file identically on every replica (e.g. a pgsodium key); see the [pg chart README](../pg/README.md#mounting-an-extra-file-on-every-replica) | `[]` |
 | `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
 | `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |

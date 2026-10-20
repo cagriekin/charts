@@ -34,6 +34,13 @@ assert_loopback_answers "${NAMESPACE}" "${POD}"
 
 probe_lab_350 "${NAMESPACE}" "${POD}"
 
+# #370: the standalone hook reports its outcome through PID 1's stderr, i.e. the container log,
+# so a hook that ran late, skipped the rules or failed is visible without the pod events.
+hook_log=$(kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql 2>/dev/null | grep "postStart:" || true)
+assert_contains "#370: the hook's outcome is in the container log" "${hook_log}" "real server up on 127.0.0.1 after"
+assert_contains "#370: it names the pg_hba entries it wrote" "${hook_log}" "1 pg_hba entries written"
+assert_eq "#370: no FailedPostStartHook event for the pod" "" "$(kubectl get events -n "${NAMESPACE}" --field-selector reason=FailedPostStartHook,involvedObject.name="${POD}" -o name 2>/dev/null)"
+
 # Test: configuration parameters are applied
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem is 64MB" "64MB" "${work_mem}"
@@ -84,6 +91,9 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 30
 # After upgrade the pod is recycled due to checksum change, so new config should be active
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem updated to 128MB after upgrade" "128MB" "${work_mem}"
+# #370: a restart on the same PVC finds the rules already in place (the awk re-emit is idempotent).
+hook_log2=$(kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql 2>/dev/null | grep "postStart:" || true)
+assert_contains "#370: the restarted container's hook found the pg_hba entries already in place" "${hook_log2}" "1 pg_hba entries already in place"
 
 maint_work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW maintenance_work_mem" "testuser" "testdb")
 assert_eq "maintenance_work_mem updated to 256MB after upgrade" "256MB" "${maint_work_mem}"

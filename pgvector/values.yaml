@@ -109,6 +109,8 @@ postgresql:
   # postgres opens at all, and crash-recovery WAL replay can take longer still, both
   # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is
   # the total startup budget (1800s here); keep the steady-state livenessProbe window tight.
+  # In standalone mode the same budget (floor 300s) bounds the postStart hook's wait for the
+  # real server, so it is also how long a crash recovery may take before a restart (#370).
   # Probed over loopback TCP, which the bootstrap's socket-only transient postmaster never
   # opens, so a cluster still being created cannot retire this grace (#350).
   # Bounds a standby's FIRST clone: since #288 the agent clones in this container, not in a
@@ -348,7 +350,8 @@ postgresql:
       # harmless -- but a cluster where NO pod reaches a primary within 90s of starting comes
       # up without the extension, and `CREATE EXTENSION vector` has to be run by hand. Note
       # also that probes do not begin until this hook returns. See pg/values.yaml for the
-      # full note.
+      # full note. Standalone (ha.enabled=false) is not best effort: its hook waits the
+      # startup-probe budget for the real server, then fails loudly (#370).
       additionalCommands: |
         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 
