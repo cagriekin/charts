@@ -51,7 +51,7 @@ HELM_REPO_URL="${HELM_REPO_URL:-https://cagriekin.github.io/charts}"
 # 2.0.0's image has neither -- and it must NOT be a tag CI builds locally, or the freshly-built
 # image loaded into KinD would shadow it and the "1.x" phase would silently run 2.0.0. Same tag
 # and same reasoning as test-migrate-native.sh.
-FROM_IMAGE_BASE="${FROM_IMAGE_BASE:-trixie-5.5.0-32-pg18}"   # set-pg-major: keep (an older RELEASED image is the point)
+FROM_IMAGE_BASE="${FROM_IMAGE_BASE:-trixie-5.5.0-32-pg17}"   # set-pg-major: keep (an older RELEASED image is the point)
 PG_MAJOR=$(awk '/^(repmgr|ha):/{r=1} r&&/^    majorVersion:/{gsub(/"/,"",$2); print $2; exit}' "${CHART_DIR}/values.yaml")
 [ -n "${PG_MAJOR}" ] || { echo "could not resolve majorVersion from ${CHART_DIR}/values.yaml" >&2; exit 1; }
 FROM_IMAGE_TAG="${FROM_IMAGE_BASE%-pg[0-9]*}-pg${PG_MAJOR}"

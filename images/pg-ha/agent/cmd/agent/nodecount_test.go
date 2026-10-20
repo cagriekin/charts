@@ -85,3 +85,26 @@ func TestExpectedNodesIsNeverNegative(t *testing.T) {
 		t.Fatalf("expectedNodes = %d, want 0", got)
 	}
 }
+
+// refreshNodeCount's result is "is a node count known from any source": a failed first read
+// with no env is false, so tick() skips rather than planning on zero peers -- which the
+// planner would read as a single-node cluster, not as unknown (#373 review).
+func TestRefreshNodeCountReportsWhetherACountIsKnown(t *testing.T) {
+	a := nodeCountAgent(t) // no StatefulSet: the Get fails
+	if a.refreshNodeCount(context.Background()) {
+		t.Fatal("no StatefulSet and no env must report the count as unknown")
+	}
+	a.cfg.NodeCount = 2
+	if !a.refreshNodeCount(context.Background()) {
+		t.Fatal("the env fallback is a known count")
+	}
+	a.cfg.NodeCount = 0
+	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(sts(3)), "ns")
+	if !a.refreshNodeCount(context.Background()) {
+		t.Fatal("a successful read is a known count")
+	}
+	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns")
+	if !a.refreshNodeCount(context.Background()) || a.expectedNodes() != 3 {
+		t.Fatalf("a failed re-read keeps the last count known; expectedNodes=%d", a.expectedNodes())
+	}
+}

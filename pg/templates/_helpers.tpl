@@ -2020,13 +2020,22 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
        render there rather than surface a raw nil-pointer (#298 review). */ -}}
 {{- $lag := int64 ((.Values.ha.agent).maximumLagOnFailover | default 0) -}}
 {{- if and (eq (include "pg.agentMode" .) "true") (gt $lag 0) -}}
+{{- $ver := include "pg.haImageSchemeVersion" . -}}
+{{- if and $ver (semverCompare "< 2.1.0" $ver) -}}
+{{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart %s ships it), or set maximumLagOnFailover to 0." $lag (.Values.ha.image.tag | toString) .Chart.Version) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "pg.haImageSchemeVersion" -}}
+{{- /* The semver of ha.image.tag when the tag is of the chart's own scheme
+       (<semver>-pg<major>), else the empty string. The image-floor validators
+       (pg.validateLagGateImage for #273, pg.validateAgentImageFloor for #373) only ever judge a
+       tag of this scheme: a custom tag is the operator's statement that they know what the
+       image runs, and is never second-guessed. One parser so the two cannot drift. */ -}}
 {{- $tag := .Values.ha.image.tag | toString -}}
 {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-pg[0-9]+$" $tag -}}
-{{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
-{{- if semverCompare "< 2.1.0" $ver -}}
-{{- fail (printf "ha.agent.maximumLagOnFailover=%v needs the pg-ha image at 2.1.0 or later, but ha.image.tag is %q: that agent does not read MAX_LAG_ON_FAILOVER_BYTES, so the RPO gate would be silently inactive. Set ha.image.tag to 2.1.0-pg<major> or later (chart %s ships it), or set maximumLagOnFailover to 0." $lag $tag .Chart.Version) -}}
-{{- end -}}
-{{- end -}}
+{{- regexReplaceAll "-pg[0-9]+$" $tag "" -}}
 {{- end -}}
 {{- end -}}
 
@@ -2037,16 +2046,14 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
        image 2.4.0 REQUIRES that env at boot -- config.Load lists it as missing and exits --
        so pairing this chart with an older chart-scheme tag is a crash-loop of every
        PostgreSQL pod at once, over a values file helm accepted. Refuse it here instead.
-       Same shape as pg.validateLagGateImage: only a tag of the chart's own scheme
-       (<semver>-pg<major>) is checked, a custom tag being the operator's statement that they
-       know what the image runs; agent-mode only, since standalone runs no agent. */ -}}
+       Same shape as pg.validateLagGateImage, through pg.haImageSchemeVersion: only a tag of
+       the chart's own scheme (<semver>-pg<major>) is checked, a custom tag being the
+       operator's statement that they know what the image runs; agent-mode only, since
+       standalone runs no agent. */ -}}
 {{- if eq (include "pg.agentMode" .) "true" -}}
-{{- $tag := .Values.ha.image.tag | toString -}}
-{{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+-pg[0-9]+$" $tag -}}
-{{- $ver := regexReplaceAll "-pg[0-9]+$" $tag "" -}}
-{{- if semverCompare "< 2.4.0" $ver -}}
-{{- fail (printf "ha.image.tag is %q, but chart %s needs the pg-ha image at 2.4.0 or later: this chart no longer sets REPMGR_NODE_COUNT (the agent reads its StatefulSet's spec.replicas instead, so scaling rolls no pod, #373), and an older agent refuses to boot without it -- every PostgreSQL pod would crash-loop at once. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.4.0-pg<major> or later, or stay on a chart before 2.6.0 for that image." $tag .Chart.Version) -}}
-{{- end -}}
+{{- $ver := include "pg.haImageSchemeVersion" . -}}
+{{- if and $ver (semverCompare "< 2.4.0" $ver) -}}
+{{- fail (printf "ha.image.tag is %q, but chart %s needs the pg-ha image at 2.4.0 or later: this chart no longer sets REPMGR_NODE_COUNT (the agent reads its StatefulSet's spec.replicas instead, so scaling rolls no pod, #373), and an older agent refuses to boot without it -- every PostgreSQL pod would crash-loop at once. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.4.0-pg<major> or later, or stay on a chart before 2.6.0 for that image." (.Values.ha.image.tag | toString) .Chart.Version) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

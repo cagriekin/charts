@@ -5,9 +5,10 @@ set -euo pipefail
 # repmgr.nodes. The primary reconciles repmgr.nodes against the live ordinal range and
 # unregisters records for pods the StatefulSet no longer runs.
 #
-# The agent's own cleanupGhostNodes runs on the lease holder each tick, bounded by the
-# StatefulSet's spec.replicas, which the scale-down `helm upgrade` changes without rolling a
-# single pod (#373; asserted below on the controller revision). Keeping
+# The agent's slot reconcile (reconcileSlots) runs on the lease holder each tick: it creates
+# one slot per expected ordinal below the StatefulSet's spec.replicas, which the scale-down
+# `helm upgrade` changes without rolling a single pod (#373; asserted below on the controller
+# revision), and drops the slot of an ordinal no live pod owns. Keeping
 # this suite is the point of the port -- it is the only end-to-end #139 regression, and
 # the Go unit tests cover ghostNodeIDs' arithmetic but not the live unregister.
 #

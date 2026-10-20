@@ -793,7 +793,16 @@ func (a *agent) boot(ctx context.Context) error {
 // or a background ticker is fine, a cached write path is not.
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
-	a.refreshNodeCount(ctx)
+	if !a.refreshNodeCount(ctx) {
+		// No node count from any source yet: not the StatefulSet, not the env. Acting on
+		// it would probe zero peers, and zero peers is not "unknown" to the planner -- it
+		// is "single node": PeersPending cannot arm (no peer is unreachable), `newer` is
+		// nil, and a lease-holding cold boot with primary-state data would StartLocal
+		// read-write past the #125/#171 check, while the primary would pre-create no
+		// slots. A StatefulSet always has at least one replica, so an unknown count is the
+		// only way to reach zero; skip the tick and try again next interval (#373).
+		return
+	}
 	// Sampled BEFORE observe() so deriveServingRW can tell whether a demote completed while
 	// this tick was looking (#298 review; see the fenceGen field).
 	gen := a.fenceGen.Load()
@@ -1034,7 +1043,9 @@ func markerTamperSuspected(o reconcile.Observation) (bool, string) {
 	return false, ""
 }
 
-// refreshNodeCount reads spec.replicas of this agent's StatefulSet into a.nodeCount (#373).
+// refreshNodeCount reads spec.replicas of this agent's StatefulSet into a.nodeCount (#373)
+// and reports whether a node count is known from ANY source afterwards: this read, an
+// earlier one, or the REPMGR_NODE_COUNT env. False means the tick has nothing to go on.
 //
 // Bounded by the fence budget like every other apiserver call on the reconcile goroutine
 // (#288 review): tick()'s context has no deadline, and a blackholed Get would otherwise
@@ -1043,16 +1054,21 @@ func markerTamperSuspected(o reconcile.Observation) (bool, string) {
 // warning is logged once per episode: a StatefulSet that cannot be read is a cluster
 // running an older chart's RBAC, and that is a one-line "upgrade the chart" message, not a
 // log line every five seconds.
-func (a *agent) refreshNodeCount(ctx context.Context) {
+func (a *agent) refreshNodeCount(ctx context.Context) bool {
 	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 	defer cancel()
 	n, err := a.kube.StatefulSetReplicas(rctx, a.base)
 	if err != nil {
 		if !a.nodeCountWarned {
-			a.log.Warn("read the StatefulSet's spec.replicas; using the last known node count (the REPMGR_NODE_COUNT env until the first read succeeds). Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)", "statefulset", a.base, "fallback", a.expectedNodes(), "err", err)
+			fallback := a.expectedNodes()
+			msg := "cannot read the StatefulSet's spec.replicas; using the last known node count (the REPMGR_NODE_COUNT env until the first read succeeds). Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)"
+			if fallback == 0 {
+				msg = "cannot read the StatefulSet's spec.replicas and no REPMGR_NODE_COUNT env is set: the node count is unknown, so the reconcile tick is skipped until a read succeeds. Chart 2.6.0+ grants the agent `get` on its own StatefulSet (#373)"
+			}
+			a.log.Warn(msg, "statefulset", a.base, "fallback", fallback, "err", err)
 			a.nodeCountWarned = true
 		}
-		return
+		return a.expectedNodes() > 0
 	}
 	if a.nodeCountWarned {
 		a.log.Info("StatefulSet readable again; node count follows spec.replicas", "statefulset", a.base, "nodeCount", n)
@@ -1062,6 +1078,7 @@ func (a *agent) refreshNodeCount(ctx context.Context) {
 		a.log.Info("node count changed with spec.replicas; peers and slots follow it on this tick, no pod rolled", "from", a.nodeCount, "to", n)
 	}
 	a.nodeCount = n
+	return a.expectedNodes() > 0
 }
 
 // expectedNodes is how many pods the StatefulSet should have: the live spec.replicas when
