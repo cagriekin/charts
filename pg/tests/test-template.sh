@@ -2195,8 +2195,30 @@ assert_contains "#361: agent pgpool: RO backend is detachable" "${agent_pgpool}"
 assert_not_contains "#361: ... and no longer DISALLOW_TO_FAILOVER" "${agent_pgpool}" "backend_flag1 = 'DISALLOW_TO_FAILOVER'"
 pgpool_dep_361=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_eq "#361: the re-attach loop runs beside pgpool (pcp_attach_node once)" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pcp_attach_node -h 127.0.0.1')"
-assert_eq "#361: both probes ask pgpool over PCP, not through a PostgreSQL session" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info')"
+assert_eq "#361: both probes ask pgpool over PCP, not through a PostgreSQL session" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pcp_info; rc=$?')"
 assert_not_contains "#361: no probe opens a session through pgpool" "${pgpool_dep_361}" 'psql -h 127.0.0.1 -p 9999'
+# #375: one PCP prelude feeds the re-attach loop and both probes; the user comes from its own
+# file; an authentication fault (the client's exact wording) is fail-open and logged once;
+# PCP not answering still fails. #374: readiness asks backend 0 itself with pg_isready (the
+# loop also uses pg_isready, on detached backends), liveness never does.
+assert_eq "#375: the PCP prelude is shared by the loop and both probes (3 copies)" "3" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PCP_USER=$(cat /usr/local/etc/pcp_user)')"
+assert_not_contains "#375: nothing parses the PCP user out of pcp.conf" "${pgpool_dep_361}" 'cut -d: -f1 /usr/local/etc/pcp.conf'
+assert_eq "#375: both probes pass fail-open on a PCP authentication fault" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 2 \] && { pcp_auth_note fail; exit 0; }')"
+assert_eq "#375: ... and fail when PCP does not answer" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 0 \] || exit 1')"
+assert_contains "#375: the authentication episode is logged to the container log once" "${pgpool_dep_361}" '\[probe\] PCP authentication failed'
+assert_contains "#375: ... and its end" "${pgpool_dep_361}" '\[probe\] PCP authentication works again'
+assert_contains "#375: the init container refuses a PCP user with a colon" "${pgpool_dep_361}" 'case "$PCP_USER" in \*:\*|\*"$nl"\*)'
+assert_contains "#375: ... and writes the user to its own file" "${pgpool_dep_361}" '> /usr/local/etc/pcp_user'
+assert_eq "#374: readiness asks backend 0 with pg_isready (plus the loop's detached-backend check)" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pg_isready -h')"
+assert_contains "#374: ... reading backend 0 from the rendered pgpool.conf" "${pgpool_dep_361}" "backend_hostname0 = "
+assert_not_contains "#374: the never-false node-0 clause is gone" "${pgpool_dep_361}" 'NR == 1 { exit !($5 == "up"'
+pgpool_375_colon=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.admin.username='ops:admin' 2>&1 || true)
+assert_contains "#375: a ':' in pgpool.admin.username fails the render naming the knob" "${pgpool_375_colon}" "pgpool.admin.username"
+# The schema pattern speaks first (helm validates values before rendering); the template
+# guard is the second layer for a chart consumer that skips schema validation.
+assert_contains "#375: ... from the schema (Helm 3.14 and Helm 4 wordings)" "${pgpool_375_colon}" "[Dd]oes not match pattern"
+pgpool_375_byo_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.admin.existingSecret.enabled=true --set pgpool.admin.existingSecret.name=x >/dev/null 2>&1 || pgpool_375_byo_rc=$?
+assert_eq "#375: an existing admin Secret renders; its username is checked by the init container at boot" "0" "${pgpool_375_byo_rc}"
 pgpool_dep_361_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpool_dep_361_off}" "pcp_attach_node"
 assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"

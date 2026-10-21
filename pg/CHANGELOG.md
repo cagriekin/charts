@@ -22,6 +22,32 @@
 
 ### Fixed
 
+- **A PCP credential fault no longer restarts pgpool in a loop (#375).** Since 2.5.0 the pgpool
+  probes authenticate over PCP, with the user parsed out of `pcp.conf` by `cut -d: -f1`. A PCP
+  admin username containing `:` (which `pcp.conf`, `user:md5` per line and split at the first
+  `:`, can never carry), or any other `pcp.conf`/`.pcppass` disagreement, therefore failed
+  liveness on every check and the kubelet restarted every replica in a loop, taking the pooled
+  endpoint down -- a fault that before 2.5.0 only stalled the re-attach loop. Now: a `:` or
+  newline in the admin username is refused at render time (`pgpool.admin.username`, schema and
+  template guard) and at boot by the init container for an existing Secret; the username is
+  written to its own file instead of being parsed back out of `pcp.conf`; and the probes tell
+  "PCP is not answering" (still a failure, still a restart after ~60 s) from "pgpool answered
+  and refused the credentials" (pgpool's `authentication failed for user ...`), which
+  leaves both probes passing -- pgpool is alive, and a restart cannot mint a credential -- and
+  is logged once per episode as `[probe] PCP authentication failed ...` in the pgpool
+  container log, with a `[probe] PCP authentication works again` line when it clears. The
+  re-attach loop and both probes now share one PCP prelude (`pg.pgpoolPcpPrelude`). pgpool
+  rolls once on upgrade (Deployment template change).
+- **pgpool readiness now sees an unreachable primary (#374).** The 2.5.0 readiness clause
+  "node 0 is up or waiting" could never be false: node 0 is
+  `ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER`, so pgpool never marks it down, and with the primary
+  gone pgpool stayed Ready and in the Service while every session failed. Readiness now asks
+  backend 0 directly with `pg_isready` (a startup packet: no session, no auth, no reserve slot;
+  rc 0 only, so a primary in crash recovery counts as unavailable), reading its host and port
+  from the rendered `pgpool.conf` (the RW Service in HA, pod 0 in standalone). With the probe's
+  6 failures 10 s apart, an ordinary failover (the agent re-points the RW Service in ~20-40 s)
+  never empties the pgpool endpoints; a primary unreachable for ~60 s does, which is what the
+  README has described since 2.5.0 and is now true.
 - **The standalone postStart hook no longer kills a node whose crash recovery outlasts 300 s
   (#370, #358).** Kubernetes starts no probe until postStart returns and puts no timeout on an
   exec hook, so the hook's fixed 300-iteration wait was the only bound on a standalone start: a

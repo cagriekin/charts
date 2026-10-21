@@ -93,9 +93,12 @@ tests:
           pattern: PCP_PASS=\$\(printf '%s' "\$PCP_ADMIN_PASSWORD"\)[\s\S]*contains a newline[\s\S]*printf '%s' "\$PCP_PASS" \| md5sum[\s\S]*PCP_PASS_ESC=\$\(printf '%s' "\$PCP_PASS"
   # The probes ask pgpool over PCP and open no PostgreSQL session: a session through pgpool
   # leaves a cached backend connection behind, which on a full node comes out of a reserve.
-  # Readiness follows node 0 (the write path) only, so a detached read backend never makes
-  # the proxy unready (#361), and requires a free pgpool child; liveness fails only when PCP
-  # stops answering or every backend is down (#122), never for a merely saturated pgpool.
+  # Readiness asks backend 0 (the write path) directly with pg_isready -- pgpool's own view of
+  # it can never say down (#374) -- so a detached read backend never makes the proxy unready
+  # (#361), and requires a free pgpool child; liveness fails only when PCP stops answering or
+  # every backend is down (#122), never for a merely saturated pgpool. A PCP authentication
+  # fault (the client's exact "authentication failed") is fail-open on both and logged once
+  # (#375); the user comes from its own file, never parsed back out of pcp.conf.
   - it: both probes use PCP and open no PostgreSQL session
     template: templates/pgpool-deployment.yaml
     set:
@@ -103,10 +106,35 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
-          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*\$5 != "" && \$5 != "down" \{ live = 1 \}'
+          pattern: 'PCP_USER=\$\(cat /usr/local/etc/pcp_user\)[\s\S]*pcp_node_info -h 127\.0\.0\.1 -p 9898 -U "\$PCP_USER" -w 2>&1[\s\S]*"authentication failed"[\s\S]*pcp_info; rc=\$\?\n\s*\[ "\$rc" = 2 \] && \{ pcp_auth_note fail; exit 0; \}\n\s*\[ "\$rc" = 0 \] \|\| exit 1\n\s*pcp_auth_note ok\n[\s\S]*\$5 != "" && \$5 != "down" \{ live = 1 \}'
       - matchRegex:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
-          pattern: 'PCPPASSFILE=/usr/local/etc/\.pcppass pcp_node_info -h 127\.0\.0\.1 -p 9898[\s\S]*NR == 1 \{ exit !\(\$5 == "up" \|\| \$5 == "waiting"\) \}[\s\S]*pcp_proc_info -h 127\.0\.0\.1 -p 9898 [^\n]* -w -a -v\) \|\| exit 1\n.*grep -q .\^Status \*: Wait for connection.'
+          pattern: 'PCP_USER=\$\(cat /usr/local/etc/pcp_user\)[\s\S]*pcp_info; rc=\$\?\n\s*\[ "\$rc" = 2 \] && \{ pcp_auth_note fail; exit 0; \}[\s\S]*backend_hostname0[\s\S]*backend_port0[\s\S]*pg_isready -h "\$host" -p "\$port" -t 3 -q \|\| exit 1\n\s*procs=\$\(pcp_proc_info -h 127\.0\.0\.1 -p 9898 -U "\$PCP_USER" -w -a -v\) \|\| exit 1\n.*grep -q .\^Status \*: Wait for connection.'
+      # #374: the never-false "node 0 is up or waiting" clause is gone.
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: 'NR == 1'
+      # #375: nothing parses the user back out of pcp.conf (a ':' in it truncated the user).
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: 'cut -d: -f1'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: 'cut -d: -f1'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'cut -d: -f1'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'PCP_USER=\$\(cat /usr/local/etc/pcp_user\)[\s\S]*if pcp_info; then'
+      # Liveness never asks the backend: a down primary is a readiness matter.
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: pg_isready
+      # #375: the init container refuses a ':' in the user and writes it to its own file.
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: 'case "\$PCP_USER" in \*:\*\|\*"\$nl"\*\)[\s\S]*contains .:. or a newline[\s\S]*printf .%s\\n. "\$PCP_USER" > /usr/local/etc/pcp_user\n\s*chmod 0600 /usr/local/etc/pcp_user'
       - notMatchRegex:
           path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
           pattern: psql

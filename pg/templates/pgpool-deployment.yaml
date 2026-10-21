@@ -1,4 +1,5 @@
 {{- include "pg.validatePgpoolReattach" . -}}
+{{- include "pg.validatePgpoolAdminUsername" . -}}
 {{- if .Values.pgpool.enabled }}
 {{- /* Removed in favor of pgpool.admin.*; fail instead of silently falling
        back to the chart defaults when stale values are still set. */}}
@@ -115,13 +116,26 @@ spec:
               case "$PCP_PASS" in *"$nl"*)
                 echo "pgpool admin password contains a newline, which the PCP tools cannot carry; remove it from the admin Secret (pgpool.admin / pgpool.admin.existingSecret)" >&2; exit 1;;
               esac
-              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_PASS" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # The username is held to the same format (#375): pgpool splits each pcp.conf
+              # line at the FIRST ':', so a user containing one can never authenticate -- and
+              # since the probes authenticate over PCP, that used to restart pgpool in a loop
+              # on every replica. The chart-managed value is refused at render time
+              # (pg.validatePgpoolAdminUsername); an existing Secret is only visible here.
+              PCP_USER=$(printf '%s' "$PCP_ADMIN_USER")
+              case "$PCP_USER" in *:*|*"$nl"*)
+                echo "pgpool admin username contains ':' or a newline, which pcp.conf (user:md5 per line, split at the first ':') cannot carry, so no PCP client could authenticate as it; choose another username (pgpool.admin.username, or the usernameKey of pgpool.admin.existingSecret)" >&2; exit 1;;
+              esac
+              printf '%s:%s\n' "$PCP_USER" "$(printf '%s' "$PCP_PASS" | md5sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
+              # The username on its own, for the re-attach loop and the probes
+              # (pg.pgpoolPcpPrelude): nothing parses pcp.conf back.
+              printf '%s\n' "$PCP_USER" > /usr/local/etc/pcp_user
+              chmod 0600 /usr/local/etc/pcp_user
               # .pcppass for the re-attach loop in the pgpool container (#361): the pcp_*
               # tools read it through PCPPASSFILE, 0600 like libpq's pgpass. It lives in
               # the emptyDir beside pcp.conf, so the PCP password never enters the pgpool
               # container's environment. Same escaping as pgpass: \ -> \\, : -> \:
               PCP_PASS_ESC=$(printf '%s' "$PCP_PASS" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              PCP_USER_ESC=$(printf '%s' "$PCP_ADMIN_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              PCP_USER_ESC=$(printf '%s' "$PCP_USER" | sed -e 's/\\/\\\\/g')
               printf '127.0.0.1:9898:%s:%s\n' "$PCP_USER_ESC" "$PCP_PASS_ESC" > /usr/local/etc/.pcppass
               chmod 0600 /usr/local/etc/.pcppass
               # Byte-safe placeholder splice: sed replacement corrupts
@@ -325,14 +339,13 @@ spec:
               # the exec) never has to reap it. pgpool.command replaces this whole block;
               # pg.validatePgpoolReattach refuses that pairing at render time.
               (
-                PCPPASSFILE=/usr/local/etc/.pcppass; export PCPPASSFILE
-                PCP_USER=$(cut -d: -f1 /usr/local/etc/pcp.conf)
+                {{- include "pg.pgpoolPcpPrelude" . | nindent 16 }}
                 pcp_ok=1
                 sleep 15
                 while :; do
                   # One PCP call lists every backend, one per line:
                   #   hostname port status weight status_name backend_status role ...
-                  if info=$(pcp_node_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then
+                  if pcp_info; then
                     [ "$pcp_ok" = 1 ] || echo "[reattach] PCP answers again"
                     pcp_ok=1
                     printf '%s\n' "$info" | awk '$5 == "down" { print NR - 1, $1, $2 }' | while read -r idx host port; do
@@ -345,8 +358,9 @@ spec:
                     # Once per episode, not every pass. Silent failure here would leave a
                     # detached backend detached for good with nothing in the log: the
                     # liveness probe is pinned to the primary and no longer restarts pgpool
-                    # over a missing read backend. Causes seen: an unreadable .pcppass, a
-                    # PCP user with ':' in it, an image without the pcp tools.
+                    # over a missing read backend. Causes seen: an unreadable .pcppass, an
+                    # image without the pcp tools (a PCP user with ':' in it is refused at
+                    # boot since #375).
                     echo "[reattach] pcp_node_info failed; nothing will be re-attached until this clears: $info"
                     pcp_ok=0
                   fi
@@ -386,22 +400,45 @@ spec:
           # Liveness: PCP answers and at least one backend is not down. That still catches
           # the #122 wedge -- a pgpool that accepts TCP but rejects every session with "all
           # backend nodes are down" -- and restarts it with a fresh status file.
-          # Readiness: PCP answers, node 0 -- the primary, the write path -- is up or
-          # waiting, and at least one pgpool child is free ("Wait for connection" in
+          # Readiness: PCP answers, backend 0 -- the primary, the write path -- answers
+          # pg_isready, and at least one pgpool child is free ("Wait for connection" in
           # pcp_proc_info -a -v). A read backend that is detached or lagging must not make the
           # proxy unready (#361); the re-attach loop brings it back. The free-child check is
           # the part of the old session probe worth keeping: with every child busy or hung,
           # new sessions queue until they time out, so the pod should leave the Service
           # (readiness only -- liveness does not restart a pgpool that is merely saturated).
-          # "Idle" is a child still holding a connected client, so it does not count. The PCP
-          # credentials are the .pcppass init-config writes for the re-attach loop.
+          # "Idle" is a child still holding a connected client, so it does not count.
+          #
+          # Backend 0 is asked DIRECTLY (#374), because pgpool's own view of it can never say
+          # down: it is ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER (pgpool.conf), so a failed health
+          # check never detaches it and the "node 0 is up or waiting" clause this replaced was
+          # true with the primary unreachable, leaving pgpool Ready while every session failed.
+          # pg_isready sends a startup packet and reads the answer -- no session, no auth, no
+          # reserve slot -- and rc 0 only: a primary in crash recovery (rc 1) takes no writes.
+          # Its host and port come from the rendered pgpool.conf (the RW Service in HA, pod 0
+          # in standalone), so the probe and pgpool agree on what backend 0 is. Failover
+          # interaction: the agent re-points the RW Service within a lease term plus the
+          # promote (~20-40s on chart defaults) while readiness needs 6 failures 10s apart,
+          # so an ordinary failover never empties the pgpool endpoints; a primary gone for
+          # 60s+ does, which is the behaviour the README describes.
+          #
+          # A PCP AUTHENTICATION fault is fail-open on both probes (#375). pgpool answered, so
+          # it is alive, and a restart cannot mint credentials: before #365 the same fault only
+          # stalled the re-attach loop, while here it restarted every replica in a loop and
+          # took the pooled endpoint down. The episode is logged once to the container log
+          # (pcp_auth_note); the one known cause, a ':' in the admin username, is refused at
+          # render time and at boot. PCP not answering at all still fails both probes.
           livenessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
                 - |
-                  info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w) || exit 1
+                  {{- include "pg.pgpoolPcpPrelude" . | nindent 18 }}
+                  pcp_info; rc=$?
+                  [ "$rc" = 2 ] && { pcp_auth_note fail; exit 0; }
+                  [ "$rc" = 0 ] || exit 1
+                  pcp_auth_note ok
                   printf '%s\n' "$info" | awk '$5 != "" && $5 != "down" { live = 1 } END { exit !live }'
             initialDelaySeconds: 30
             periodSeconds: 10
@@ -413,9 +450,16 @@ spec:
                 - /bin/sh
                 - -c
                 - |
-                  info=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_node_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w) || exit 1
-                  printf '%s\n' "$info" | awk 'NR == 1 { exit !($5 == "up" || $5 == "waiting") } END { if (NR == 0) exit 1 }' || exit 1
-                  procs=$(PCPPASSFILE=/usr/local/etc/.pcppass pcp_proc_info -h 127.0.0.1 -p 9898 -U "$(cut -d: -f1 /usr/local/etc/pcp.conf)" -w -a -v) || exit 1
+                  {{- include "pg.pgpoolPcpPrelude" . | nindent 18 }}
+                  pcp_info; rc=$?
+                  [ "$rc" = 2 ] && { pcp_auth_note fail; exit 0; }
+                  [ "$rc" = 0 ] || exit 1
+                  pcp_auth_note ok
+                  host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
+                  port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+                  [ -n "$host" ] && [ -n "$port" ] || exit 1
+                  pg_isready -h "$host" -p "$port" -t 3 -q || exit 1
+                  procs=$(pcp_proc_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -a -v) || exit 1
                   printf '%s\n' "$procs" | grep -q '^Status *: Wait for connection'
             initialDelaySeconds: 5
             periodSeconds: 10
