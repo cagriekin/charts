@@ -4,6 +4,9 @@
 
 ### Changed
 
+- **pg-ha image 2.4.0 builds the agent with Go 1.26.10**, fixing GO-2026-6809 (crypto/x509
+  certificate verification), which `govulncheck` reports as reachable from the agent's TLS
+  paths. No behaviour change.
 - **pg-ha image 2.3.0: the agent's writes run on a connection of their own (#371).** The
   transport introduced in 2.5.0 kept one session per node and ran every statement on it,
   serialised. Statements that change state -- `CHECKPOINT` for the durable-timeline repair,
