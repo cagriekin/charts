@@ -64,53 +64,37 @@ func scrubSCRAM(s string) string {
 
 // rehashSQL re-hashes one managed user's password from md5 to scram-sha-256 when it
 // is still stored as md5 (PG14+ only -- md5->scram pg_hba auto-promotion exists from
-// 14). Idempotent: a no-op once the password is already scram.
+// 14). Idempotent: a no-op once the password is already scram, and on PG < 14.
 //
-// What crosses the wire is a SCRAM VERIFIER, never the plaintext (#298 review). The
-// previous form sent the password as a SQL literal via `SET myvars.tgt_pass = :'tgt_pass'`,
-// which kept it off argv but not out of the SERVER LOG: a top-level SET is logged verbatim
-// under log_statement = 'all' or log_min_duration_statement = 0, so any cluster with
-// statement logging on recorded the superuser and replication passwords in cleartext and
-// then shipped them wherever its logs go. PostgreSQL stores a well-formed
-// `SCRAM-SHA-256$...` string in ALTER USER ... PASSWORD verbatim rather than re-hashing it,
-// so hashing in Go (see ScramVerifier) produces exactly the secret the server would have
-// produced itself.
+// What crosses the wire is a SCRAM VERIFIER, never the plaintext (#298 review). An earlier
+// form sent the password as a SQL literal via `SET myvars.tgt_pass = :'tgt_pass'`, which kept
+// it off argv but not out of the SERVER LOG under log_statement = 'all'; the next form hoisted
+// the verifier into a session GUC after lowering log_statement, which pgaudit then logged
+// verbatim under its misc, misc_set and all classes (#369). Now no SET carries a secret at
+// all: the md5 gate runs client-side (a SELECT naming only the user, folded into a psql
+// variable with \gset), and the verifier appears in exactly one statement, a top-level
+// `ALTER USER ... WITH PASSWORD`, which pgaudit redacts in every class (`PASSWORD
+// <REDACTED>`). PostgreSQL stores a well-formed `SCRAM-SHA-256$...` string verbatim rather
+// than re-hashing it, so hashing in Go (see ScramVerifier) produces exactly the secret the
+// server would have produced itself, and password_encryption plays no part.
 //
 // The log-suppression SETs come FIRST, before anything carrying the verifier, and they are
 // defence in depth rather than the fix: a verifier still permits an offline dictionary
-// attack, and password_encryption is not the only GUC an operator can change under us.
-// Ordering matters -- a SET issued before log_statement is lowered is logged under the old
-// value, so the sequence here is not cosmetic.
+// attack. Ordering matters -- a statement issued before log_statement is lowered is logged
+// under the old value, so the sequence here is not cosmetic.
 //
-// The username arrives as the psql var :'u'; the verifier via \getenv from
-// REHASH_TGT_SECRET (kept off argv). Both are hoisted into per-session GUCs and read back
-// inside the DO block via current_setting() (a DO block cannot see psql vars directly), and
-// format(%I,%L) quotes the identifier + literal safely. Derived from the chart's former
-// postStart fix_user_auth (#199); the md5 gate and idempotence are unchanged.
+// The username arrives as the psql var :'u' / :"u"; the verifier via \getenv from
+// REHASH_TGT_SECRET (kept off argv), quoted by psql's :'var' interpolation. Derived from the
+// chart's former postStart fix_user_auth (#199); the md5 gate and idempotence are unchanged.
 const rehashSQL = `\getenv tgt_secret REHASH_TGT_SECRET
 SET log_statement = 'none';
 SET log_min_duration_statement = -1;
 SET log_min_error_statement = 'panic';
-SET myvars.tgt_user = :'u';
-SET myvars.tgt_secret = :'tgt_secret';
-DO $$
-DECLARE
-  v_user TEXT := current_setting('myvars.tgt_user');
-  v_secret TEXT := current_setting('myvars.tgt_secret');
-BEGIN
-  IF current_setting('server_version_num')::int < 140000 THEN
-    RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
-    RETURN;
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM pg_authid WHERE rolname = v_user AND rolpassword LIKE 'md5%'
-  ) THEN
-    -- v_secret is already a SCRAM-SHA-256 verifier, which PostgreSQL stores verbatim
-    -- without consulting the encryption GUC, so this path sets no encryption at all.
-    EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_secret);
-  END IF;
-END
-$$;`
+SELECT current_setting('server_version_num')::int >= 140000
+       AND EXISTS (SELECT 1 FROM pg_authid WHERE rolname = :'u' AND rolpassword LIKE 'md5%') AS needs_rehash \gset
+\if :needs_rehash
+ALTER USER :"u" WITH PASSWORD :'tgt_secret';
+\endif`
 
 // RehashMd5User re-hashes targetUser's password to scram-sha-256 if it is still stored
 // as md5. It connects as superUser over the LOCAL socket (the agent's pg_hba

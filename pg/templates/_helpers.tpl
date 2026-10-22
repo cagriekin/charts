@@ -2058,6 +2058,58 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- end -}}
 
+{{- /*
+pg.managedRoleDO -- the DO block that creates and converges one chart-managed role (#372).
+BYTE-IDENTICAL to managedRoleDO in images/pg-ha/agent/internal/pg/roles.go, which the agent
+runs in HA mode; the standalone postStart hook includes this one twice (app role, pgpool
+check role). pg/tests/test-template.sh compares the two whole blocks, so a change to either
+copy fails the render tests until the other follows. It reads the role's name, kind and
+database from session GUCs (myvars.role_name / role_kind / role_db) and carries NO password:
+each caller sets that with one top-level `ALTER ROLE ... WITH PASSWORD`, the one statement
+pgaudit redacts in every class (#369). Comments on the logic live beside the Go copy.
+*/ -}}
+{{- define "pg.managedRoleDO" -}}
+DO $$
+DECLARE
+  v_name TEXT := current_setting('myvars.role_name');
+  v_kind TEXT := current_setting('myvars.role_kind');
+  v_db TEXT := current_setting('myvars.role_db');
+  v_marker TEXT := 'managed by the pg chart';
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_name) THEN
+    EXECUTE format('CREATE ROLE %I', v_name);
+    EXECUTE format('COMMENT ON ROLE %I IS %L', v_name, v_marker);
+  ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = v_name), 'pg_authid') IS DISTINCT FROM v_marker THEN
+    RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(v_name), quote_ident(v_name), quote_literal(v_marker);
+  END IF;
+  EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', v_name);
+  IF v_kind = 'pgpool-check' THEN
+    EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
+    IF v_db = 'postgres' AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public')
+       AND has_schema_privilege(v_name, 'public', 'CREATE') THEN
+      EXECUTE format('REVOKE CREATE ON SCHEMA public FROM %I', v_name);
+    END IF;
+  ELSIF v_kind = 'app' THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+               WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = v_name)
+                 AND g.rolname IN ('pg_monitor', 'pg_use_reserved_connections')) THEN
+      EXECUTE format('REVOKE pg_monitor, pg_use_reserved_connections FROM %I', v_name);
+    END IF;
+    IF v_db = 'postgres' THEN
+      EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', v_db, v_name);
+      IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN
+        EXECUTE format('GRANT USAGE, CREATE ON SCHEMA public TO %I', v_name);
+      END IF;
+    ELSE
+      EXECUTE format('ALTER DATABASE %I OWNER TO %I', v_db, v_name);
+    END IF;
+  ELSE
+    RAISE EXCEPTION 'unknown managed role kind %', v_kind;
+  END IF;
+END
+$$;
+{{- end -}}
+
 {{- define "pg.validatePgpoolAdminUsername" -}}
 {{- /* pcp.conf is `user:md5(password)` and pgpool splits each line at the FIRST ':', so a PCP
        admin username containing ':' can never authenticate -- and since #365 the probes

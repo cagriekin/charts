@@ -1817,27 +1817,42 @@ assert_not_contains "#298: ...in the same awk pass, not a pre-pass that can drop
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
-# The standalone postStart hook provisions the managed roles with its own copy of the SQL the
-# agent runs in HA mode (pg.EnsureRole, images/pg-ha/agent/internal/pg/roles.go): the image and
-# the chart cannot share one file. Every dynamic statement must appear in both, in both
-# directions, so the two definitions of a managed role cannot drift apart.
+# The standalone postStart hook provisions the managed roles with the SAME DO block the agent
+# runs in HA mode (#372): pg.managedRoleDO in _helpers.tpl is byte-identical to managedRoleDO in
+# images/pg-ha/agent/internal/pg/roles.go (the image and the chart cannot share one file). The
+# whole block is compared, indentation stripped, in both directions -- not a list of needles --
+# so nothing inside it can drift: a new privilege, a new guard, a changed message.
 roles_go="$(cd "${SCRIPT_DIR}/../.." && pwd)/images/pg-ha/agent/internal/pg/roles.go"
 standalone_hook=$(helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
   --show-only templates/statefulset.yaml 2>&1)
+# do_block <text> -> the first `DO $$` ... `$$;` block, leading whitespace stripped.
+# In roles.go the block is a Go raw string: the `const ... = \`` prefix and the closing backtick
+# are stripped first so the same extraction reads both texts.
+do_block() { sed -e 's/^const managedRoleDO = `//' -e 's/`$//' -e 's/^[[:space:]]*//' | sed -n '/^DO \$\$$/,/^\$\$;$/p' | sed -n '1,/^\$\$;$/p'; }
+agent_do=$(do_block < "${roles_go}")
+hook_do=$(do_block <<< "${standalone_hook}")
+assert_gt "managed roles: roles.go has a DO block to compare" "$(grep -c . <<< "${agent_do}")" "20"
+assert_eq "managed roles (#372): the standalone hook runs byte-for-byte the agent's DO block" "${agent_do}" "${hook_do}"
+assert_eq "managed roles (#372): the hook includes the block once per role (2)" "2" "$(grep -c "v_marker TEXT := 'managed by the pg chart';" <<< "${standalone_hook}")"
+assert_eq "managed roles (#372): roles.go holds the block once" "1" "$(grep -c "v_marker TEXT := 'managed by the pg chart';" "${roles_go}")"
+# The format('...') statement set is a cheaper second signal of the same invariant.
 agent_formats=$(grep -o "format('[^']*'" "${roles_go}" | sort -u)
 hook_formats=$(grep -o "format('[^']*'" <<< "${standalone_hook}" | sort -u)
-assert_gt "managed roles: roles.go has dynamic statements to compare" "$(grep -c . <<< "${agent_formats}")" "5"
 assert_eq "managed roles: the standalone hook runs exactly the agent's role statements" "${agent_formats}" "${hook_formats}"
-assert_contains "managed roles: the hook guards the public-schema grant like the agent" "${standalone_hook}" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
-assert_contains "managed roles: roles.go guards the public-schema grant" "$(cat "${roles_go}")" "IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public') THEN"
-# The ownership marker and the refusal of an unmarked same-named role must match too.
-for needle in "v_marker TEXT := 'managed by the pg chart';" \
-  "SET pg_stat_statements.track = 'none';" \
-  "SET pg_stat_statements.track_utility = off;" \
-  "RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %'"; do
-  assert_contains "managed roles: roles.go carries: ${needle:0:60}" "$(cat "${roles_go}")" "${needle}"
-  assert_contains "managed roles: the hook carries: ${needle:0:60}" "${standalone_hook}" "${needle}"
-done
+# #369: no SET carries a secret in either copy -- pgaudit logs a SET verbatim under misc, misc_set
+# and all -- and the password appears only in a top-level ALTER ROLE after the block, which
+# pgaudit redacts in every class. One such statement per role.
+assert_eq "managed roles (#369): roles.go hoists no secret into a session GUC" "0" "$(grep -cE "^SET myvars\.[a-z_]*(secret|pw|pass)" "${roles_go}" || true)"
+assert_eq "managed roles (#369): the hook hoists no secret into a session GUC" "0" "$(grep -cE "^[[:space:]]*SET myvars\.[a-z_]*(secret|pw|pass)" <<< "${standalone_hook}" || true)"
+assert_not_contains "managed roles (#369): the shared DO block carries no password" "${agent_do}" "PASSWORD"
+assert_eq "managed roles (#369): roles.go sets the password with one top-level ALTER ROLE" "1" "$(grep -c "^ALTER ROLE :\"r\" WITH PASSWORD :'role_secret';" "${roles_go}")"
+assert_eq "managed roles (#369): the hook sets each password with one top-level ALTER ROLE" "2" "$(grep -cE "^[[:space:]]*ALTER ROLE :\"r_(app|check)\" WITH PASSWORD :'(app|check)_pw';" <<< "${standalone_hook}")"
+hook_sql=$(sed -n "/<<'SQL'$/,/^[[:space:]]*SQL$/p" <<< "${standalone_hook}")
+assert_eq "managed roles (#369): the hook lowers statement logging before any password travels" "1" "$(awk '/SET log_statement = .none./{l=NR} /WITH PASSWORD :/{if(!l||NR<l) bad=1} END{print bad?0:1}' <<< "${hook_sql}")"
+# The agent's md5->scram rehash (#298) is held to the same rule.
+rehash_go="$(cd "${SCRIPT_DIR}/../.." && pwd)/images/pg-ha/agent/internal/pg/rehash.go"
+assert_eq "rehash (#369): rehash.go hoists no secret into a session GUC" "0" "$(grep -cE "^SET myvars\." "${rehash_go}" || true)"
+assert_contains "rehash (#369): the verifier travels in one top-level ALTER USER" "$(cat "${rehash_go}")" "ALTER USER :\"u\" WITH PASSWORD :'tgt_secret';"
 
 # reserved_connections needs a PostgreSQL restart, so it is pgpool.reservedConnections, not a
 # function of pgpool.replicaCount: scaling pgpool within it must not change the PostgreSQL

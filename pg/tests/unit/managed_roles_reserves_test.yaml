@@ -309,7 +309,15 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
-          pattern: '\\getenv app_pw APP_PASSWORD[\s\S]*SET log_statement = ''none''[\s\S]*SET myvars\.app_pw[\s\S]*ALTER ROLE %I WITH LOGIN NOSUPERUSER[\s\S]*GRANT pg_monitor, pg_use_reserved_connections[\s\S]*ALTER DATABASE %I OWNER TO %I'
+          pattern: '\\getenv app_pw APP_PASSWORD[\s\S]*SET log_statement = ''none''[\s\S]*SET myvars\.role_name = :''r_app'';\n\s*SET myvars\.role_kind = ''app'';[\s\S]*ALTER ROLE %I WITH LOGIN NOSUPERUSER[\s\S]*GRANT pg_monitor, pg_use_reserved_connections[\s\S]*ALTER DATABASE %I OWNER TO %I[\s\S]*\$\$;\n\s*ALTER ROLE :"r_app" WITH PASSWORD :''app_pw'';\n\s*SET myvars\.role_name = :''r_check'';\n\s*SET myvars\.role_kind = ''pgpool-check'';[\s\S]*\$\$;\n\s*ALTER ROLE :"r_check" WITH PASSWORD :''check_pw'';'
+      # #369: no SET carries a password (pgaudit logs SET verbatim under misc/misc_set/all);
+      # the DO block carries none either, and PASSWORD appears only in the two top-level ALTERs.
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'SET myvars\.\w*(pw|secret|pass)'
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
+          pattern: 'PASSWORD %L'
 
   # --- pgpool uses the check role and knows both new logins ---
   - it: pgpool's checks log in as the check role, not the superuser
@@ -356,7 +364,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.containers[0].lifecycle.postStart.exec.command[2]
-          pattern: "REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?IF current_setting\\('myvars\\.db'\\) = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
+          pattern: "REVOKE pg_monitor, pg_use_reserved_connections FROM %I[\\s\\S]*?IF v_db = 'postgres' THEN\\s+EXECUTE format\\('GRANT CONNECT ON DATABASE %I TO %I'[\\s\\S]*GRANT USAGE, CREATE ON SCHEMA public TO %I[\\s\\S]*ELSE\\s+EXECUTE format\\('ALTER DATABASE %I OWNER TO %I'"
 
   # --- existingSecret must carry the managed roles' keys; checked when lookup can see it ---
   - it: an existingSecret without the managed roles' keys is refused at render

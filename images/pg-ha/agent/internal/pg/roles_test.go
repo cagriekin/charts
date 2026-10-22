@@ -3,6 +3,7 @@ package pg
 import (
 	"context"
 	"errors"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -45,7 +46,7 @@ func TestEnsureRoleSQL(t *testing.T) {
 	for _, want := range []string{
 		`\set VERBOSITY terse`,
 		"CREATE ROLE %I",
-		"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L",
+		"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'",
 		"GRANT pg_monitor, pg_use_reserved_connections TO %I",
 		"ALTER DATABASE %I OWNER TO %I",
 		"ELSIF v_kind = 'app' THEN",
@@ -66,10 +67,34 @@ func TestEnsureRoleSQL(t *testing.T) {
 			t.Errorf("SQL missing %q", want)
 		}
 	}
+	// #369: the verifier appears in exactly one statement -- the top-level ALTER ROLE, which
+	// pgaudit redacts in every class -- never in a SET (logged verbatim under misc/misc_set/all)
+	// and never inside the DO block (shared verbatim with the standalone hook, #372).
 	iLog := strings.Index(ensureRoleSQL, "SET log_statement = 'none';")
-	iSecret := strings.Index(ensureRoleSQL, "myvars.role_secret = :'role_secret'")
-	if iLog < 0 || iSecret < 0 || iLog > iSecret {
-		t.Errorf("log suppression must precede the verifier-bearing SET")
+	iDOEnd := strings.Index(ensureRoleSQL, "$$;")
+	iAlter := strings.Index(ensureRoleSQL, `ALTER ROLE :"r" WITH PASSWORD :'role_secret';`)
+	if iLog < 0 || iDOEnd < 0 || iAlter < 0 || iLog > iDOEnd || iDOEnd > iAlter {
+		t.Errorf("want log suppression, then the DO block, then the one password-bearing ALTER ROLE (log %d, DO end %d, alter %d)", iLog, iDOEnd, iAlter)
+	}
+	if n := strings.Count(ensureRoleSQL, "PASSWORD"); n != 1 {
+		t.Errorf("PASSWORD must appear exactly once (the top-level ALTER ROLE), got %d", n)
+	}
+	if strings.Contains(managedRoleDO, "PASSWORD") || strings.Contains(managedRoleDO, "secret") {
+		t.Errorf("the shared DO block must carry no password:\n%s", managedRoleDO)
+	}
+	if !strings.HasPrefix(managedRoleDO, "DO $$\n") || !strings.HasSuffix(managedRoleDO, "\n$$;") {
+		t.Errorf("managedRoleDO must be exactly the DO block, for the chart-side comparison")
+	}
+}
+
+// #369: no SET may ever carry a secret again, in either of the two scripts that send one.
+// pgaudit logs SET verbatim under misc, misc_set and all; CREATE/ALTER ROLE it redacts.
+func TestManagedRoleSQLCarriesNoSecretSET(t *testing.T) {
+	re := regexp.MustCompile(`(?mi)^SET myvars\.\w*(secret|pass|pw)\b`)
+	for name, sql := range map[string]string{"ensureRoleSQL": ensureRoleSQL, "rehashSQL": rehashSQL} {
+		if m := re.FindString(sql); m != "" {
+			t.Errorf("%s hoists a secret into a session GUC (%q), which pgaudit logs in full", name, m)
+		}
 	}
 }
 

@@ -130,5 +130,16 @@ assert_eq "superuser_reserved_connections comes from the chart's reserved-connec
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
 assert_eq "work_mem reverted to default after disable" "4MB" "${work_mem}"
 
+# --- #369: with log_statement=all the standalone hook's managed-role passwords never log ---
+# The hook sends the plaintext to the server (password_encryption hashes it); it must appear in
+# no logged statement: the hook lowers log_statement first and the password rides only in an
+# ALTER ROLE, never in a SET. The fixture's log_statement=all is the strongest setting there is.
+app_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.app-password}' | base64 -d)
+chk_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.pgpool-check-password}' | base64 -d)
+pod_log=$(kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql 2>/dev/null || true)
+assert_eq "#369: no plaintext managed-role password in the standalone log under log_statement=all" "0" "$(( $(grep -cF -- "${app_pw}" <<< "${pod_log}" || true) + $(grep -cF -- "${chk_pw}" <<< "${pod_log}" || true) ))"
+assert_eq "#369: no secret-bearing SET in the standalone log" "0" "$(grep -c "SET myvars\.[a-z_]*\(secret\|pw\)" <<< "${pod_log}" || true)"
+assert_contains "#369: the hook provisioned the managed roles on this start" "${pod_log}" "postStart: real server up on 127.0.0.1 after [0-9]*s; applied: .*managed roles app_user, pgpool_check"
+
 end_suite
 print_summary
