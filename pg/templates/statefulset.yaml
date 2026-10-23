@@ -1260,12 +1260,15 @@ spec:
                            only through the environment (\getenv) and psql's :'var' quoting; statement
                            logging and pg_stat_statements tracking are turned off before they are
                            sent, password_encryption pins the stored form, and VERBOSITY terse keeps
-                           a failing statement out of psql's CONTEXT. A failure fails the hook: the
+                           a failing statement out of psql's CONTEXT. -1 (single transaction) keeps
+                           the old all-or-nothing shape now that each role is a DO block plus a
+                           separate ALTER ROLE: a role is never committed without its password, and
+                           a refused second role rolls the first back. A failure fails the hook: the
                            kubelet restarts the container and records the message in a
                            FailedPostStartHook event, where it is visible, instead of pgpool
                            waiting forever on a role that was never created. The gate above
                            guarantees this runs against the real server. */}}
-                    if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 \
+                    if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q --no-psqlrc -v ON_ERROR_STOP=1 -1 \
                          -v r_app="$APP_USER" -v r_check="$PGPOOL_CHECK_USER" -v d="$POSTGRES_DB" <<'SQL'
                     \set VERBOSITY terse
                     \getenv app_pw APP_PASSWORD

@@ -382,7 +382,10 @@ assert_eq "#369: no secret-bearing SET reached pgaudit" "0" "${leak_s}"
 # container's APP_USER env; the password the Secret's app-password key). Over TCP, so pg_hba's
 # scram line is what answers, not the local trust socket.
 P369=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}')
-app_ok=$(kubectl exec -n "${NAMESPACE}" "${P369}" -c postgresql -- sh -c "PGPASSWORD='${app_pw}' psql -h 127.0.0.1 -U \"\$APP_USER\" -d testdb -tAc 'SELECT 1'" 2>/dev/null | xargs || echo "")
+# env PGPASSWORD=..., not sh -c re-quoting: a generated password holding ' or $ must not
+# break the command (same shape as run_as in test-databases-roles.sh).
+app_ok=$(kubectl exec -n "${NAMESPACE}" "${P369}" -c postgresql -- \
+  env PGPASSWORD="${app_pw}" psql -h 127.0.0.1 -U app_user -d testdb -tAc 'SELECT 1' 2>/dev/null | xargs || echo "")
 assert_eq "#369: the app role still authenticates with the Secret's password" "1" "${app_ok}"
 
 end_suite

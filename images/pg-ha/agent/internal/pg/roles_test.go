@@ -15,7 +15,7 @@ func TestEnsureRoleInvocation(t *testing.T) {
 			t.Fatalf("%s: %v", kind, err)
 		}
 		argline := strings.Join(f.args, " ")
-		for _, want := range []string{"-U postgres", "-d appdb", "ON_ERROR_STOP=1", "r=app", "k=" + string(kind), "d=appdb", "--no-psqlrc"} {
+		for _, want := range []string{"-U postgres", "-d appdb", "ON_ERROR_STOP=1", "-1", "r=app", "k=" + string(kind), "d=appdb", "--no-psqlrc"} {
 			if !strings.Contains(argline, want) {
 				t.Errorf("%s: args missing %q: %v", kind, want, f.args)
 			}

@@ -136,6 +136,11 @@ func EnsureRole(ctx context.Context, ex StdinExec, superUser, db string, r Manag
 		ensureRoleSQL, "psql",
 		"-U", superUser, "-d", db,
 		"-v", "ON_ERROR_STOP=1",
+		// -1: the DO block and the password-bearing ALTER ROLE are separate statements
+		// since #369; one transaction keeps a role from ever being committed without its
+		// password (a cancelled psql between the two would otherwise leave a LOGIN role
+		// with none until the next tick).
+		"-1",
 		"-v", "r="+r.Name,
 		"-v", "k="+string(r.Kind),
 		"-v", "d="+db,
