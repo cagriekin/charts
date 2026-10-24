@@ -195,12 +195,7 @@ data:
     host    all         all         127.0.0.1/32          trust
     host    all         all         ::1/128               trust
     host    all         all         0.0.0.0/0             md5
-
-  pool_passwd: |
-    {{- /* TEXT marks the entry as cleartext: unprefixed entries are taken
-           as md5 hashes, which work against md5 backends by accident but
-           cannot answer scram challenges */}}
-    __POSTGRES_USER__:TEXT__POSTGRES_PASSWORD__
-    __CHECK_USER__:TEXT__CHECK_PASSWORD__
-    __APP_USER__:TEXT__APP_PASSWORD__
+{{- /* pool_passwd is not a ConfigMap key: it is rendered from the release Secret's files by
+       pg.pgpoolPoolPasswdFns, at boot by init-config and on every change by the
+       password-sync loop in the pgpool container (#366). */}}
 {{- end }}

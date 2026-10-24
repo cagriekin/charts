@@ -2169,6 +2169,61 @@ pcp_auth_note() {
 }
 {{- end -}}
 
+{{- /* pool_passwd helpers (#366), shared verbatim by pgpool's init-config container (first
+  render, busybox) and the password-sync loop in the pgpool container (every change, the
+  pgpool image): one rendering of the file, one escaping, nothing to drift. Both read the
+  release Secret as FILES, mounted at /etc/pg-secret, where the kubelet keeps them current
+  (a projected Secret volume is refreshed; env and subPath mounts never are), instead of
+  the env snapshot the init container used to splice into a ConfigMap template.
+
+  pool_passwd_esc escapes a value for pool_passwd: backslash first, then the field separator
+  (\ -> \\, : -> \:). TEXT marks an entry as cleartext: an unprefixed entry is taken as an
+  md5 hash, which works against an md5 backend by accident but cannot answer a scram
+  challenge. $(...) drops a trailing newline, as it did from the env.
+
+  pool_passwd_render <dir> prints the three pooled roles -- the superuser (username/password
+  of the Secret), pgpool's check role and the application role -- from <dir>: the Secret
+  mount at first boot, or the loop's "applied" copy afterwards (see the loop for why).
+
+  pool_passwd_write <dir> <file> renders <dir> over <file> IN PLACE, on the same inode, and
+  that is the whole trick. pgpool opens pool_passwd once at startup and every lookup --
+  frontend auth, backend auth, the health and streaming checks -- rewinds that open
+  descriptor and rescans the file (src/auth/pool_passwd.c, pool_get_passwd); the children
+  inherit the descriptor at fork, and a reload (SIGHUP, pcp_reload_config) re-reads
+  pgpool.conf and pool_hba.conf but never reopens pool_passwd. So a file renamed over it is
+  invisible for the life of the process, while bytes written through the same inode are
+  seen by every process on its next lookup, with no reload and no restart. The write avoids
+  the truncate-then-write gap (a lookup landing in it would read an empty file and fail an
+  authentication): `1<>` opens the file read-write WITHOUT truncation and cat writes the new
+  content from offset 0 in one write(2) for anything this small, then the tail of the old
+  content, if the new one is shorter, is cut off. A lookup between those two steps sees the
+  new entries followed by a fragment of the old file: pgpool returns the FIRST matching
+  user, so the fragment can never win, and a partial line matches no user at all.
+*/ -}}
+{{- define "pg.pgpoolPoolPasswdFns" -}}
+pool_passwd_esc() { sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'; }
+pool_passwd_render() {
+  printf '%s:TEXT%s\n' "$(pool_passwd_esc < "$1/username")" "$(pool_passwd_esc < "$1/password")"
+  printf '%s:TEXT%s\n' "$(printf '%s' "$PGPOOL_CHECK_USER" | pool_passwd_esc)" "$(pool_passwd_esc < "$1/pgpool-check-password")"
+  printf '%s:TEXT%s\n' "$(printf '%s' "$APP_USER" | pool_passwd_esc)" "$(pool_passwd_esc < "$1/app-password")"
+}
+pool_passwd_write() {
+  (umask 077; pool_passwd_render "$1" > "$2.new" && : >> "$2") || return 1
+  cat "$2.new" 1<> "$2" && truncate -s "$(wc -c < "$2.new")" "$2"; rc=$?
+  rm -f "$2.new"; return $rc
+}
+{{- end -}}
+
+{{- define "pg.validatePgpoolPasswordSync" -}}
+{{- /* Same pairing rule as pg.validatePgpoolReattach: the password-sync loop (#366) lives in
+       the chart's default pgpool command, so a custom pgpool.command drops it while
+       pgpool.passwordSync.enabled still reads true, and a rotated password would again wait
+       for a restart that nothing announces. */ -}}
+{{- if and .Values.pgpool.enabled ((.Values.pgpool.passwordSync).enabled) .Values.pgpool.command -}}
+{{- fail "pgpool.passwordSync.enabled=true but pgpool.command is set: the password-sync loop (#366) lives in the chart's default pgpool command, so a custom command drops it and a password rotated in the release Secret would never reach pool_passwd without a restart. Either copy the loop from the chart's default command into yours, or set pgpool.passwordSync.enabled=false." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.validatePgpoolReattach" -}}
 {{- /* The re-attach loop (#361) is part of the chart's default pgpool command, so a custom
        pgpool.command silently drops the only thing that re-attaches a detached read backend

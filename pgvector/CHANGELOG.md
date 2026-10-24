@@ -25,6 +25,22 @@
 
 ### Fixed
 
+- **pgpool follows a password rotated in the release Secret (#366).** `pool_passwd` was rendered
+  once, at pod start, from an env snapshot of the Secret, and nothing tied the pod template to
+  that Secret: a rotated `password`, `pgpool-check-password` or `app-password` (edited in place
+  when chart-generated, which is the only way to rotate one, or changed in
+  `postgresql.existingSecret`) reached pgpool only through a restart nobody announced, and since
+  the PCP probes of 2.5.0 (#365) the pod stayed Ready while every login through it failed. The
+  Secret is now mounted into the pgpool pod as files, which the kubelet keeps current, and a loop
+  in the pgpool container (`pgpool.passwordSync`, on by default, part of the default
+  `pgpool.command`) rewrites `pool_passwd` in place when they change; pgpool rescans the file
+  through its open descriptor on every lookup, so the new value is live on the next login with
+  no reload and no restart. A changed value is switched in only once it authenticates against
+  backend 0 as that role, so the Secret and the database can be rotated in either order and
+  pgpool keeps the working password in between; the wait and the switch are `[pool_passwd]`
+  lines in the pgpool container log. `pool_passwd` is no longer a key of the pgpool ConfigMap,
+  and the init container reads the Secret as files instead of taking the three passwords as
+  env. **The pgpool pods roll once.**
 - **pgaudit no longer sees chart-managed passwords (#369).** The agent's managed-role SQL and
   its md5→scram re-hash hoisted the SCRAM verifier into a session GUC (`SET myvars.role_secret
   = ...`) so `log_statement` could not see it; pgaudit logs a `SET` verbatim under `misc`,

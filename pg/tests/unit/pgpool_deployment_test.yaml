@@ -35,6 +35,7 @@ tests:
     set:
       pgpool.enabled: true
       pgpool.reattach.enabled: false
+      pgpool.passwordSync.enabled: false
       pgpool.command:
         - /custom/entrypoint.sh
         - --flag
@@ -71,6 +72,7 @@ tests:
     set:
       pgpool.enabled: true
       pgpool.reattach.enabled: false
+      pgpool.passwordSync.enabled: false
     asserts:
       - notMatchRegex:
           path: spec.template.spec.containers[0].command[2]
@@ -155,6 +157,16 @@ tests:
       - failedTemplate:
           errorPattern: 'pgpool.reattach.enabled=true but pgpool.command is set'
 
+  - it: pgpool.command with pgpool.passwordSync.enabled fails fast (#366)
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.reattach.enabled: false
+      pgpool.command: ["/bin/sh", "-c", "exec pgpool -n"]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool.passwordSync.enabled=true but pgpool.command is set'
+
   # --- wait-check-role: pgpool starts only once its check role logs in ---
   - it: a wait-check-role init container runs after init-config and before pgpool
     template: templates/pgpool-deployment.yaml
@@ -169,10 +181,16 @@ tests:
           value: wait-check-role
       - matchRegex:
           path: spec.template.spec.initContainers[1].command[2]
-          pattern: 'until err=\$\(PGCONNECT_TIMEOUT=5 psql -h "test-pg[a-z-]*\.NAMESPACE\.svc\.cluster\.local" -p 5432 -U "\$PGPOOL_CHECK_USER" -d "\$POSTGRES_DB"'
-      - equal:
-          path: spec.template.spec.initContainers[1].env[?(@.name=="PGPASSWORD")].valueFrom.secretKeyRef.key
-          value: pgpool-check-password
+          pattern: 'until err=\$\(PGPASSWORD="\$\(cat /etc/pg-secret/pgpool-check-password\)" PGCONNECT_TIMEOUT=5 psql -h "test-pg[a-z-]*\.NAMESPACE\.svc\.cluster\.local" -p 5432 -U "\$PGPOOL_CHECK_USER" -d "\$POSTGRES_DB"'
+      # #366: the password comes from the mounted Secret on every attempt, not an env snapshot.
+      - notExists:
+          path: spec.template.spec.initContainers[1].env[?(@.name=="PGPASSWORD")]
+      - contains:
+          path: spec.template.spec.initContainers[1].volumeMounts
+          content:
+            name: pg-secret
+            mountPath: /etc/pg-secret
+            readOnly: true
 
   - it: under backend TLS the wait connects with pgpool's own client certificate
     template: templates/pgpool-deployment.yaml
@@ -194,17 +212,83 @@ tests:
             name: PGSSLCERT
             value: /usr/local/etc/tls/backend.crt
 
-  - it: init-config splices the check and application roles into pool_passwd
+  # #366: pool_passwd is rendered from the release Secret mounted as files (which the kubelet
+  # keeps current), by init-config at boot and by the password-sync loop in the pgpool
+  # container afterwards; the passwords are no longer env anywhere in the pod.
+  - it: init-config renders pool_passwd from the mounted Secret, not from env
     template: templates/pgpool-deployment.yaml
     set:
       pgpool.enabled: true
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[0].command[2]
-          pattern: 'splice\(\$0, "__CHECK_USER__", ENVIRON\["SUB_CHECK_USER"\]\)[\s\S]*splice\(\$0, "__APP_PASSWORD__", ENVIRON\["SUB_APP_PASS"\]\)'
+          pattern: 'cat "/etc/pg-secret/\$f" > "/usr/local/etc/\.pool_passwd\.d/\$f"[\s\S]*pool_passwd_write /usr/local/etc/\.pool_passwd\.d /usr/local/etc/pool_passwd'
+      - notMatchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: '__APP_PASSWORD__|__CHECK_PASSWORD__|__POSTGRES_PASSWORD__'
+      - notExists:
+          path: spec.template.spec.initContainers[0].env[?(@.name=="APP_PASSWORD")]
+      - notExists:
+          path: spec.template.spec.initContainers[0].env[?(@.name=="PGPOOL_CHECK_PASSWORD")]
+      - notExists:
+          path: spec.template.spec.initContainers[0].env[?(@.name=="POSTGRES_PASSWORD")]
+      - contains:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          content:
+            name: pg-secret
+            mountPath: /etc/pg-secret
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: pg-secret
+            mountPath: /etc/pg-secret
+            readOnly: true
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '\[pool_passwd\][\s\S]*exec pgpool -D -n'
+
+  - it: the mounted Secret projects the existingSecret key names onto fixed paths
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      postgresql.existingSecret.enabled: true
+      postgresql.existingSecret.name: byo
+      postgresql.existingSecret.passwordKey: PG_PW
+      postgresql.existingSecret.appPasswordKey: APP_PW
+      postgresql.existingSecret.pgpoolCheckPasswordKey: CHK_PW
+    asserts:
       - equal:
-          path: spec.template.spec.initContainers[0].env[?(@.name=="APP_PASSWORD")].valueFrom.secretKeyRef.key
-          value: app-password
+          path: spec.template.spec.volumes[?(@.name=="pg-secret")].secret.secretName
+          value: byo
+      - contains:
+          path: spec.template.spec.volumes[?(@.name=="pg-secret")].secret.items
+          content:
+            key: PG_PW
+            path: password
+      - contains:
+          path: spec.template.spec.volumes[?(@.name=="pg-secret")].secret.items
+          content:
+            key: APP_PW
+            path: app-password
+      - contains:
+          path: spec.template.spec.volumes[?(@.name=="pg-secret")].secret.items
+          content:
+            key: CHK_PW
+            path: pgpool-check-password
+
+  - it: pgpool.passwordSync.enabled=false drops the loop and keeps the boot render
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.passwordSync.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '\[pool_passwd\]'
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: 'pool_passwd_write /usr/local/etc/\.pool_passwd\.d /usr/local/etc/pool_passwd'
 
   # The metrics exporter logs in as the check role: its session makes pgpool open backend
   # connections, which on a full node must come from reserved_connections, not the superuser

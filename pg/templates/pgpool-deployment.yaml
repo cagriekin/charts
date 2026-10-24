@@ -1,4 +1,5 @@
 {{- include "pg.validatePgpoolReattach" . -}}
+{{- include "pg.validatePgpoolPasswordSync" . -}}
 {{- include "pg.validatePgpoolAdminUsername" . -}}
 {{- if .Values.pgpool.enabled }}
 {{- /* Removed in favor of pgpool.admin.*; fail instead of silently falling
@@ -97,7 +98,22 @@ spec:
             - |
               cp /config/pgpool.conf /usr/local/etc/pgpool.conf
               cp /config/pool_hba.conf /usr/local/etc/pool_hba.conf
-              cp /config/pool_passwd /usr/local/etc/pool_passwd
+              # pool_passwd is rendered from the release Secret's FILES (#366), by the same
+              # functions the password-sync loop in the pgpool container uses later, into
+              # the emptyDir pgpool reads it from. The loop's "applied" copy of the Secret
+              # is seeded here with what pgpool starts on, so the loop's first pass has
+              # something to compare against and only a value that CHANGES after this
+              # point is ever gated on a login. No gate at boot: there is no previous
+              # password to keep, so a Secret rotated ahead of the database makes this
+              # pod start on the new one -- wait-check-role then holds it out of service
+              # until the check role logs in, and the old pods keep serving (maxUnavailable
+              # 0), which is the pre-#366 behaviour of any restart mid-rotation.
+              {{- include "pg.pgpoolPoolPasswdFns" . | nindent 14 }}
+              mkdir -m 0700 /usr/local/etc/.pool_passwd.d
+              for f in username database password pgpool-check-password app-password; do
+                cat "/etc/pg-secret/$f" > "/usr/local/etc/.pool_passwd.d/$f"
+              done
+              pool_passwd_write /usr/local/etc/.pool_passwd.d /usr/local/etc/pool_passwd
               # pcp.conf entries are user:md5(password) -- pgpool's PCP auth
               # validates the password as plain md5(password) (what `pg_md5`
               # emits), NOT sha256, so sha256 made every pcp_* command fail.
@@ -149,37 +165,21 @@ spec:
                     return out s
                   }
                   { $0 = splice($0, "__POSTGRES_USER__", ENVIRON["SUB_USER"])
-                    $0 = splice($0, "__POSTGRES_PASSWORD__", ENVIRON["SUB_PASS"])
                     $0 = splice($0, "__POSTGRES_DB__", ENVIRON["SUB_DB"])
                     $0 = splice($0, "__CHECK_USER__", ENVIRON["SUB_CHECK_USER"])
-                    $0 = splice($0, "__CHECK_PASSWORD__", ENVIRON["SUB_CHECK_PASS"])
-                    $0 = splice($0, "__APP_USER__", ENVIRON["SUB_APP_USER"])
-                    $0 = splice($0, "__APP_PASSWORD__", ENVIRON["SUB_APP_PASS"])
                     print }
                 ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
               }
               # pgpool.conf placeholders sit inside single-quoted strings;
               # its lexer escapes with backslash, not SQL-style doubling:
-              # \ -> \\ first, then ' -> \'
+              # \ -> \\ first, then ' -> \'. No password travels this way: the
+              # check/recovery passwords are blank in pgpool.conf and come from
+              # pool_passwd (see the ConfigMap).
               SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
-              SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
               SUB_DB=$(printf '%s' "$POSTGRES_DB" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
               SUB_CHECK_USER=$(printf '%s' "$PGPOOL_CHECK_USER" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
-              SUB_CHECK_PASS=""
-              SUB_APP_USER=""
-              SUB_APP_PASS=""
-              export SUB_USER SUB_PASS SUB_DB SUB_CHECK_USER SUB_CHECK_PASS SUB_APP_USER SUB_APP_PASS
+              export SUB_USER SUB_DB SUB_CHECK_USER
               subst /usr/local/etc/pgpool.conf
-              # pool_passwd escapes backslash and the field separator with
-              # backslash: \ -> \\ first, then : -> \:
-              SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              SUB_DB="$POSTGRES_DB"
-              SUB_CHECK_USER=$(printf '%s' "$PGPOOL_CHECK_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              SUB_CHECK_PASS=$(printf '%s' "$PGPOOL_CHECK_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              SUB_APP_USER=$(printf '%s' "$APP_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              SUB_APP_PASS=$(printf '%s' "$APP_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
-              subst /usr/local/etc/pool_passwd
 {{- if .Values.pgpool.tls.enabled }}
               # Stage TLS certs from the read-only Secret mounts into the emptyDir with
               # a 0600 key (pgpool/libpq reject a group/world-readable key), like the
@@ -201,11 +201,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
@@ -213,18 +208,8 @@ spec:
                   key: {{ include "pg.secretDatabaseKey" . }}
             - name: PGPOOL_CHECK_USER
               value: {{ include "pg.pgpoolCheckUsername" . | quote }}
-            - name: PGPOOL_CHECK_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
             - name: APP_USER
               value: {{ include "pg.appUsername" . | quote }}
-            - name: APP_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretAppPasswordKey" . }}
             - name: PCP_ADMIN_USER
               valueFrom:
                 secretKeyRef:
@@ -240,6 +225,9 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /config
+            - name: pg-secret
+              mountPath: /etc/pg-secret
+              readOnly: true
             - name: pgpool-config
               mountPath: /usr/local/etc
 {{- if .Values.pgpool.tls.enabled }}
@@ -261,7 +249,10 @@ spec:
                container's log. No deadline: a role that never appears is a provisioning
                failure the agent's log or the FailedPostStartHook event names, and giving up
                would only start pgpool into the broken state. Same backend and TLS as
-               pgpool's own checks. */}}
+               pgpool's own checks. The password is read from the mounted Secret on every
+               attempt, not from an env snapshot (#366): a pod held here by a Secret rotated
+               ahead of the database starts the moment either side is corrected, without
+               being recreated. */}}
         - name: wait-check-role
           image: {{ include "pg.image" .Values.pgpool.image | quote }}
           imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
@@ -271,7 +262,7 @@ spec:
             - /bin/sh
             - -c
             - |
-              until err=$(PGCONNECT_TIMEOUT=5 psql -h {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }} -p 5432 -U "$PGPOOL_CHECK_USER" -d "$POSTGRES_DB" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); do
+              until err=$(PGPASSWORD="$(cat /etc/pg-secret/pgpool-check-password)" PGCONNECT_TIMEOUT=5 psql -h {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }} -p 5432 -U "$PGPOOL_CHECK_USER" -d "$POSTGRES_DB" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); do
                 echo "waiting for pgpool check role $PGPOOL_CHECK_USER to log in: $err"
                 sleep 5
               done
@@ -285,16 +276,14 @@ spec:
                   key: {{ include "pg.secretDatabaseKey" . }}
             - name: PGPOOL_CHECK_USER
               value: {{ include "pg.pgpoolCheckUsername" . | quote }}
-            - name: PGPASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
           resources:
             {{- include "pg.initResources" . | nindent 12 }}
           volumeMounts:
             - name: pgpool-config
               mountPath: /usr/local/etc
+            - name: pg-secret
+              mountPath: /etc/pg-secret
+              readOnly: true
       containers:
         - name: pgpool
           image: {{ include "pg.image" .Values.pgpool.image | quote }}
@@ -368,6 +357,83 @@ spec:
                 done
               ) &
 {{- end }}
+{{- if .Values.pgpool.passwordSync.enabled }}
+              # Password-sync loop (#366). pool_passwd used to be rendered once, at pod start,
+              # from an env snapshot of the release Secret, and nothing tied the pod template to
+              # that Secret: a rotated password -- chart-generated and edited in place (the only
+              # way to rotate one, since the chart keeps the live value across upgrades), or
+              # rotated in an existingSecret, by helm or by hand -- left every running replica
+              # on the old pool_passwd until someone restarted the Deployment, and since the
+              # probes stopped opening sessions through pgpool (#365) nothing even made the pod
+              # unready: it stayed in the Service while every login through it failed. The
+              # Secret is mounted as files now, which the kubelet keeps current (within its
+              # sync period, about a minute), and this loop re-renders pool_passwd in place
+              # when they change; pgpool sees the new bytes on its next lookup with no reload
+              # and no restart (pg.pgpoolPoolPasswdFns explains why in place, and why in place
+              # is enough).
+              #
+              # A changed password is GATED on a login to backend 0 (the primary: the RW Service
+              # in HA, pod 0 in standalone, read from pgpool.conf like the readiness probe) as
+              # that role with the NEW value, with the container's backend TLS settings. Only a
+              # value PostgreSQL accepts is switched in; until then pgpool keeps the previous
+              # one, which is the one still working. That makes the order of a rotation
+              # irrelevant: Secret first, and pgpool follows the moment the database takes the
+              # new password (the agent or the hook applies it on their next start today, an
+              # ALTER ROLE by hand applies it at once); database first, and pgpool follows the
+              # moment the Secret carries it. Without the gate, Secret-first would break every
+              # login through pgpool for as long as the database lagged, where pre-#366 it kept
+              # working until the restart. The gate is one short session per changed role per
+              # pass, not per pass: unchanged files cost a cmp. Each role has its own "applied"
+              # copy, so one role's rotation never waits for another's. A value the database
+              # keeps refusing is logged once per episode, with the server's reason, and
+              # retried every interval; a login that cannot reach the primary at all is the
+              # same case (nothing to switch to yet). Both outcomes are `[pool_passwd]` lines in
+              # this container's log. A background sibling of pgpool like the re-attach loop:
+              # it needs pgpool's own files and psql, and nothing else. pgpool.command replaces
+              # this whole block; pg.validatePgpoolPasswordSync refuses that pairing at render
+              # time.
+              (
+                {{- include "pg.pgpoolPoolPasswdFns" . | nindent 16 }}
+                src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d
+                host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
+                port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+                while :; do
+                  sleep {{ int .Values.pgpool.passwordSync.interval }}
+                  changed=0
+                  for f in username database; do
+                    cmp -s "$src/$f" "$applied/$f" && continue
+                    cat "$src/$f" > "$applied/$f"; changed=1
+                  done
+                  for f in password pgpool-check-password app-password; do
+                    case "$f" in
+                      password) u=$(cat "$applied/username");;
+                      pgpool-check-password) u=$PGPOOL_CHECK_USER;;
+                      app-password) u=$APP_USER;;
+                    esac
+                    if cmp -s "$src/$f" "$applied/$f"; then
+                      # A refused value the Secret has since taken back ends that episode.
+                      [ -e "$applied/.pending-$f" ] && { rm -f "$applied/.pending-$f"; echo "[pool_passwd] $u: the Secret is back on the password pgpool runs on"; }
+                      continue
+                    fi
+                    if err=$(PGPASSWORD="$(cat "$src/$f")" PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "$u" -d "$(cat "$applied/database")" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); then
+                      cat "$src/$f" > "$applied/$f"; changed=1
+                      rm -f "$applied/.pending-$f"
+                      echo "[pool_passwd] $u: the password rotated in the Secret authenticates against backend 0; switching pgpool to it (#366)"
+                    elif [ ! -e "$applied/.pending-$f" ]; then
+                      : > "$applied/.pending-$f"
+                      echo "[pool_passwd] $u: the Secret carries a new password that backend 0 does not accept yet; pgpool keeps the previous one and retries every {{ int .Values.pgpool.passwordSync.interval }}s (#366): $err"
+                    fi
+                  done
+                  if [ "$changed" = 1 ]; then
+                    if pool_passwd_write "$applied" /usr/local/etc/pool_passwd; then
+                      echo "[pool_passwd] pool_passwd rewritten in place; pgpool reads it on its next lookup, no restart"
+                    else
+                      echo "[pool_passwd] rewriting pool_passwd failed; pgpool stays on the previous file until this clears"
+                    fi
+                  fi
+                done
+              ) &
+{{- end }}
               exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf
           {{- end }}
           ports:
@@ -389,6 +455,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+            {{- /* The two pooled non-superuser roles, for the password-sync loop's pool_passwd
+                   entries and its gate logins (#366). Names only; the passwords are files. */}}
+            - name: PGPOOL_CHECK_USER
+              value: {{ include "pg.pgpoolCheckUsername" . | quote }}
+            - name: APP_USER
+              value: {{ include "pg.appUsername" . | quote }}
           # Probes ask pgpool itself, over PCP, and open no PostgreSQL session. Any session
           # through pgpool -- whatever the role -- makes pgpool open a backend connection and
           # keep it cached in that child, and a probe lands on a different one of the
@@ -470,6 +542,9 @@ spec:
           volumeMounts:
             - name: pgpool-config
               mountPath: /usr/local/etc
+            - name: pg-secret
+              mountPath: /etc/pg-secret
+              readOnly: true
 {{- if .Values.pgpool.metrics.enabled }}
         - name: pgpool-exporter
           image: {{ include "pg.image" .Values.pgpool.metrics.image | quote }}
@@ -533,6 +608,27 @@ spec:
         - name: pgpool-config
           emptyDir:
             sizeLimit: 16Mi
+        {{- /* The release Secret as files, for pool_passwd (#366): a Secret volume is kept
+               current by the kubelet, env never is. Only the keys pool_passwd needs, under
+               fixed names, so the existingSecret key mapping is resolved here once and the
+               shell on both sides reads the same five paths. 0444 like the TLS mounts: the
+               containers run as pgpool's uid with no fsGroup, and the files are read by
+               the init container and the pgpool container alone. */}}
+        - name: pg-secret
+          secret:
+            secretName: {{ include "pg.secretName" . }}
+            defaultMode: 0444
+            items:
+              - key: {{ include "pg.secretUsernameKey" . }}
+                path: username
+              - key: {{ include "pg.secretPasswordKey" . }}
+                path: password
+              - key: {{ include "pg.secretDatabaseKey" . }}
+                path: database
+              - key: {{ include "pg.secretPgpoolCheckPasswordKey" . }}
+                path: pgpool-check-password
+              - key: {{ include "pg.secretAppPasswordKey" . }}
+                path: app-password
 {{- if .Values.pgpool.tls.enabled }}
         - name: pgpool-tls
           secret:
