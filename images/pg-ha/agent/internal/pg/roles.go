@@ -32,37 +32,23 @@ type ManagedRole struct {
 	Kind     RoleKind
 }
 
-// ensureRoleSQL creates the role if absent, marking it with COMMENT ON ROLE, and then
-// asserts its whole definition on every run, so a chart role an operator altered converges
-// to what the chart declares: LOGIN, no superuser or other elevated attribute, the password
-// from the Secret, and the kind's privileges. A same-named role WITHOUT the mark belongs to
-// someone else: converting it would silently demote it and reset its password, so the run
-// stops instead and says how to rename the value or hand the role over. The app branch
-// revokes the check role's memberships: a marked role renamed from pgpool.checkUser to
-// postgresql.app would otherwise keep pg_monitor and the reserved-connection slots; the
-// check branch likewise revokes CREATE on public in the maintenance database, which the
-// app role holds there. pg_stat_statements tracking is turned off for the session before
-// anything carrying the secret is sent (a placeholder GUC when the extension is not
-// loaded; superuser-settable when it is). The password travels exactly as rehashSQL's does (see there): a SCRAM
-// verifier computed in Go, passed through the environment, hoisted into a session GUC after
-// statement logging is lowered, and quoted with format(%I, %L). VERBOSITY terse keeps the
-// dynamic statement -- verifier included -- out of psql's CONTEXT lines on failure.
-const ensureRoleSQL = `\set VERBOSITY terse
-\getenv role_secret ENSURE_ROLE_SECRET
-SET log_statement = 'none';
-SET log_min_duration_statement = -1;
-SET log_min_error_statement = 'panic';
-SET client_min_messages = 'warning';
-SET pg_stat_statements.track = 'none';
-SET pg_stat_statements.track_utility = off;
-SET myvars.role_name = :'r';
-SET myvars.role_secret = :'role_secret';
-SET myvars.role_kind = :'k';
-SET myvars.role_db = :'d';
-DO $$
+// managedRoleDO is the DO block that creates and converges one chart-managed role: created
+// if absent and marked with COMMENT ON ROLE, refused if a same-named role WITHOUT the mark
+// exists (converting it would silently demote someone else's role and reset its password),
+// then LOGIN without any elevated attribute and the kind's privileges. It reads the role's
+// name, kind and database from session GUCs (a DO block cannot see psql variables) and
+// carries NO password: the password is set by a separate top-level ALTER ROLE (#369), so this
+// block can be byte-identical to the one the standalone postStart hook runs
+// (pg.managedRoleDO in pg/templates/_helpers.tpl; pg/tests/test-template.sh compares the two
+// whole blocks, #372). Any change here is a change there.
+//
+// The app branch revokes the check role's memberships: a marked role renamed from
+// pgpool.checkUser to postgresql.app would otherwise keep pg_monitor and the
+// reserved-connection slots; the check branch likewise revokes CREATE on public in the
+// maintenance database, which the app role holds there.
+const managedRoleDO = `DO $$
 DECLARE
   v_name TEXT := current_setting('myvars.role_name');
-  v_secret TEXT := current_setting('myvars.role_secret');
   v_kind TEXT := current_setting('myvars.role_kind');
   v_db TEXT := current_setting('myvars.role_db');
   v_marker TEXT := 'managed by the pg chart';
@@ -73,7 +59,7 @@ BEGIN
   ELSIF shobj_description((SELECT oid FROM pg_roles WHERE rolname = v_name), 'pg_authid') IS DISTINCT FROM v_marker THEN
     RAISE EXCEPTION 'role % already exists and is not managed by the pg chart: rename the chart value, or hand the role over with COMMENT ON ROLE % IS %', quote_ident(v_name), quote_ident(v_name), quote_literal(v_marker);
   END IF;
-  EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', v_name, v_secret);
+  EXECUTE format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', v_name);
   IF v_kind = 'pgpool-check' THEN
     EXECUTE format('GRANT pg_monitor, pg_use_reserved_connections TO %I', v_name);
     IF v_db = 'postgres' AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'public')
@@ -100,6 +86,36 @@ BEGIN
 END
 $$;`
 
+// ensureRoleSQL runs managedRoleDO for one role and then sets its password with ONE
+// top-level ALTER ROLE -- the only statement that ever carries the secret (#369).
+//
+// The secret is a SCRAM verifier computed in Go (ScramVerifier), passed through the
+// environment (\getenv keeps it off argv) and quoted by psql's :'var' interpolation. It used
+// to be hoisted into a session GUC (`SET myvars.role_secret = :'role_secret'`) so the DO block
+// could read it, which kept it out of log_statement -- but pgaudit logs a SET verbatim under
+// its misc, misc_set and all classes, verifier included (#369). pgaudit redacts the password
+// of CREATE ROLE / ALTER ROLE in every class (`PASSWORD <REDACTED>`), so that statement is the
+// one place a secret may appear in: log_statement = none keeps it out of the plain log,
+// log_min_error_statement = panic out of the error echo, pg_stat_statements tracking is off
+// (a placeholder GUC when the extension is not loaded; superuser-settable when it is), and
+// VERBOSITY terse keeps it out of psql's CONTEXT lines on failure. Ordering matters: a
+// statement issued before log_statement is lowered is logged under the old value, so the
+// suppression SETs come first and the ALTER ROLE last. The DO block's RAISE for an unmarked
+// same-named role aborts the script (ON_ERROR_STOP) before the password is ever sent.
+const ensureRoleSQL = `\set VERBOSITY terse
+\getenv role_secret ENSURE_ROLE_SECRET
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+SET client_min_messages = 'warning';
+SET pg_stat_statements.track = 'none';
+SET pg_stat_statements.track_utility = off;
+SET myvars.role_name = :'r';
+SET myvars.role_kind = :'k';
+SET myvars.role_db = :'d';
+` + managedRoleDO + `
+ALTER ROLE :"r" WITH PASSWORD :'role_secret';`
+
 // EnsureRole converges one chart-managed role on the LOCAL primary, connecting as
 // superUser over the local socket (pg_hba `local all all trust`) to db. Idempotent.
 // ErrNeedsSASLprep is returned matchable: such a password can never be provisioned by
@@ -120,6 +136,11 @@ func EnsureRole(ctx context.Context, ex StdinExec, superUser, db string, r Manag
 		ensureRoleSQL, "psql",
 		"-U", superUser, "-d", db,
 		"-v", "ON_ERROR_STOP=1",
+		// -1: the DO block and the password-bearing ALTER ROLE are separate statements
+		// since #369; one transaction keeps a role from ever being committed without its
+		// password (a cancelled psql between the two would otherwise leave a LOGIN role
+		// with none until the next tick).
+		"-1",
 		"-v", "r="+r.Name,
 		"-v", "k="+string(r.Kind),
 		"-v", "d="+db,

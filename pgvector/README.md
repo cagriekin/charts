@@ -537,7 +537,9 @@ psql -h localhost -p 9999 -U postgres -d postgres
 
 Opt-in, [pgaudit](https://github.com/pgaudit/pgaudit)-based audit logging for compliance
 regimes (SOC 2, HIPAA, PCI-DSS, ISO 27001). Off by default — inherited unchanged from the
-pg chart's symlinked templates.
+pg chart's symlinked templates. No class exposes a chart-managed credential: the chart's role
+provisioning sends passwords only inside `ALTER ROLE ... PASSWORD`, which pgaudit redacts
+(#369).
 
 ```yaml
 postgresql:

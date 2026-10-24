@@ -56,12 +56,16 @@ func TestRehashMd5UserInvocation(t *testing.T) {
 	if !strings.HasPrefix(secret, "SCRAM-SHA-256$4096:") {
 		t.Errorf("expected a SCRAM verifier in REHASH_TGT_SECRET, got %q (env %v)", secret, f.env)
 	}
-	// The SQL guards PG<14 and re-hashes only md5-stored passwords, via \getenv + format.
+	// The SQL guards PG<14 and re-hashes only md5-stored passwords: the gate is a client-side
+	// SELECT naming only the user (\gset + \if), and the verifier reaches the server in one
+	// top-level ALTER USER, which pgaudit redacts (#369).
 	for _, want := range []string{
 		`\getenv tgt_secret REHASH_TGT_SECRET`,
 		"server_version_num",
 		"rolpassword LIKE 'md5%'",
-		"ALTER USER %I WITH PASSWORD %L",
+		`AS needs_rehash \gset`,
+		`\if :needs_rehash`,
+		`ALTER USER :"u" WITH PASSWORD :'tgt_secret';`,
 	} {
 		if !strings.Contains(f.stdin, want) {
 			t.Errorf("SQL missing %q:\n%s", want, f.stdin)
@@ -73,11 +77,15 @@ func TestRehashMd5UserInvocation(t *testing.T) {
 		t.Errorf("password_encryption has no role once a verifier is sent:\n%s", f.stdin)
 	}
 	// Statement logging must be lowered BEFORE anything carrying the verifier is sent --
-	// a SET issued first would be logged under the operator's original log_statement.
+	// a statement issued first would be logged under the operator's original log_statement.
 	iLog := strings.Index(f.stdin, "SET log_statement = 'none';")
-	iSecret := strings.Index(f.stdin, "myvars.tgt_secret = :'tgt_secret'")
+	iSecret := strings.Index(f.stdin, "WITH PASSWORD :'tgt_secret'")
 	if iLog < 0 || iSecret < 0 || iLog > iSecret {
-		t.Errorf("log suppression must precede the verifier-bearing SET (log at %d, secret at %d):\n%s", iLog, iSecret, f.stdin)
+		t.Errorf("log suppression must precede the verifier-bearing ALTER USER (log at %d, secret at %d):\n%s", iLog, iSecret, f.stdin)
+	}
+	// #369: the verifier is never hoisted into a SET, which pgaudit logs in full.
+	if strings.Contains(f.stdin, "SET myvars") {
+		t.Errorf("no session GUC may carry the verifier:\n%s", f.stdin)
 	}
 }
 

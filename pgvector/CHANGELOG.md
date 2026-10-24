@@ -25,6 +25,21 @@
 
 ### Fixed
 
+- **pgaudit no longer sees chart-managed passwords (#369).** The agent's managed-role SQL and
+  its md5→scram re-hash hoisted the SCRAM verifier into a session GUC (`SET myvars.role_secret
+  = ...`) so `log_statement` could not see it; pgaudit logs a `SET` verbatim under `misc`,
+  `misc_set` and `all`, verifier included. pgaudit redacts the password of `CREATE ROLE` /
+  `ALTER ROLE` in every class, so that is now the only statement a secret travels in: the DO
+  block provisions the role without a password and one top-level `ALTER ROLE ... WITH PASSWORD`
+  follows it (pg-ha image 2.4.0); the re-hash moves its md5 gate client-side (`\gset` + `\if`)
+  and does the same. The standalone postStart hook, which sends the plaintext, is restructured
+  identically. Statement logging, error echo and `pg_stat_statements` tracking are still
+  lowered first, as before.
+- **One managed-role DO block for the agent and the standalone hook (#372).** The hook ran its
+  own two-role copy of the agent's SQL, held in step only by a list of `format()` needles.
+  With the password out of the block it is now byte-identical in both places (`managedRoleDO`
+  in the agent, `pg.managedRoleDO` in the chart, included once per role), and the render tests
+  compare the whole block in both directions, so nothing inside it can drift.
 - **A PCP credential fault no longer restarts pgpool in a loop (#375).** Since 2.5.0 the pgpool
   probes authenticate over PCP, with the user parsed out of `pcp.conf` by `cut -d: -f1`. A PCP
   admin username containing `:` (which `pcp.conf`, `user:md5` per line and split at the first
