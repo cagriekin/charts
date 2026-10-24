@@ -2013,6 +2013,12 @@ creates the extension idempotently on the primary via a post-install/upgrade hoo
 - **Log classes** (`log`): comma-separated `read`, `write`, `function`, `role`, `ddl`,
   `misc`, `misc_set`, `all`. Prefix a class with `-` to subtract from `all`
   (e.g. `all, -misc`). Validated against this allowlist at render time.
+- **No class exposes a chart-managed credential.** The chart's own role provisioning (the
+  agent in HA mode, the standalone postStart hook) and the agent's md5→scram re-hash send a
+  password or SCRAM verifier only inside `ALTER ROLE ... PASSWORD`, which pgaudit redacts in
+  every class (`PASSWORD <REDACTED>`); nothing is hoisted into a session `SET`, which
+  `misc`, `misc_set` and `all` would log verbatim (#369). Your own statements are your own:
+  `logParameter` logs bind parameters, including any secret an application binds.
 - **Object-level auditing** (`role`): set `pgaudit.role` to an existing role; any object it
   is `GRANT`ed on is audited regardless of the class list. Leave empty for session-only
   logging. To audit objects in databases other than the primary, add `pgaudit` to that

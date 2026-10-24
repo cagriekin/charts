@@ -339,5 +339,54 @@ fi
 
 rm -f "${SCRIPT_DIR}/.agent_primary" "${SCRIPT_DIR}/.agent_standby"
 
+# --- #369: pgaudit under `all` must never see a chart-managed credential ---
+# Last, after the failover assertions: enabling pgaudit rolls both pods in Parallel and the
+# lease then lands on either, which would break the "pod-0 starts as primary" premise above.
+# The agent provisions the managed roles on its first primary tick, with one ALTER ROLE
+# carrying a SCRAM verifier; it used to hoist that verifier into a SET, which pgaudit logs in
+# full under misc/misc_set/all. Enable pgaudit with every class (a postmaster parameter, so the
+# pods roll and every agent provisions again), then read the primary's log: no verifier, no
+# plaintext, and the redacted ALTER ROLE line present so the path demonstrably ran.
+echo "  #369: enabling pgaudit with log=all (rolls the pods)..."
+helm upgrade "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.audit.enabled=true --set postgresql.audit.log=all --wait --timeout 10m
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
+app_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.app-password}' | base64 -d)
+chk_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.pgpool-check-password}' | base64 -d)
+redacted=0; s=0
+while [[ ${s} -lt 180 ]]; do
+  redacted=0
+  for pod in "${POD0}" "${POD1}"; do
+    # pgaudit CSV-quotes a statement containing quotes: ...,ROLE,ALTER ROLE,,,"ALTER ROLE ""app_user"" WITH PASSWORD <REDACTED>",...
+    n=$(kubectl logs -n "${NAMESPACE}" "${pod}" -c postgresql 2>/dev/null | grep -c 'AUDIT: SESSION.*,ROLE,ALTER ROLE,,,.*WITH PASSWORD <REDACTED>' || true)
+    redacted=$((redacted + n))
+  done
+  [[ ${redacted} -ge 2 ]] && break
+  sleep 5; s=$((s + 5))
+done
+assert_gt "#369: pgaudit logged the managed-role ALTER ROLE with the password redacted (both roles)" "${redacted}" "1"
+leak_v=0; leak_p=0
+for pod in "${POD0}" "${POD1}"; do
+  log=$(kubectl logs -n "${NAMESPACE}" "${pod}" -c postgresql 2>/dev/null || true)
+  leak_v=$((leak_v + $(grep -cF 'SCRAM-SHA-256$' <<< "${log}" || true)))
+  leak_p=$((leak_p + $(grep -cF -- "${app_pw}" <<< "${log}" || true) + $(grep -cF -- "${chk_pw}" <<< "${log}" || true)))
+done
+assert_eq "#369: no SCRAM verifier in any PostgreSQL log under pgaudit log=all" "0" "${leak_v}"
+assert_eq "#369: no plaintext managed-role password in any PostgreSQL log" "0" "${leak_p}"
+leak_s=0
+for pod in "${POD0}" "${POD1}"; do
+  leak_s=$((leak_s + $(kubectl logs -n "${NAMESPACE}" "${pod}" -c postgresql 2>/dev/null | grep -c "SET myvars\.[a-z_]*\(secret\|pw\|pass\)" || true)))
+done
+assert_eq "#369: no secret-bearing SET reached pgaudit" "0" "${leak_s}"
+# The roles still authenticate with the Secret's passwords after the roll (the name is the
+# container's APP_USER env; the password the Secret's app-password key). Over TCP, so pg_hba's
+# scram line is what answers, not the local trust socket.
+P369=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}')
+# env PGPASSWORD=..., not sh -c re-quoting: a generated password holding ' or $ must not
+# break the command (same shape as run_as in test-databases-roles.sh).
+app_ok=$(kubectl exec -n "${NAMESPACE}" "${P369}" -c postgresql -- \
+  env PGPASSWORD="${app_pw}" psql -h 127.0.0.1 -U app_user -d testdb -tAc 'SELECT 1' 2>/dev/null | xargs || echo "")
+assert_eq "#369: the app role still authenticates with the Secret's password" "1" "${app_ok}"
+
 end_suite
 print_summary
