@@ -109,7 +109,8 @@ spec:
               # until the check role logs in, and the old pods keep serving (maxUnavailable
               # 0), which is the pre-#366 behaviour of any restart mid-rotation.
               {{- include "pg.pgpoolPoolPasswdFns" . | nindent 14 }}
-              mkdir -m 0700 /usr/local/etc/.pool_passwd.d
+              # -p: a restarted init container (the emptyDir outlives it) finds the dir already there.
+              mkdir -p -m 0700 /usr/local/etc/.pool_passwd.d
               for f in username database password pgpool-check-password app-password; do
                 cat "/etc/pg-secret/$f" > "/usr/local/etc/.pool_passwd.d/$f"
               done
@@ -386,8 +387,9 @@ spec:
               # pass, not per pass: unchanged files cost a cmp. Each role has its own "applied"
               # copy, so one role's rotation never waits for another's. A value the database
               # keeps refusing is logged once per episode, with the server's reason, and
-              # retried every interval; a login that cannot reach the primary at all is the
-              # same case (nothing to switch to yet). Both outcomes are `[pool_passwd]` lines in
+              # retried every interval (a second, different refused value opens a new episode);
+              # a login that cannot reach the primary at all is the same case (nothing to
+              # switch to yet). Both outcomes are `[pool_passwd]` lines in
               # this container's log. A background sibling of pgpool like the re-attach loop:
               # it needs pgpool's own files and psql, and nothing else. pgpool.command replaces
               # this whole block; pg.validatePgpoolPasswordSync refuses that pairing at render
@@ -400,9 +402,11 @@ spec:
                 while :; do
                   sleep {{ int .Values.pgpool.passwordSync.interval }}
                   changed=0
+                  # username is a pool_passwd field; database is only the gate's -d, so a change
+                  # in it alone rewrites nothing.
                   for f in username database; do
                     cmp -s "$src/$f" "$applied/$f" && continue
-                    cat "$src/$f" > "$applied/$f"; changed=1
+                    cat "$src/$f" > "$applied/$f"; [ "$f" = username ] && changed=1
                   done
                   for f in password pgpool-check-password app-password; do
                     case "$f" in
@@ -419,8 +423,11 @@ spec:
                       cat "$src/$f" > "$applied/$f"; changed=1
                       rm -f "$applied/.pending-$f"
                       echo "[pool_passwd] $u: the password rotated in the Secret authenticates against backend 0; switching pgpool to it (#366)"
-                    elif [ ! -e "$applied/.pending-$f" ]; then
-                      : > "$applied/.pending-$f"
+                    elif ! cmp -s "$src/$f" "$applied/.pending-$f" 2>/dev/null; then
+                      # The marker holds the refused value: a DIFFERENT refused value (a second
+                      # attempt at the rotation) starts a new episode and is logged with its own
+                      # reason, the same one refused again is not.
+                      cat "$src/$f" > "$applied/.pending-$f"
                       echo "[pool_passwd] $u: the Secret carries a new password that backend 0 does not accept yet; pgpool keeps the previous one and retries every {{ int .Values.pgpool.passwordSync.interval }}s (#366): $err"
                     fi
                   done

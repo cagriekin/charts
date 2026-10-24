@@ -40,7 +40,11 @@
   pgpool keeps the working password in between; the wait and the switch are `[pool_passwd]`
   lines in the pgpool container log. `pool_passwd` is no longer a key of the pgpool ConfigMap,
   and the init container reads the Secret as files instead of taking the three passwords as
-  env. **The pgpool pods roll once.**
+  env. **The pgpool pods roll once.** A custom `pgpool.command` now fails the render unless
+  `pgpool.passwordSync.enabled=false` is set alongside it, as `pgpool.reattach.enabled` already
+  does. The metrics sidecar (`pgpool.metrics`) is unaffected by a rotation: `pool_hba.conf`
+  trusts localhost, so the password it holds in env is never checked, and its sessions reach
+  the backends through `pool_passwd` like any other.
 - **pgaudit no longer sees chart-managed passwords (#369).** The agent's managed-role SQL and
   its md5→scram re-hash hoisted the SCRAM verifier into a session GUC (`SET myvars.role_secret
   = ...`) so `log_statement` could not see it; pgaudit logs a `SET` verbatim under `misc`,

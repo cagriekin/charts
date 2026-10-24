@@ -2273,7 +2273,9 @@ assert_eq "#366: the loop gates each changed value on a login to backend 0 as th
 assert_contains "#366: ... reading backend 0 from pgpool.conf like the readiness probe" "${pgpool_dep_361}" 'src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d'
 assert_contains "#366: a refused value is logged once per episode" "${pgpool_dep_361}" '\[pool_passwd\] $u: the Secret carries a new password that backend 0 does not accept yet'
 assert_contains "#366: ... and the switch" "${pgpool_dep_361}" '\[pool_passwd\] $u: the password rotated in the Secret authenticates against backend 0'
-assert_contains "#366: the loop runs at the configured interval" "${pgpool_dep_361}" 'sleep 10'
+assert_eq "#366: the loop runs at the configured interval (one sleep per loop: re-attach and password-sync)" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '^ *sleep 10$')"
+assert_contains "#366: a different refused value opens a new episode (the marker holds the refused value)" "${pgpool_dep_361}" 'elif ! cmp -s "$src/$f" "$applied/.pending-$f"'
+assert_contains "#366: init-config tolerates a restart (the applied dir may already exist)" "${pgpool_dep_361}" 'mkdir -p -m 0700 /usr/local/etc/.pool_passwd.d'
 pgpool_366_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.passwordSync.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
 assert_not_contains "#366: pgpool.passwordSync.enabled=false drops the loop" "${pgpool_366_off}" '\[pool_passwd\]'
 assert_eq "#366: ... but init-config still renders pool_passwd from the Secret files" "1" "$(printf '%s\n' "${pgpool_366_off}" | grep -c '^ *pool_passwd_esc() {')"
