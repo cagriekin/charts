@@ -47,17 +47,18 @@ var scramVerifierRe = regexp.MustCompile(`SCRAM-SHA-256\$[^\s'"]+`)
 // an error.
 //
 // The verifier is kept off argv and out of the SERVER log (see rehashSQL), and that was
-// assumed to be the whole exposure -- but PostgreSQL puts the full dynamic statement into
-// the error CONTEXT of any failure inside `EXECUTE format('ALTER USER %I WITH PASSWORD %L',
-// ...)`, and psql prints CONTEXT at default verbosity. rehashManagedUsersOnce logs this
-// error verbatim, so an ALTER that failed wrote the superuser's or replication user's
-// verifier straight into the pod log and thence to whatever ships logs -- the same leak the
-// #298 rewrite closed on the server side, reappearing on the client side. Reachable without
-// anything exotic: the re-hash runs against the local node and the role is ALTERed after the
-// EXISTS check, so a node that entered recovery in between fails with "cannot execute ALTER
-// ROLE in a read-only transaction" and leaks; a concurrently dropped or renamed role does
-// the same. A verifier is not the plaintext, but it is enough for an offline dictionary
-// attack, which is exactly why it is treated as a secret everywhere else in this file.
+// assumed to be the whole exposure -- but the client side can echo it too. The earlier DO
+// form put the full dynamic statement into the error CONTEXT of any failure inside
+// `EXECUTE format('ALTER USER %I WITH PASSWORD %L', ...)`, which psql prints at default
+// verbosity; rehashManagedUsersOnce logs this error verbatim, so an ALTER that failed (a
+// node that entered recovery between the EXISTS check and the ALTER, a concurrently
+// dropped or renamed role) wrote the superuser's or replication user's verifier straight
+// into the pod log and thence to whatever ships logs. Since #369 the ALTER is a top-level
+// statement and carries no CONTEXT, but psql still prints the statement excerpt at the
+// error POSITION (`LINE 1: ...`) for any error that has one, so this scrub stays as the
+// client-side backstop. A verifier is not the plaintext, but it is enough for an offline
+// dictionary attack, which is exactly why it is treated as a secret everywhere else in this
+// file.
 func scrubSCRAM(s string) string {
 	return scramVerifierRe.ReplaceAllString(s, "SCRAM-SHA-256$[redacted]")
 }

@@ -375,7 +375,7 @@ assert_eq "#369: no SCRAM verifier in any PostgreSQL log under pgaudit log=all" 
 assert_eq "#369: no plaintext managed-role password in any PostgreSQL log" "0" "${leak_p}"
 leak_s=0
 for pod in "${POD0}" "${POD1}"; do
-  leak_s=$((leak_s + $(kubectl logs -n "${NAMESPACE}" "${pod}" -c postgresql 2>/dev/null | grep -c "SET myvars\.[a-z_]*\(secret\|pw\)" || true)))
+  leak_s=$((leak_s + $(kubectl logs -n "${NAMESPACE}" "${pod}" -c postgresql 2>/dev/null | grep -c "SET myvars\.[a-z_]*\(secret\|pw\|pass\)" || true)))
 done
 assert_eq "#369: no secret-bearing SET reached pgaudit" "0" "${leak_s}"
 # The roles still authenticate with the Secret's passwords after the roll (the name is the

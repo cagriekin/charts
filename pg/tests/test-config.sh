@@ -138,7 +138,7 @@ app_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.
 chk_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.pgpool-check-password}' | base64 -d)
 pod_log=$(kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql 2>/dev/null || true)
 assert_eq "#369: no plaintext managed-role password in the standalone log under log_statement=all" "0" "$(( $(grep -cF -- "${app_pw}" <<< "${pod_log}" || true) + $(grep -cF -- "${chk_pw}" <<< "${pod_log}" || true) ))"
-assert_eq "#369: no secret-bearing SET in the standalone log" "0" "$(grep -c "SET myvars\.[a-z_]*\(secret\|pw\)" <<< "${pod_log}" || true)"
+assert_eq "#369: no secret-bearing SET in the standalone log" "0" "$(grep -c "SET myvars\.[a-z_]*\(secret\|pw\|pass\)" <<< "${pod_log}" || true)"
 assert_contains "#369: the hook provisioned the managed roles on this start" "${pod_log}" "postStart: real server up on 127.0.0.1 after [0-9]*s; applied: .*managed roles app_user, pgpool_check"
 
 end_suite
