@@ -399,9 +399,14 @@ spec:
                 {{- include "pg.pgpoolPoolPasswdFns" . | nindent 16 }}
                 src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d
                 {{- include "pg.pgpoolBackend0" . | nindent 16 }}
+                # Same guard as the readiness probe: an empty host would make psql dial the
+                # local socket and report every rotation as refused by the database.
+                [ -n "$host" ] && [ -n "$port" ] || echo "[pool_passwd] backend 0 not found in pgpool.conf; a rotated password cannot pass the gate and pgpool stays on the boot pool_passwd"
                 while :; do
                   sleep {{ int .Values.pgpool.passwordSync.interval }}
-                  changed=0
+                  # changed is sticky across a failed rewrite (.dirty): the applied copy already
+                  # holds the gated value, so nothing else would ever trigger the write again.
+                  changed=0; [ -e "$applied/.dirty" ] && changed=1
                   # username is a pool_passwd field; database is only the gate's -d, so a change
                   # in it alone rewrites nothing.
                   for f in username database; do
@@ -414,28 +419,38 @@ spec:
                       pgpool-check-password) u=$PGPOOL_CHECK_USER;;
                       app-password) u=$APP_USER;;
                     esac
-                    if cmp -s "$src/$f" "$applied/$f"; then
+                    # One read of the Secret file per pass. The kubelet swaps the mount
+                    # atomically, but it can swap again between the gate login and the copy
+                    # into "applied", and the value pgpool switched to must be the one the
+                    # gate saw, not whatever the mount holds a moment later.
+                    new="$applied/.new-$f"; cat "$src/$f" > "$new"
+                    if cmp -s "$new" "$applied/$f"; then
+                      rm -f "$new"
                       # A refused value the Secret has since taken back ends that episode.
                       [ -e "$applied/.pending-$f" ] && { rm -f "$applied/.pending-$f"; echo "[pool_passwd] $u: the Secret is back on the password pgpool runs on"; }
                       continue
                     fi
-                    if err=$(PGPASSWORD="$(cat "$src/$f")" PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "$u" -d "$(cat "$applied/database")" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); then
-                      cat "$src/$f" > "$applied/$f"; changed=1
+                    if err=$(PGPASSWORD="$(cat "$new")" PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "$u" -d "$(cat "$applied/database")" --no-psqlrc -tAc "SELECT 1" 2>&1 >/dev/null); then
+                      mv -f "$new" "$applied/$f"; changed=1
                       rm -f "$applied/.pending-$f"
                       echo "[pool_passwd] $u: the password rotated in the Secret authenticates against backend 0; switching pgpool to it (#366)"
-                    elif ! cmp -s "$src/$f" "$applied/.pending-$f" 2>/dev/null; then
+                    elif cmp -s "$new" "$applied/.pending-$f" 2>/dev/null; then
+                      rm -f "$new"
+                    else
                       # The marker holds the refused value: a DIFFERENT refused value (a second
                       # attempt at the rotation) starts a new episode and is logged with its own
                       # reason, the same one refused again is not.
-                      cat "$src/$f" > "$applied/.pending-$f"
+                      mv -f "$new" "$applied/.pending-$f"
                       echo "[pool_passwd] $u: the Secret carries a new password that backend 0 does not accept yet; pgpool keeps the previous one and retries every {{ int .Values.pgpool.passwordSync.interval }}s (#366): $err"
                     fi
                   done
                   if [ "$changed" = 1 ]; then
                     if pool_passwd_write "$applied" /usr/local/etc/pool_passwd; then
+                      rm -f "$applied/.dirty"
                       echo "[pool_passwd] pool_passwd rewritten in place; pgpool reads it on its next lookup, no restart"
                     else
-                      echo "[pool_passwd] rewriting pool_passwd failed; pgpool stays on the previous file until this clears"
+                      : > "$applied/.dirty"
+                      echo "[pool_passwd] rewriting pool_passwd failed; pgpool stays on the previous file, retried every {{ int .Values.pgpool.passwordSync.interval }}s"
                     fi
                   fi
                 done
