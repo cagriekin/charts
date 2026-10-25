@@ -370,9 +370,9 @@ spec:
               # unready: it stayed in the Service while every login through it failed. The
               # Secret is mounted as files now, which the kubelet keeps current (within its
               # sync period, about a minute), and this loop re-renders pool_passwd in place
-              # when they change; pgpool sees the new bytes on its next lookup with no reload
-              # and no restart (pg.pgpoolPoolPasswdFns explains why in place, and why in place
-              # is enough).
+              # when they change and tells pgpool to reload (pcp_reload_config), after which
+              # every pgpool process reopens the file; no restart (pg.pgpoolPoolPasswdFns
+              # explains the in-place write and why the reload is what makes it visible).
               #
               # A changed password is GATED on a login to backend 0 (the primary: the RW Service
               # in HA, pod 0 in standalone, read from pgpool.conf like the readiness probe) as
@@ -397,6 +397,7 @@ spec:
               # time.
               (
                 {{- include "pg.pgpoolPoolPasswdFns" . | nindent 16 }}
+                {{- include "pg.pgpoolPcpPrelude" . | nindent 16 }}
                 src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d
                 {{- include "pg.pgpoolBackend0" . | nindent 16 }}
                 # Same guard as the readiness probe: an empty host would make psql dial the
@@ -445,9 +446,17 @@ spec:
                     fi
                   done
                   if [ "$changed" = 1 ]; then
+                    # Write, then reload: a process that already read pool_passwd serves its
+                    # stdio buffer until it reopens the file, which SIGHUP makes it do (the
+                    # helper's comment). .dirty keeps both retried until both have succeeded.
                     if pool_passwd_write "$applied" /usr/local/etc/pool_passwd; then
-                      rm -f "$applied/.dirty"
-                      echo "[pool_passwd] pool_passwd rewritten in place; pgpool reads it on its next lookup, no restart"
+                      if out=$(pcp_reload_config -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then
+                        rm -f "$applied/.dirty"
+                        echo "[pool_passwd] pool_passwd rewritten in place and pgpool reloaded; every process reopens it, no restart"
+                      else
+                        : > "$applied/.dirty"
+                        echo "[pool_passwd] pool_passwd rewritten but pgpool could not be told to reload over PCP, so its processes may still serve the previous file; retried every {{ int .Values.pgpool.passwordSync.interval }}s: $out"
+                      fi
                     else
                       : > "$applied/.dirty"
                       echo "[pool_passwd] rewriting pool_passwd failed; pgpool stays on the previous file, retried every {{ int .Values.pgpool.passwordSync.interval }}s"

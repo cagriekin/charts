@@ -33,9 +33,10 @@
   the PCP probes of 2.5.0 (#365) the pod stayed Ready while every login through it failed. The
   Secret is now mounted into the pgpool pod as files, which the kubelet keeps current, and a loop
   in the pgpool container (`pgpool.passwordSync`, on by default, part of the default
-  `pgpool.command`) rewrites `pool_passwd` in place when they change; pgpool rescans the file
-  through its open descriptor on every lookup, so the new value is live on the next login with
-  no reload and no restart. A changed value is switched in only once it authenticates against
+  `pgpool.command`) rewrites `pool_passwd` in place when they change and tells pgpool to
+  reload (`pcp_reload_config`), after which every pgpool process reopens the file (a process
+  that already read it keeps serving its buffered copy until then), so the new value is live
+  on the next login with no restart. A changed value is switched in only once it authenticates against
   backend 0 as that role, so the Secret and the database can be rotated in either order and
   pgpool keeps the working password in between; the wait and the switch are `[pool_passwd]`
   lines in the pgpool container log. `pool_passwd` is no longer a key of the pgpool ConfigMap,

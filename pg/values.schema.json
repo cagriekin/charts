@@ -528,7 +528,7 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Run the password-sync loop in the pgpool container (#366): the release Secret is mounted as files and a password rotated in it is rewritten into pool_passwd in place, no restart, once it authenticates against the primary. Part of the chart's default pgpool command; setting pgpool.command with this enabled fails the render."
+              "description": "Run the password-sync loop in the pgpool container (#366): the release Secret is mounted as files and a password rotated in it is rewritten into pool_passwd in place and reloaded over PCP, no restart, once it authenticates against the primary. Part of the chart's default pgpool command; setting pgpool.command with this enabled fails the render."
             },
             "interval": {
               "type": "integer",

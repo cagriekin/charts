@@ -2216,7 +2216,7 @@ assert_not_contains "#361: no probe opens a session through pgpool" "${pgpool_de
 # file; an authentication fault (the client's exact wording) is fail-open and logged once;
 # PCP not answering still fails. #374: readiness asks backend 0 itself with pg_isready (the
 # loop also uses pg_isready, on detached backends), liveness never does.
-assert_eq "#375: the PCP prelude is shared by the loop and both probes (3 copies)" "3" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PCP_USER=$(cat /usr/local/etc/pcp_user)')"
+assert_eq "#375: the PCP prelude is shared by both loops and both probes (4 copies, the password-sync loop since #366)" "4" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PCP_USER=$(cat /usr/local/etc/pcp_user)')"
 assert_not_contains "#375: nothing parses the PCP user out of pcp.conf" "${pgpool_dep_361}" 'cut -d: -f1 /usr/local/etc/pcp.conf'
 assert_eq "#375: both probes pass fail-open on a PCP authentication fault" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 2 \] && { pcp_auth_note fail; exit 0; }')"
 assert_eq "#375: ... and fail when PCP does not answer" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 0 \] || exit 1')"
@@ -2277,6 +2277,8 @@ assert_eq "#366: the loop runs at the configured interval (one sleep per loop: r
 assert_contains "#366: a different refused value opens a new episode (the marker holds the refused value)" "${pgpool_dep_361}" 'elif cmp -s "$new" "$applied/.pending-$f"'
 assert_contains "#366: the Secret file is read once per pass (the gated value is the applied one)" "${pgpool_dep_361}" 'new="$applied/.new-$f"; cat "$src/$f" > "$new"'
 assert_contains "#366: a failed rewrite is retried on the next pass" "${pgpool_dep_361}" '[ -e "$applied/.dirty" ] && changed=1'
+assert_contains "#366: the rewrite is followed by a PCP reload (a process serves its buffered pool_passwd until it reopens it)" "${pgpool_dep_361}" 'if out=$(pcp_reload_config -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then'
+assert_contains "#366: ... and a failed reload is retried too" "${pgpool_dep_361}" 'pool_passwd rewritten but pgpool could not be told to reload over PCP'
 assert_contains "#366: the loop keeps the probe's empty-backend guard" "${pgpool_dep_361}" '\[ -n "$host" \] && \[ -n "$port" \] || echo "\[pool_passwd\] backend 0 not found'
 assert_contains "#366: init-config tolerates a restart (the applied dir may already exist)" "${pgpool_dep_361}" 'mkdir -p -m 0700 /usr/local/etc/.pool_passwd.d'
 pgpool_366_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.passwordSync.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)

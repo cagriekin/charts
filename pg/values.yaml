@@ -1013,7 +1013,8 @@ pgpool:
   # with -- is rendered from the release Secret, which is mounted into the pgpool pod as
   # files the kubelet keeps current. Every `interval` seconds the pgpool container compares
   # those files with what pgpool runs on and, when one changed, rewrites pool_passwd in
-  # place; pgpool reads it on its next lookup, with no reload and no restart. Before this,
+  # place and tells pgpool to reload (pcp_reload_config), after which every pgpool process
+  # reopens the file; no restart. Before this,
   # a password rotated in the Secret (edited in place when chart-generated, or in
   # postgresql.existingSecret by any means) reached pgpool only through a restart nobody
   # announced, and the pod stayed Ready while every login through it failed.

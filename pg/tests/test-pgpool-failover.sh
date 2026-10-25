@@ -263,10 +263,12 @@ APP_PW_OLD=$(kubectl get secret "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.d
 APP_PW_NEW="rot-app-$(date +%s)"
 WAIT_LINE='[pool_passwd] app_user: the Secret carries a new password that backend 0 does not accept yet'
 SWITCH_LINE='[pool_passwd] app_user: the password rotated in the Secret authenticates against backend 0'
+RELOAD_LINE='[pool_passwd] pool_passwd rewritten in place and pgpool reloaded'
 assert_eq "#366: the application role logs in through pgpool before the rotation" "app_user" "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT current_user' || true)"
 echo "  #366: rotating app-password in the Secret (the database keeps the old one for now)..."
 wait_before=$(pgpool_log_count "${WAIT_LINE}")
 switch_before=$(pgpool_log_count "${SWITCH_LINE}")
+reload_before=$(pgpool_log_count "${RELOAD_LINE}")
 secret_set app-password "${APP_PW_NEW}"
 # The kubelet refreshes a Secret volume on its sync period (about a minute), then the loop sees
 # it within one interval (10s).
@@ -282,10 +284,20 @@ pg_exec "${NAMESPACE}" "${PRIMARY_366}" "ALTER ROLE app_user PASSWORD '${APP_PW_
 switched=$(wait_log_delta "${SWITCH_LINE}" "${switch_before}" 60)
 [[ -n "${switched}" ]] && echo "  pgpool switched after ${switched}s"
 assert_gt "#366: pgpool switches within an interval of the primary taking the new password" "${switched:--1}" -1
+# A child that authenticated the role before serves its buffered pool_passwd until the reload
+# makes it reopen the file, so the login is only deterministic after the reload line.
+reloaded=$(wait_log_delta "${RELOAD_LINE}" "${reload_before}" 30)
+assert_gt "#366: ... the rewrite is followed by a PCP reload" "${reloaded:--1}" -1
 sleep 3
-assert_eq "#366: ... the new password logs in through pgpool" "app_user" "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_NEW}" 'SELECT current_user' || true)"
-old_rc=0; via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT 1' >/dev/null || old_rc=$?
-assert_gt "#366: ... and the old one no longer does" "${old_rc}" 0
+# Several sessions, not one: each lands on a different pgpool child, and the stale-buffer
+# failure is per child (a child that authenticated the role before the rotation).
+new_ok=0; old_ok=0
+for i in 1 2 3 4 5 6 7 8; do
+  [[ "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_NEW}" 'SELECT current_user' || true)" == "app_user" ]] && new_ok=$((new_ok + 1))
+  via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT 1' >/dev/null 2>&1 && old_ok=$((old_ok + 1))
+done
+assert_eq "#366: ... the new password logs in through pgpool (8 of 8 sessions)" "8" "${new_ok}"
+assert_eq "#366: ... and the old one no longer does (0 of 8 sessions)" "0" "${old_ok}"
 pool_passwd_366=$(kubectl exec -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool -- cat /usr/local/etc/pool_passwd)
 assert_contains "#366: pool_passwd carries the new password, in place" "${pool_passwd_366}" "app_user:TEXT${APP_PW_NEW}"
 assert_not_contains "#366: ... and not the old one" "${pool_passwd_366}" "${APP_PW_OLD}"
@@ -296,11 +308,14 @@ CHK_PW_NEW="rot-chk-$(date +%s)"
 CHK_SWITCH_LINE='[pool_passwd] pgpool_check: the password rotated in the Secret authenticates against backend 0'
 echo "  #366: rotating the check role on the primary first, then in the Secret..."
 chk_switch_before=$(pgpool_log_count "${CHK_SWITCH_LINE}")
+chk_reload_before=$(pgpool_log_count "${RELOAD_LINE}")
 pg_exec "${NAMESPACE}" "${PRIMARY_366}" "ALTER ROLE pgpool_check PASSWORD '${CHK_PW_NEW}'" >/dev/null
 secret_set pgpool-check-password "${CHK_PW_NEW}"
 chk_switched=$(wait_log_delta "${CHK_SWITCH_LINE}" "${chk_switch_before}" 240)
 [[ -n "${chk_switched}" ]] && echo "  pgpool took the new check password after ${chk_switched}s"
 assert_gt "#366: the check role's new password is switched in once the Secret carries it" "${chk_switched:--1}" -1
+chk_reloaded=$(wait_log_delta "${RELOAD_LINE}" "${chk_reload_before}" 30)
+assert_gt "#366: ... and reloaded" "${chk_reloaded:--1}" -1
 # The health checks ran on the old password while the Secret propagated and may have detached
 # the RO backend; on the new one they pass again and the re-attach loop brings it back.
 attached=false; s=0

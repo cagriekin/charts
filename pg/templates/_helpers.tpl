@@ -2185,20 +2185,28 @@ pcp_auth_note() {
   of the Secret), pgpool's check role and the application role -- from <dir>: the Secret
   mount at first boot, or the loop's "applied" copy afterwards (see the loop for why).
 
-  pool_passwd_write <dir> <file> renders <dir> over <file> IN PLACE, on the same inode, and
-  that is the whole trick. pgpool opens pool_passwd once at startup and every lookup --
-  frontend auth, backend auth, the health and streaming checks -- rewinds that open
-  descriptor and rescans the file (src/auth/pool_passwd.c, pool_get_passwd); the children
-  inherit the descriptor at fork, and a reload (SIGHUP, pcp_reload_config) re-reads
-  pgpool.conf and pool_hba.conf but never reopens pool_passwd. So a file renamed over it is
-  invisible for the life of the process, while bytes written through the same inode are
-  seen by every process on its next lookup, with no reload and no restart. The write avoids
-  the truncate-then-write gap (a lookup landing in it would read an empty file and fail an
-  authentication): `1<>` opens the file read-write WITHOUT truncation and cat writes the new
-  content from offset 0 in one write(2) for anything this small, then the tail of the old
-  content, if the new one is shorter, is cut off. A lookup between those two steps sees the
-  new entries followed by a fragment of the old file: pgpool returns the FIRST matching
-  user, so the fragment can never win, and a partial line matches no user at all.
+  pool_passwd_write <dir> <file> renders <dir> over <file> IN PLACE, on the same inode. How
+  pgpool reads the file decides what a rewrite must look like (src/auth/pool_passwd.c and
+  the callers of pool_reopen_passwd_file, checked on the pinned 4.7 line): every pgpool
+  process -- each child, the health-check and the streaming-check workers -- opens
+  pool_passwd once at its start and keeps that stdio stream; every lookup (frontend auth,
+  backend auth, the checks' own logins) rewinds the stream and rescans. rewind() on a
+  stream whose buffer already holds the file does NOT go back to the kernel, so a process
+  that authenticated once keeps serving the bytes it buffered, whatever the file says now,
+  until it reopens the file -- which it does on SIGHUP (a child at its next accepted
+  connection, the workers at their next loop). So the rewrite is two steps, and the second
+  is the one that makes it visible: write, then pcp_reload_config (the loop does that; the
+  reload re-reads pgpool.conf and pool_hba.conf, which are unchanged, and signals every
+  process). Verified live: after the write alone, a child that had authenticated the role
+  before still answered `md5 authentication failed` for the new password.
+  In place, not a rename, so that nothing is ever lost between the two steps: a process
+  that happens to reopen before the write (a fresh child) and one that reads a fragment
+  during it both see a file whose first matching entry is a real one. `1<>` opens the file
+  read-write WITHOUT truncation and cat writes the new content from offset 0 in one
+  write(2) for anything this small, then the tail of the old content, if the new one is
+  shorter, is cut off. A read between those two steps sees the new entries followed by a
+  fragment of the old file: pgpool returns the FIRST matching user, so the fragment can
+  never win, and a partial line matches no user at all.
 */ -}}
 {{- define "pg.pgpoolPoolPasswdFns" -}}
 pool_passwd_esc() { sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'; }
