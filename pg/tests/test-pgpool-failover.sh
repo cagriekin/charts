@@ -257,6 +257,7 @@ wait_log_delta() {  # <needle> <count-before> <budget-s> -> seconds waited, or "
   echo ""
 }
 PRIMARY_366=$(current_primary)
+[[ -n "${PRIMARY_366}" ]] || { echo "#366: no primary answers; cannot run the rotation checks" >&2; end_suite; print_summary; exit 1; }
 restarts_366=$(pgpool_restarts)
 APP_PW_OLD=$(kubectl get secret "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.data.app-password}' | base64 -d)
 APP_PW_NEW="rot-app-$(date +%s)"

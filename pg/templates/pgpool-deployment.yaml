@@ -35,9 +35,10 @@ spec:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
       annotations:
-        {{- /* pgpool.conf and pool_passwd are rendered into an emptyDir by
+        {{- /* pgpool.conf and pool_hba.conf are rendered into an emptyDir by
                the init container, so configmap changes only reach pods
-               through a template-hash roll */}}
+               through a template-hash roll. pool_passwd is not in the
+               ConfigMap: it follows the mounted Secret (#366). */}}
         checksum/pgpool-config: {{ include (print $.Template.BasePath "/pgpool-configmap.yaml") . | sha256sum }}
         {{- /* pcp.conf is generated into an emptyDir from the admin Secret,
                so chart-managed credential changes only apply via a roll */}}
@@ -151,7 +152,7 @@ spec:
               # tools read it through PCPPASSFILE, 0600 like libpq's pgpass. It lives in
               # the emptyDir beside pcp.conf, so the PCP password never enters the pgpool
               # container's environment. Same escaping as pgpass: \ -> \\, : -> \:
-              PCP_PASS_ESC=$(printf '%s' "$PCP_PASS" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              PCP_PASS_ESC=$(printf '%s' "$PCP_PASS" | pool_passwd_esc)
               PCP_USER_ESC=$(printf '%s' "$PCP_USER" | sed -e 's/\\/\\\\/g')
               printf '127.0.0.1:9898:%s:%s\n' "$PCP_USER_ESC" "$PCP_PASS_ESC" > /usr/local/etc/.pcppass
               chmod 0600 /usr/local/etc/.pcppass
@@ -397,8 +398,7 @@ spec:
               (
                 {{- include "pg.pgpoolPoolPasswdFns" . | nindent 16 }}
                 src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d
-                host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
-                port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+                {{- include "pg.pgpoolBackend0" . | nindent 16 }}
                 while :; do
                   sleep {{ int .Values.pgpool.passwordSync.interval }}
                   changed=0
@@ -534,8 +534,7 @@ spec:
                   [ "$rc" = 2 ] && { pcp_auth_note fail; exit 0; }
                   [ "$rc" = 0 ] || exit 1
                   pcp_auth_note ok
-                  host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
-                  port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+                  {{- include "pg.pgpoolBackend0" . | nindent 18 }}
                   [ -n "$host" ] && [ -n "$port" ] || exit 1
                   pg_isready -h "$host" -p "$port" -t 3 -q || exit 1
                   procs=$(pcp_proc_info -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w -a -v) || exit 1

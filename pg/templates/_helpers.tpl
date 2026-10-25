@@ -2214,6 +2214,14 @@ pool_passwd_write() {
 }
 {{- end -}}
 
+{{- /* Backend 0's host and port from the rendered pgpool.conf (the RW Service in HA, pod 0
+  in standalone), for the readiness probe (#374) and the password-sync gate (#366): one
+  extraction, so the probe, the gate and pgpool agree on what backend 0 is. */ -}}
+{{- define "pg.pgpoolBackend0" -}}
+host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
+port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+{{- end -}}
+
 {{- define "pg.validatePgpoolPasswordSync" -}}
 {{- /* Same pairing rule as pg.validatePgpoolReattach: the password-sync loop (#366) lives in
        the chart's default pgpool command, so a custom pgpool.command drops it while
