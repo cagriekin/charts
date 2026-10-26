@@ -197,10 +197,9 @@ these variables. Nothing injects or reads them any more:
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` | init-config (`sr_check_user`/`health_check_user` and its `pool_passwd` entry), wait-check-role (login probe) |
-| `PGPOOL_CHECK_PASSWORD` | string | yes | secret (`pgpool-check-password`) | init-config (`pool_passwd`) |
-| `APP_USER` / `APP_PASSWORD` | string | yes | `postgresql.app.username` / secret (`app-password`) | init-config (`pool_passwd`, so pgpool accepts the application role) |
-| `PGPASSWORD` | string | yes | secret (`pgpool-check-password`) | wait-check-role (psql login as the check role before pgpool starts) |
+| `PGPOOL_CHECK_USER` | string | yes | `pgpool.checkUser.username` | init-config (`sr_check_user`/`health_check_user` and its `pool_passwd` entry), wait-check-role (login probe), the pgpool container (password-sync loop, #366) |
+| `APP_USER` | string | yes | `postgresql.app.username` | init-config (its `pool_passwd` entry, so pgpool accepts the application role), the pgpool container (password-sync loop) |
+| `/etc/pg-secret/{username,password,database,pgpool-check-password,app-password}` | files | yes | the release Secret, mounted as a volume the kubelet keeps current (#366) | init-config renders `pool_passwd` from them at boot; wait-check-role reads `pgpool-check-password` on every login attempt; the pgpool container's password-sync loop re-renders `pool_passwd` in place when they change. No init container and no loop takes a password from env (the metrics sidecar still does, see below) |
 | `POSTGRES_DB` | string | yes | secret (`database`) | wait-check-role (database the login probe connects to) |
 | `PGSSLMODE` | string | no | `pgpool.tls.backendSslmode`; emitted only when `pgpool.tls.enabled` | wait-check-role and the pgpool container (backend TLS) |
 | `PGSSLROOTCERT` | string | no | `/usr/local/etc/tls/ca.crt`; emitted only when `backendSslmode` is `verify-ca`/`verify-full` | wait-check-role and the pgpool container |

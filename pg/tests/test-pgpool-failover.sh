@@ -225,5 +225,111 @@ done
 assert_eq "#374: pgpool is Ready again once the primary answers" "true" "${ready_again}"
 assert_eq "#374: no restart across the whole episode" "${restarts_375}" "$(pgpool_restarts)"
 
+# --- #366: a password rotated in the release Secret reaches pgpool without a restart ---
+# pool_passwd used to be an env snapshot taken at pod start, and nothing rolled the pod on a
+# Secret change: a rotated password left pgpool on the old one until a restart nobody announced,
+# Ready all the while. Now the Secret is mounted as files and the password-sync loop rewrites
+# pool_passwd in place, gated on the new value logging in to backend 0. Secret first (the
+# application role): pgpool must keep the previous password, say so once, and switch within an
+# interval of the primary taking the new one; then the new password logs in through pgpool and
+# the old does not. Database first (the check role): pgpool must follow the Secret once the
+# kubelet refreshes the mount, and its health checks must end up working again on the new
+# password with every backend attached. No restart anywhere; pgpool stays Ready throughout.
+current_primary() {
+  for p in "${POD0}" "${POD1}"; do
+    [[ "$(pg_exec "${NAMESPACE}" "${p}" "SELECT pg_is_in_recovery()" 2>/dev/null || echo "")" == "f" ]] && { echo "${p}"; return; }
+  done
+}
+# via_pgpool_as <exec-pod> <user> <password> <sql> -> stdout+stderr, psql rc preserved.
+via_pgpool_as() {
+  kubectl exec -n "${NAMESPACE}" "$1" -c postgresql -- \
+    env PGPASSWORD="$3" psql -h "${PGPOOL}" -p 9999 -U "$2" -d testdb --no-psqlrc -tAc "$4" 2>&1
+}
+secret_set() {  # <key> <value>
+  kubectl patch secret "${FULLNAME}" -n "${NAMESPACE}" -p "{\"data\":{\"$1\":\"$(printf '%s' "$2" | base64 -w0)\"}}" >/dev/null
+}
+wait_log_delta() {  # <needle> <count-before> <budget-s> -> seconds waited, or "" on timeout
+  local s=0
+  while [[ ${s} -lt $3 ]]; do
+    [[ "$(pgpool_log_count "$1")" -gt "$2" ]] && { echo "${s}"; return; }
+    sleep 5; s=$((s + 5))
+  done
+  echo ""
+}
+PRIMARY_366=$(current_primary)
+[[ -n "${PRIMARY_366}" ]] || { echo "#366: no primary answers; cannot run the rotation checks" >&2; end_suite; print_summary; exit 1; }
+restarts_366=$(pgpool_restarts)
+APP_PW_OLD=$(kubectl get secret "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.data.app-password}' | base64 -d)
+APP_PW_NEW="rot-app-$(date +%s)"
+WAIT_LINE='[pool_passwd] app_user: the Secret carries a new password that backend 0 does not accept yet'
+SWITCH_LINE='[pool_passwd] app_user: the password rotated in the Secret authenticates against backend 0'
+RELOAD_LINE='[pool_passwd] pool_passwd rewritten in place and pgpool reloaded'
+assert_eq "#366: the application role logs in through pgpool before the rotation" "app_user" "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT current_user' || true)"
+echo "  #366: rotating app-password in the Secret (the database keeps the old one for now)..."
+wait_before=$(pgpool_log_count "${WAIT_LINE}")
+switch_before=$(pgpool_log_count "${SWITCH_LINE}")
+reload_before=$(pgpool_log_count "${RELOAD_LINE}")
+secret_set app-password "${APP_PW_NEW}"
+# The kubelet refreshes a Secret volume on its sync period (about a minute), then the loop sees
+# it within one interval (10s).
+waited=$(wait_log_delta "${WAIT_LINE}" "${wait_before}" 240)
+[[ -n "${waited}" ]] && echo "  pgpool saw the rotated Secret after ${waited}s and kept the previous password"
+assert_gt "#366: pgpool sees the rotated Secret and keeps the previous password while the primary refuses the new one" "${waited:--1}" -1
+assert_eq "#366: ... the old password still logs in through pgpool" "app_user" "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT current_user' || true)"
+sleep 25
+assert_eq "#366: ... logged once per episode, not per pass" "$((wait_before + 1))" "$(pgpool_log_count "${WAIT_LINE}")"
+assert_eq "#366: ... and not switched yet" "${switch_before}" "$(pgpool_log_count "${SWITCH_LINE}")"
+echo "  #366: applying the new app-password on the primary ${PRIMARY_366}..."
+pg_exec "${NAMESPACE}" "${PRIMARY_366}" "ALTER ROLE app_user PASSWORD '${APP_PW_NEW}'" >/dev/null
+switched=$(wait_log_delta "${SWITCH_LINE}" "${switch_before}" 60)
+[[ -n "${switched}" ]] && echo "  pgpool switched after ${switched}s"
+assert_gt "#366: pgpool switches within an interval of the primary taking the new password" "${switched:--1}" -1
+# A child that authenticated the role before serves its buffered pool_passwd until the reload
+# makes it reopen the file, so the login is only deterministic after the reload line.
+reloaded=$(wait_log_delta "${RELOAD_LINE}" "${reload_before}" 30)
+assert_gt "#366: ... the rewrite is followed by a PCP reload" "${reloaded:--1}" -1
+sleep 3
+# Several sessions, not one: each lands on a different pgpool child, and the stale-buffer
+# failure is per child (a child that authenticated the role before the rotation).
+new_ok=0; old_ok=0
+for i in 1 2 3 4 5 6 7 8; do
+  [[ "$(via_pgpool_as "${STANDBY}" app_user "${APP_PW_NEW}" 'SELECT current_user' || true)" == "app_user" ]] && new_ok=$((new_ok + 1))
+  via_pgpool_as "${STANDBY}" app_user "${APP_PW_OLD}" 'SELECT 1' >/dev/null 2>&1 && old_ok=$((old_ok + 1))
+done
+assert_eq "#366: ... the new password logs in through pgpool (8 of 8 sessions)" "8" "${new_ok}"
+assert_eq "#366: ... and the old one no longer does (0 of 8 sessions)" "0" "${old_ok}"
+pool_passwd_366=$(kubectl exec -n "${NAMESPACE}" "${PGPOOL_POD}" -c pgpool -- cat /usr/local/etc/pool_passwd)
+assert_contains "#366: pool_passwd carries the new password, in place" "${pool_passwd_366}" "app_user:TEXT${APP_PW_NEW}"
+assert_not_contains "#366: ... and not the old one" "${pool_passwd_366}" "${APP_PW_OLD}"
+assert_eq "#366: no restart" "${restarts_366}" "$(pgpool_restarts)"
+assert_eq "#366: pgpool stays Ready" "true" "$(pgpool_ready)"
+
+CHK_PW_NEW="rot-chk-$(date +%s)"
+CHK_SWITCH_LINE='[pool_passwd] pgpool_check: the password rotated in the Secret authenticates against backend 0'
+echo "  #366: rotating the check role on the primary first, then in the Secret..."
+chk_switch_before=$(pgpool_log_count "${CHK_SWITCH_LINE}")
+chk_reload_before=$(pgpool_log_count "${RELOAD_LINE}")
+pg_exec "${NAMESPACE}" "${PRIMARY_366}" "ALTER ROLE pgpool_check PASSWORD '${CHK_PW_NEW}'" >/dev/null
+secret_set pgpool-check-password "${CHK_PW_NEW}"
+chk_switched=$(wait_log_delta "${CHK_SWITCH_LINE}" "${chk_switch_before}" 240)
+[[ -n "${chk_switched}" ]] && echo "  pgpool took the new check password after ${chk_switched}s"
+assert_gt "#366: the check role's new password is switched in once the Secret carries it" "${chk_switched:--1}" -1
+chk_reloaded=$(wait_log_delta "${RELOAD_LINE}" "${chk_reload_before}" 30)
+assert_gt "#366: ... and reloaded" "${chk_reloaded:--1}" -1
+# The health checks ran on the old password while the Secret propagated and may have detached
+# the RO backend; on the new one they pass again and the re-attach loop brings it back.
+attached=false; s=0
+while [[ ${s} -lt 90 ]]; do
+  rows=$(via_pgpool "${STANDBY}" "SHOW POOL_NODES" || true)
+  if [[ "$(up_backends "${rows}")" == "2" ]]; then attached=true; echo "  both backends attached after ${s}s"; break; fi
+  sleep 5; s=$((s + 5))
+done
+assert_eq "#366: pgpool's health checks work on the rotated check password (both backends attached)" "true" "${attached}"
+W366="pw-rotated-$(date +%s)"
+w366=$(via_pgpool "${STANDBY}" "INSERT INTO pp_fo (v) VALUES ('${W366}'); SELECT v FROM pp_fo WHERE v='${W366}'" || true)
+assert_contains "#366: ... and writes through pgpool still land" "${w366}" "${W366}"
+assert_eq "#366: no restart across both rotations" "${restarts_366}" "$(pgpool_restarts)"
+assert_eq "#366: pgpool is Ready at the end" "true" "$(pgpool_ready)"
+
 end_suite
 print_summary

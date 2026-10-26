@@ -1008,6 +1008,30 @@ pgpool:
     enabled: true
     interval: 10
 
+  # Password-sync loop (#366). pool_passwd -- the superuser, pgpool.checkUser and
+  # postgresql.app passwords pgpool authenticates clients and its own backend sessions
+  # with -- is rendered from the release Secret, which is mounted into the pgpool pod as
+  # files the kubelet keeps current. Every `interval` seconds the pgpool container compares
+  # those files with what pgpool runs on and, when one changed, rewrites pool_passwd in
+  # place and tells pgpool to reload (pcp_reload_config), after which every pgpool process
+  # reopens the file; no restart. Before this,
+  # a password rotated in the Secret (edited in place when chart-generated, or in
+  # postgresql.existingSecret by any means) reached pgpool only through a restart nobody
+  # announced, and the pod stayed Ready while every login through it failed.
+  # A changed password is switched in only once it authenticates against backend 0 (the
+  # primary) as that role; until then pgpool keeps the previous one, which is the one still
+  # working. So the order of a rotation does not matter: Secret first and the database
+  # later (the agent, the standalone postStart hook or an ALTER ROLE by hand), or the
+  # database first and the Secret later. A value the database keeps refusing is logged
+  # once per episode as `[pool_passwd]` in the pgpool container log and retried. The gate
+  # is one short session as that role per changed value, not per pass.
+  # Part of the chart's default pgpool command: setting pgpool.command with this enabled
+  # fails the render. With it off, pool_passwd is rendered once at pod start, as before,
+  # and a rotated password needs `kubectl rollout restart deployment/<release>-pg-pgpool`.
+  passwordSync:
+    enabled: true
+    interval: 10
+
   podSecurityContext:
     runAsNonRoot: true
     seccompProfile:

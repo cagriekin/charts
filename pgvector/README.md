@@ -375,6 +375,8 @@ The pgBackRest backup CronJob is an apiserver client too — it resolves the cur
 | `pgpool.healthCheck.retryDelay` | Seconds between retries | `1` |
 | `pgpool.reattach.enabled` | Re-attach a backend PgPool reports `down` once it answers `pg_isready` again (#361). Part of the default `pgpool.command` | `true` |
 | `pgpool.reattach.interval` | Seconds between re-attach passes | `10` |
+| `pgpool.passwordSync.enabled` | Follow a password rotated in the release Secret into `pool_passwd` in place (reloaded over PCP), no restart, once it authenticates against the primary (#366). Part of the default `pgpool.command` | `true` |
+| `pgpool.passwordSync.interval` | Seconds between password-sync passes | `10` |
 
 #### PGPool-II Metrics Exporter
 
@@ -1273,6 +1275,8 @@ kubectl exec -it deploy/my-pgvector-pgpool -c pgpool -- pcp_node_info -h localho
 
 Changing the chart-managed credentials rolls the Deployment via the Secret checksum annotation; rotating an existing Secret requires `kubectl rollout restart deployment my-pgvector-pgpool`, because `pcp.conf` is generated at pod start.
 
+The PostgreSQL passwords PGPool-II authenticates with (`password`, `pgpool-check-password` and `app-password` in the release Secret, or the keys `postgresql.existingSecret` maps to them) need no restart (#366): the Secret is mounted into the pgpool pod as files, and a loop in the pgpool container (`pgpool.passwordSync`, part of the default `pgpool.command`) rewrites `pool_passwd` in place when one changes and tells PGPool-II to reload (`pcp_reload_config`), after which every PGPool-II process reopens the file, so the new value is live on the next login with no restart. A changed value is switched in only once it authenticates against the primary as that role, so the Secret and the database may be rotated in either order: Secret first, and PGPool-II keeps the previous password, logs `[pool_passwd] <role>: the Secret carries a new password that backend 0 does not accept yet` once, and switches when the database takes the new one; database first, and logins through PGPool-II fail until the Secret carries the new password and the kubelet has refreshed the mount (about a minute). The database side of an `app-password`/`pgpool-check-password` rotation is applied by the agent (HA) or the postStart hook (standalone) when the PostgreSQL pods next start, or at once with `ALTER ROLE <role> PASSWORD '...'` on the primary; the superuser password is applied by hand only. With `pgpool.passwordSync.enabled=false`, `pool_passwd` is rendered once at pod start and a rotation needs `kubectl rollout restart deployment my-pgvector-pgpool`. The metrics sidecar (`pgpool.metrics`) needs nothing: `pool_hba.conf` trusts localhost, so the password it holds in env is never checked, and its sessions reach the backends through `pool_passwd` like any other.
+
 Node IDs follow the StatefulSet ordinals: node 0 is `my-pgvector-0`, node 1 is `my-pgvector-1`, and so on.
 
 | Column | Meaning |
@@ -1326,4 +1330,4 @@ Verbosity is controlled by the `pgpool.logging.*` values: `logConnections` (defa
 | `failed to connect to PostgreSQL server` / `health check retrying` | A backend is unreachable. The node is marked `down` after `pgpool.healthCheck.maxRetries` retries (default 10, every 3 seconds). |
 | `degenerate backend request ... is canceled because failover is disallowed` | Expected. Both backends are flagged `DISALLOW_TO_FAILOVER`, and the RW backend also `ALWAYS_PRIMARY`: the agent owns failover and re-points the Services, so PGPool-II must not detach nodes itself. |
 | `all backend nodes are down` | No backend is reachable and clients are rejected. The liveness probe restarts PGPool-II, which retries discovery; if the message persists, check the PostgreSQL pods. |
-| `authentication failed` / `password mismatch` | Remote clients authenticate with md5 against `pool_passwd`, which contains only the chart's PostgreSQL user. Other database users cannot authenticate through PGPool-II while `pgpool.allowClearTextFrontendAuth` is `false` (default); either connect them directly to PostgreSQL or set it to `true` so PGPool-II can request their password in clear text and forward it to the backend. |
+| `authentication failed` / `password mismatch` | Remote clients authenticate with md5 against `pool_passwd`, which contains only the chart's PostgreSQL user, its check role and the application role, rendered from the release Secret and kept current by the password-sync loop (#366). Other database users cannot authenticate through PGPool-II while `pgpool.allowClearTextFrontendAuth` is `false` (default); either connect them directly to PostgreSQL or set it to `true` so PGPool-II can request their password in clear text and forward it to the backend. |

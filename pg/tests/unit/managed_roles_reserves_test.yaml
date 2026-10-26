@@ -331,9 +331,10 @@ tests:
       - matchRegex:
           path: data["pgpool.conf"]
           pattern: "health_check_user = '__CHECK_USER__'"
-      - matchRegex:
+      # pool_passwd (the check and application entries) is rendered from the release Secret's
+      # files by the pgpool Deployment since #366, not templated into the ConfigMap.
+      - notExists:
           path: data["pool_passwd"]
-          pattern: '__CHECK_USER__:TEXT__CHECK_PASSWORD__\n__APP_USER__:TEXT__APP_PASSWORD__'
 
   # --- postgresql.database ownership: the maintenance database keeps its owner ---
   - it: a databases[] entry may keep postgres owned by the superuser (the chart leaves it alone)

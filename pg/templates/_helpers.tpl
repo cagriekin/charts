@@ -2169,6 +2169,77 @@ pcp_auth_note() {
 }
 {{- end -}}
 
+{{- /* pool_passwd helpers (#366), shared verbatim by pgpool's init-config container (first
+  render, busybox) and the password-sync loop in the pgpool container (every change, the
+  pgpool image): one rendering of the file, one escaping, nothing to drift. Both read the
+  release Secret as FILES, mounted at /etc/pg-secret, where the kubelet keeps them current
+  (a projected Secret volume is refreshed; env and subPath mounts never are), instead of
+  the env snapshot the init container used to splice into a ConfigMap template.
+
+  pool_passwd_esc escapes a value for pool_passwd: backslash first, then the field separator
+  (\ -> \\, : -> \:). TEXT marks an entry as cleartext: an unprefixed entry is taken as an
+  md5 hash, which works against an md5 backend by accident but cannot answer a scram
+  challenge. $(...) drops a trailing newline, as it did from the env.
+
+  pool_passwd_render <dir> prints the three pooled roles -- the superuser (username/password
+  of the Secret), pgpool's check role and the application role -- from <dir>: the Secret
+  mount at first boot, or the loop's "applied" copy afterwards (see the loop for why).
+
+  pool_passwd_write <dir> <file> renders <dir> over <file> IN PLACE, on the same inode. How
+  pgpool reads the file decides what a rewrite must look like (src/auth/pool_passwd.c and
+  the callers of pool_reopen_passwd_file, checked on the pinned 4.7 line): every pgpool
+  process -- each child, the health-check and the streaming-check workers -- opens
+  pool_passwd once at its start and keeps that stdio stream; every lookup (frontend auth,
+  backend auth, the checks' own logins) rewinds the stream and rescans. rewind() on a
+  stream whose buffer already holds the file does NOT go back to the kernel, so a process
+  that authenticated once keeps serving the bytes it buffered, whatever the file says now,
+  until it reopens the file -- which it does on SIGHUP (a child at its next accepted
+  connection, the workers at their next loop). So the rewrite is two steps, and the second
+  is the one that makes it visible: write, then pcp_reload_config (the loop does that; the
+  reload re-reads pgpool.conf and pool_hba.conf, which are unchanged, and signals every
+  process). Verified live: after the write alone, a child that had authenticated the role
+  before still answered `md5 authentication failed` for the new password.
+  In place, not a rename, so that nothing is ever lost between the two steps: a process
+  that happens to reopen before the write (a fresh child) and one that reads a fragment
+  during it both see a file whose first matching entry is a real one. `1<>` opens the file
+  read-write WITHOUT truncation and cat writes the new content from offset 0 in one
+  write(2) for anything this small, then the tail of the old content, if the new one is
+  shorter, is cut off. A read between those two steps sees the new entries followed by a
+  fragment of the old file: pgpool returns the FIRST matching user, so the fragment can
+  never win, and a partial line matches no user at all.
+*/ -}}
+{{- define "pg.pgpoolPoolPasswdFns" -}}
+pool_passwd_esc() { sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'; }
+pool_passwd_render() {
+  printf '%s:TEXT%s\n' "$(pool_passwd_esc < "$1/username")" "$(pool_passwd_esc < "$1/password")"
+  printf '%s:TEXT%s\n' "$(printf '%s' "$PGPOOL_CHECK_USER" | pool_passwd_esc)" "$(pool_passwd_esc < "$1/pgpool-check-password")"
+  printf '%s:TEXT%s\n' "$(printf '%s' "$APP_USER" | pool_passwd_esc)" "$(pool_passwd_esc < "$1/app-password")"
+}
+pool_passwd_write() {
+  (umask 077; pool_passwd_render "$1" > "$2.new" && : >> "$2") || return 1
+  cat "$2.new" 1<> "$2" && truncate -s "$(wc -c < "$2.new")" "$2"; rc=$?
+  rm -f "$2.new"; return $rc
+}
+{{- end -}}
+
+{{- /* Backend 0's host and port from the rendered pgpool.conf (the RW Service in HA, pod 0
+  in standalone), for the readiness probe (#374) and the password-sync gate (#366): one
+  extraction, so the probe, the gate and pgpool agree on what backend 0 is. */ -}}
+{{- define "pg.pgpoolBackend0" -}}
+host=$(sed -n "s/^backend_hostname0 = '\(.*\)'$/\1/p" /usr/local/etc/pgpool.conf)
+port=$(sed -n "s/^backend_port0 = \(.*\)$/\1/p" /usr/local/etc/pgpool.conf)
+{{- end -}}
+
+{{- define "pg.validatePgpoolPasswordSync" -}}
+{{- /* Same pairing rule as pg.validatePgpoolReattach: the password-sync loop (#366) lives in
+       the chart's default pgpool command, so a custom pgpool.command drops it while
+       pgpool.passwordSync.enabled still reads true, and a rotated password would again wait
+       for a restart that nothing announces. */ -}}
+{{- if and .Values.pgpool.enabled ((.Values.pgpool.passwordSync).enabled) .Values.pgpool.command -}}
+{{- fail "pgpool.passwordSync.enabled=true but pgpool.command is set: the password-sync loop (#366) lives in the chart's default pgpool command, so a custom command drops it and a password rotated in the release Secret would never reach pool_passwd without a restart. Either copy the loop from the chart's default command into yours, or set pgpool.passwordSync.enabled=false." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.validatePgpoolReattach" -}}
 {{- /* The re-attach loop (#361) is part of the chart's default pgpool command, so a custom
        pgpool.command silently drops the only thing that re-attaches a detached read backend

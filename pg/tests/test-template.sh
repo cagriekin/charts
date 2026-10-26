@@ -2216,7 +2216,7 @@ assert_not_contains "#361: no probe opens a session through pgpool" "${pgpool_de
 # file; an authentication fault (the client's exact wording) is fail-open and logged once;
 # PCP not answering still fails. #374: readiness asks backend 0 itself with pg_isready (the
 # loop also uses pg_isready, on detached backends), liveness never does.
-assert_eq "#375: the PCP prelude is shared by the loop and both probes (3 copies)" "3" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PCP_USER=$(cat /usr/local/etc/pcp_user)')"
+assert_eq "#375: the PCP prelude is shared by both loops and both probes (4 copies, the password-sync loop since #366)" "4" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PCP_USER=$(cat /usr/local/etc/pcp_user)')"
 assert_not_contains "#375: nothing parses the PCP user out of pcp.conf" "${pgpool_dep_361}" 'cut -d: -f1 /usr/local/etc/pcp.conf'
 assert_eq "#375: both probes pass fail-open on a PCP authentication fault" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 2 \] && { pcp_auth_note fail; exit 0; }')"
 assert_eq "#375: ... and fail when PCP does not answer" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '\[ "$rc" = 0 \] || exit 1')"
@@ -2239,14 +2239,62 @@ assert_not_contains "#361: pgpool.reattach.enabled=false drops the loop" "${pgpo
 assert_contains "#361: ... and still execs pgpool" "${pgpool_dep_361_off}" "exec pgpool -D -n"
 pgpool_361_cmd=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' 2>&1 || true)
 assert_contains "#361: pgpool.command with the re-attach loop enabled fails the render" "${pgpool_361_cmd}" "pgpool.reattach.enabled=true but pgpool.command is set"
-pgpool_361_cmd_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' --set pgpool.reattach.enabled=false >/dev/null 2>&1 || pgpool_361_cmd_rc=$?
-assert_eq "#361: ... and renders once the loop is disabled" "0" "${pgpool_361_cmd_rc}"
+pgpool_361_cmd_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' --set pgpool.reattach.enabled=false --set pgpool.passwordSync.enabled=false >/dev/null 2>&1 || pgpool_361_cmd_rc=$?
+assert_eq "#361: ... and renders once the loops are disabled (the password-sync loop too, #366)" "0" "${pgpool_361_cmd_rc}"
 pgpool_361_sa=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set ha.enabled=false --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
 assert_contains "#361: the standalone primary is not detachable either" "${pgpool_361_sa}" "backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'"
 pgpool_361_bad_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.interval=0 >/dev/null 2>&1 || pgpool_361_bad_rc=$?
 assert_gt "#361: a zero re-attach interval is refused by the schema" "${pgpool_361_bad_rc}" 0
 pgpool_361_str_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set-string pgpool.healthCheck.maxRetries=many >/dev/null 2>&1 || pgpool_361_str_rc=$?
 assert_gt "#361: a non-integer health-check knob is refused by the schema" "${pgpool_361_str_rc}" 0
+# #366: pool_passwd follows the release Secret. The Secret is a volume (kept current by the
+# kubelet) in both the init container and the pgpool container; one function block renders the
+# file from those files, identical in both copies; the loop gates a changed value on a login to
+# backend 0; no password is env anywhere in the pod any more (the exporter sidecar is off here).
+assert_eq "#366: the release Secret is mounted as files in both init containers and the pgpool container" "3" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'mountPath: /etc/pg-secret')"
+assert_contains "#366: ... projecting the five pool_passwd keys under fixed names" "${pgpool_dep_361}" "path: pgpool-check-password"
+assert_eq "#366: the pool_passwd functions appear twice (init-config and the loop)" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '^ *pool_passwd_esc() {')"
+pgpool_366_fns=$(printf '%s\n' "${pgpool_dep_361}" | sed 's/^ *//' | awk '/^pool_passwd_esc\(\) \{/ { on = 1 } on { print } /^rm -f "\$2.new"; return \$rc$/ { getline; print; print "---"; on = 0 }')
+pgpool_366_a=$(printf '%s\n' "${pgpool_366_fns}" | awk '/^---$/ { n++; next } n == 0')
+pgpool_366_b=$(printf '%s\n' "${pgpool_366_fns}" | awk '/^---$/ { n++; next } n == 1')
+assert_contains "#366: the function block ends with the in-place writer" "${pgpool_366_a}" 'truncate -s "$(wc -c < "$2.new")" "$2"'
+assert_eq "#366: ... and both copies are byte-identical (indentation aside)" "${pgpool_366_a}" "${pgpool_366_b}"
+assert_contains "#366: the writer never renames over pool_passwd (pgpool keeps the inode open)" "${pgpool_366_a}" 'cat "$2.new" 1<> "$2"'
+assert_not_contains "#366: ... no mv onto the file" "${pgpool_366_a}" 'mv '
+assert_eq "#366: init-config seeds the applied copy and renders pool_passwd from it" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'pool_passwd_write /usr/local/etc/.pool_passwd.d /usr/local/etc/pool_passwd')"
+assert_not_contains "#366: pool_passwd is no longer a ConfigMap key" "${agent_pgpool}" "pool_passwd: |"
+assert_not_contains "#366: ... nor a placeholder splice" "${pgpool_dep_361}" "__APP_PASSWORD__"
+assert_not_contains "#366: neither init-config nor the loop takes a password from env" "${pgpool_dep_361}" "name: APP_PASSWORD"
+assert_not_contains "#366: ... (check role)" "${pgpool_dep_361}" "name: PGPOOL_CHECK_PASSWORD"
+assert_not_contains "#366: ... (superuser)" "${pgpool_dep_361}" "name: POSTGRES_PASSWORD"
+assert_contains "#366: wait-check-role reads the check password from the mount on every attempt" "${pgpool_dep_361}" 'PGPASSWORD="$(cat /etc/pg-secret/pgpool-check-password)" PGCONNECT_TIMEOUT=5 psql'
+assert_not_contains "#366: ... not from an env snapshot" "${pgpool_dep_361}" "name: PGPASSWORD"
+assert_eq "#366: the loop gates each changed value on a login to backend 0 as that role" "1" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c 'PGPASSWORD="$(cat "$new")" PGCONNECT_TIMEOUT=5 psql -h "$host" -p "$port" -U "$u"')"
+assert_contains "#366: ... reading backend 0 from pgpool.conf like the readiness probe" "${pgpool_dep_361}" 'src=/etc/pg-secret; applied=/usr/local/etc/.pool_passwd.d'
+assert_contains "#366: a refused value is logged once per episode" "${pgpool_dep_361}" '\[pool_passwd\] $u: the Secret carries a new password that backend 0 does not accept yet'
+assert_contains "#366: ... and the switch" "${pgpool_dep_361}" '\[pool_passwd\] $u: the password rotated in the Secret authenticates against backend 0'
+assert_eq "#366: the loop runs at the configured interval (one sleep per loop: re-attach and password-sync)" "2" "$(printf '%s\n' "${pgpool_dep_361}" | grep -c '^ *sleep 10$')"
+assert_contains "#366: a different refused value opens a new episode (the marker holds the refused value)" "${pgpool_dep_361}" 'elif cmp -s "$new" "$applied/.pending-$f"'
+assert_contains "#366: the Secret file is read once per pass (the gated value is the applied one)" "${pgpool_dep_361}" 'new="$applied/.new-$f"; cat "$src/$f" > "$new"'
+assert_contains "#366: a failed rewrite is retried on the next pass" "${pgpool_dep_361}" '[ -e "$applied/.dirty" ] && changed=1'
+assert_contains "#366: the rewrite is followed by a PCP reload (a process serves its buffered pool_passwd until it reopens it)" "${pgpool_dep_361}" 'if out=$(pcp_reload_config -h 127.0.0.1 -p 9898 -U "$PCP_USER" -w 2>&1); then'
+assert_contains "#366: ... and a failed reload is retried too" "${pgpool_dep_361}" 'pool_passwd rewritten but pgpool could not be told to reload over PCP'
+assert_contains "#366: the loop keeps the probe's empty-backend guard" "${pgpool_dep_361}" '\[ -n "$host" \] && \[ -n "$port" \] || echo "\[pool_passwd\] backend 0 not found'
+assert_contains "#366: init-config tolerates a restart (the applied dir may already exist)" "${pgpool_dep_361}" 'mkdir -p -m 0700 /usr/local/etc/.pool_passwd.d'
+pgpool_366_off=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.passwordSync.enabled=false --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_not_contains "#366: pgpool.passwordSync.enabled=false drops the loop" "${pgpool_366_off}" '\[pool_passwd\]'
+assert_eq "#366: ... but init-config still renders pool_passwd from the Secret files" "1" "$(printf '%s\n' "${pgpool_366_off}" | grep -c '^ *pool_passwd_esc() {')"
+assert_contains "#366: ... and still execs pgpool" "${pgpool_366_off}" "exec pgpool -D -n"
+pgpool_366_cmd=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' 2>&1 || true)
+assert_contains "#366: pgpool.command with the loop enabled fails the render" "${pgpool_366_cmd}" "pgpool.passwordSync.enabled=true but pgpool.command is set"
+pgpool_366_cmd_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.reattach.enabled=false --set pgpool.passwordSync.enabled=false --set 'pgpool.command={/bin/sh,-c,exec pgpool -n}' >/dev/null 2>&1 || pgpool_366_cmd_rc=$?
+assert_eq "#366: ... and renders once both loops are disabled" "0" "${pgpool_366_cmd_rc}"
+pgpool_366_bad_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.passwordSync.interval=0 >/dev/null 2>&1 || pgpool_366_bad_rc=$?
+assert_gt "#366: a zero sync interval is refused by the schema" "${pgpool_366_bad_rc}" 0
+pgpool_366_byo=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set postgresql.existingSecret.enabled=true --set postgresql.existingSecret.name=byo --set postgresql.existingSecret.appPasswordKey=APP_PW --set postgresql.existingSecret.pgpoolCheckPasswordKey=CHK_PW --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "#366: an existing Secret is the mounted one" "${pgpool_366_byo}" "secretName: byo"
+assert_contains "#366: ... with its key names mapped to the fixed paths (app)" "${pgpool_366_byo}" "key: APP_PW"
+assert_contains "#366: ... (check)" "${pgpool_366_byo}" "key: CHK_PW"
 assert_contains "agent pgpool: backend1 is the RO Service" "${agent_pgpool}" "test-pg-readonly"
 assert_contains "agent pgpool: failover disabled" "${agent_pgpool}" "failover_command = ''"
 assert_contains "agent pgpool: fail_over_on_backend_error off" "${agent_pgpool}" "fail_over_on_backend_error = off"

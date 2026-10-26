@@ -738,6 +738,15 @@ pgpool:
     enabled: true
     interval: 10
 
+  # Follows a password rotated in the release Secret into pool_passwd in place and reloads
+  # pgpool over PCP, no restart
+  # (#366); a changed value is switched in once it authenticates against the primary, so
+  # the Secret and the database may be rotated in either order. Part of the default pgpool
+  # command; pgpool.command with this enabled fails the render. See the pg chart values.
+  passwordSync:
+    enabled: true
+    interval: 10
+
   podSecurityContext:
     runAsNonRoot: true
     seccompProfile:
