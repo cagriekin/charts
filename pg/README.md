@@ -1568,7 +1568,7 @@ in its status.
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2 - 1`, since a rollout surges one pod; render-enforced, #368) | `1` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2 - 1`, or `(pgpool.reservedConnections - 1) / 3 - 1` with `pgpool.metrics.enabled`, since a rollout surges one pod; render-enforced, #368) | `1` |
 | `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x (replicaCount + 1) + 1`, or `3 x (replicaCount + 1) + 1` with `pgpool.metrics.enabled` (the exporter logs in as the check role; `replicaCount + 1` counts the pod a rollout surges, #368). Changing it restarts the PostgreSQL pods | `7` |
 | `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |

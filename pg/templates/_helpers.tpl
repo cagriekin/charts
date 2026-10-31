@@ -1183,6 +1183,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end -}}
 
+{{- /* The pgpool Deployment's rollingUpdate.maxSurge, in one place: pg.reservedConnections
+       sizes the check-role reserve over replicaCount + this many pods (#368), so the two can
+       only move together. */ -}}
+{{- define "pg.pgpoolMaxSurge" -}}1{{- end -}}
+
 {{- define "pg.reservedConnections" -}}
 {{- if .Values.pgpool.enabled -}}
 {{- /* Per pgpool pod: a health check and a streaming check, plus the metrics exporter's
@@ -1195,12 +1200,12 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        and pgpool would detach the backend -- the failure the reserve exists to prevent. +1
        covers a reconnect, whose old backend connection stays cached in another pgpool child
        until connection_life_time. */ -}}
-{{- $perReplica := ternary 3 2 .Values.pgpool.metrics.enabled -}}
-{{- $pods := add .Values.pgpool.replicaCount 1 -}}
-{{- $want := add (mul $pods $perReplica) 1 -}}
+{{- $perPod := ternary 3 2 .Values.pgpool.metrics.enabled -}}
+{{- $pods := add .Values.pgpool.replicaCount (include "pg.pgpoolMaxSurge" . | int) -}}
+{{- $want := add (mul $pods $perPod) 1 -}}
 {{- $have := required "pgpool.reservedConnections is required when pgpool.enabled: it sets reserved_connections for pgpool's check role" .Values.pgpool.reservedConnections | int -}}
 {{- if lt $have $want -}}
-{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (%d pods during a rollout, which surges one pod: per pod a health check and a streaming check%s, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own (#368)." $have (int .Values.pgpool.replicaCount) $want (int $pods) (ternary " and the metrics exporter" "" (eq $perReplica 3))) -}}
+{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (%d pods during a rollout, which surges one pod: per pod a health check and a streaming check%s, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own (#368)." $have (int .Values.pgpool.replicaCount) $want (int $pods) (ternary " and the metrics exporter" "" (eq $perPod 3))) -}}
 {{- end -}}
 {{- $have -}}
 {{- else -}}

@@ -1859,6 +1859,7 @@ assert_contains "rehash (#369): the verifier travels in one top-level ALTER USER
 # pods' config checksum (and so must not roll the database).
 cks_pgpool1=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
 cks_pgpool2=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=2 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+assert_contains "reserves: pgpool.replicaCount=2 renders within the default reserve (#368)" "${cks_pgpool2}" "checksum/postgresql-config"
 assert_eq "reserves: scaling pgpool 1 -> 2 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool2}"
 # #368: the minimum counts the pod a rollout surges (maxSurge 1, maxUnavailable 0), so the
 # default 7 covers 2 pgpool replicas, not 3.

@@ -24,7 +24,8 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
-      maxSurge: 1
+      {{- /* From pg.pgpoolMaxSurge: pg.reservedConnections counts the surge pod (#368). */}}
+      maxSurge: {{ include "pg.pgpoolMaxSurge" . }}
   selector:
     matchLabels:
       {{- include "pg.selectorLabels" . | nindent 6 }}
