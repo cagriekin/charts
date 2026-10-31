@@ -85,7 +85,7 @@ tests:
       pgpool.replicaCount: 2
     asserts:
       - failedTemplate:
-          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=2 needs at least 10 \(3 pods during a rollout, which surges one pod: per pod a health check and a streaming check and the metrics exporter, plus 1\)'
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=2 needs at least 10 \(3 pods during a rollout, which surges 1 pod: per pod a health check and a streaming check and the metrics exporter, plus 1\)'
 
   - it: with metrics the default covers 1 pgpool replica
     template: templates/postgresql-configmap.yaml
