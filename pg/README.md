@@ -1568,8 +1568,8 @@ in its status.
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2`, render-enforced) | `1` |
-| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x replicaCount + 1`, or `3 x replicaCount + 1` with `pgpool.metrics.enabled` (the exporter logs in as the check role). Changing it restarts the PostgreSQL pods | `7` |
+| `pgpool.replicaCount` | Number of PGPool-II instances (at most `(pgpool.reservedConnections - 1) / 2 - 1`, since a rollout surges one pod; render-enforced, #368) | `1` |
+| `pgpool.reservedConnections` | `reserved_connections` for pgpool's check role; at least `2 x (replicaCount + 1) + 1`, or `3 x (replicaCount + 1) + 1` with `pgpool.metrics.enabled` (the exporter logs in as the check role; `replicaCount + 1` counts the pod a rollout surges, #368). Changing it restarts the PostgreSQL pods | `7` |
 | `pgpool.checkUser.username` | Non-superuser role pgpool's health and streaming checks log in as (`pg_monitor`, `pg_use_reserved_connections`) | `pgpool_check` |
 | `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
@@ -1763,7 +1763,7 @@ The chart splits connections into three pools:
 | Pool | Who | Size |
 |------|-----|------|
 | `superuser_reserved_connections` | superusers: the agent, backups, hook Jobs, an operator's `psql` | HA: `ha.superuserReservedConnections` (8; at least `postgresql.replicaCount + 1 + 3`, since every agent holds one read session to every node and its short-lived write connection shares the 3; render-enforced). Its own value because it needs a PostgreSQL restart: scaling the database within it rolls nothing, past it the render fails until it is raised (#373). Standalone: 3 |
-| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x pgpool.replicaCount + 1`, `3 x` with `pgpool.metrics.enabled`) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
+| `reserved_connections` | roles with `pg_use_reserved_connections`: pgpool's check role | `pgpool.reservedConnections` (7, at least `2 x (pgpool.replicaCount + 1) + 1`, `3 x` with `pgpool.metrics.enabled`; the `+ 1` inside is the pod a rollout surges, #368) with pgpool, else 0. Its own value because it needs a PostgreSQL restart, so a pgpool scale within it does not roll the database |
 | the rest of `max_connections` | everyone else, applications included | `max_connections` minus the above |
 
 Both reserves live in a chart-owned `reserved-connections.conf`. Setting them in

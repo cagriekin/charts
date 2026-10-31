@@ -1858,8 +1858,12 @@ assert_contains "rehash (#369): the verifier travels in one top-level ALTER USER
 # function of pgpool.replicaCount: scaling pgpool within it must not change the PostgreSQL
 # pods' config checksum (and so must not roll the database).
 cks_pgpool1=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
-cks_pgpool3=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=3 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
-assert_eq "reserves: scaling pgpool 1 -> 3 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool3}"
+cks_pgpool2=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=2 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")
+assert_eq "reserves: scaling pgpool 1 -> 2 leaves the PostgreSQL config checksum unchanged" "${cks_pgpool1}" "${cks_pgpool2}"
+# #368: the minimum counts the pod a rollout surges (maxSurge 1, maxUnavailable 0), so the
+# default 7 covers 2 pgpool replicas, not 3.
+assert_contains "#368: the reserve minimum counts the rollout surge pod" "$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.replicaCount=3 2>&1)" "needs at least 9 (4 pods during a rollout"
+assert_contains "#368: the surge count rests on the pgpool Deployment rolling with maxSurge 1" "$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)" "maxSurge: 1"
 # #373: the same for the database itself. superuser_reserved_connections used to be derived from
 # the node count, so adding a standby rolled every pod, the primary included.
 cks_rc1=$(helm template test-pg "${CHART_DIR}" --set postgresql.replicaCount=1 --show-only templates/statefulset.yaml 2>&1 | grep "checksum/postgresql-config")

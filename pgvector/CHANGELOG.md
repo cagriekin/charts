@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## Unreleased
+
+### Fixed
+
+- **pgpool's check-role reserve counts the pod a rollout surges (#368).** The
+  `pgpool.reservedConnections` minimum was sized on `pgpool.replicaCount` alone, but the pgpool
+  Deployment rolls with `maxSurge: 1, maxUnavailable: 0`, so every rollout (an image bump, a
+  config change, the roll a chart upgrade brings) briefly runs one pod more, and that pod logs in
+  as the check role too. On a node at `max_connections` its health or streaming check could get
+  `53300` from the exhausted reserve and pgpool would detach the backend, the failure the reserve
+  exists to prevent. The minimum is now `2 x (replicaCount + 1) + 1`, or `3 x (replicaCount + 1)
+  + 1` with `pgpool.metrics.enabled`. The default stays `7`: it covers 2 pgpool replicas, or 1
+  with metrics, so the default install (1 replica) renders the same and restarts nothing. **An
+  install at `7` with 3 pgpool replicas, or 2 with metrics, now fails to render** with a message
+  naming the value it needs; raise `pgpool.reservedConnections` (it needs a PostgreSQL restart,
+  so the database pods roll once).
+
 ## 2.6.0 - 2026-10-20
 
 ### Changed

@@ -56,41 +56,43 @@ tests:
       - failedTemplate:
           errorPattern: "(got string, want integer|Invalid type\\. Expected: integer|ha\\.superuserReservedConnections must be an integer)"
 
+  # The minimum counts replicaCount + 1 pgpool pods: the Deployment rolls with maxSurge 1 and
+  # maxUnavailable 0, and the surge pod logs in as the check role too (#368).
   - it: HA with pgpool reserves pgpool.reservedConnections for the check role
     template: templates/postgresql-configmap.yaml
     set:
       pgpool.enabled: true
-      pgpool.replicaCount: 3
+      pgpool.replicaCount: 2
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
           pattern: 'superuser_reserved_connections = 8\n\s*reserved_connections = 7'
 
-  - it: pgpool replicas beyond what reservedConnections covers are refused
+  - it: pgpool replicas beyond what reservedConnections covers, surge pod included, are refused (#368)
     template: templates/statefulset.yaml
     set:
       pgpool.enabled: true
-      pgpool.replicaCount: 4
-    asserts:
-      - failedTemplate:
-          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=4 needs at least 9'
-
-  - it: with metrics the exporter counts, so 3 replicas need 10 reserved connections
-    template: templates/statefulset.yaml
-    set:
-      pgpool.enabled: true
-      pgpool.metrics.enabled: true
       pgpool.replicaCount: 3
     asserts:
       - failedTemplate:
-          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=3 needs at least 10 \(per replica a health check and a streaming check and the metrics exporter, plus 1\)'
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=3 needs at least 9 \(4 pods during a rollout'
 
-  - it: with metrics the default covers 2 pgpool replicas
-    template: templates/postgresql-configmap.yaml
+  - it: with metrics the exporter counts, so 2 replicas need 10 reserved connections (#368)
+    template: templates/statefulset.yaml
     set:
       pgpool.enabled: true
       pgpool.metrics.enabled: true
       pgpool.replicaCount: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 7, but pgpool\.replicaCount=2 needs at least 10 \(3 pods during a rollout, which surges one pod: per pod a health check and a streaming check and the metrics exporter, plus 1\)'
+
+  - it: with metrics the default covers 1 pgpool replica
+    template: templates/postgresql-configmap.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.metrics.enabled: true
+      pgpool.replicaCount: 1
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
@@ -101,11 +103,21 @@ tests:
     set:
       pgpool.enabled: true
       pgpool.replicaCount: 4
-      pgpool.reservedConnections: 9
+      pgpool.reservedConnections: 11
     asserts:
       - matchRegex:
           path: data["reserved-connections.conf"]
-          pattern: 'reserved_connections = 9'
+          pattern: 'reserved_connections = 11'
+
+  - it: one short of the surge pod's share is refused (#368)
+    template: templates/statefulset.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.replicaCount: 4
+      pgpool.reservedConnections: 10
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool\.reservedConnections is 10, but pgpool\.replicaCount=4 needs at least 11 \(5 pods during a rollout'
 
   - it: standalone keeps PostgreSQL's 3 superuser slots
     template: templates/postgresql-configmap.yaml
