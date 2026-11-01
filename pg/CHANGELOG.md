@@ -13,7 +13,9 @@
   naming it, and `values.yaml` holds the only default. An explicit empty value fails as before
   ("not a Go duration"), the deprecated `repmgr.agent.*` spelling still works, and standalone
   (`ha.enabled: false`) is unaffected. **Upgrade note:** a release that nulls one of these keys
-  must set it or drop the override.
+  must set it or drop the override, and `helm upgrade --reuse-values` from a release older than
+  2.5.0 now fails on `saturationGrace` (Helm renders on the old chart's `values.yaml`, which lacks
+  it): use `--reset-then-reuse-values` or set the key.
 
 - **pgpool's check-role reserve counts the pod a rollout surges (#368).** The
   `pgpool.reservedConnections` minimum was sized on `pgpool.replicaCount` alone, but the pgpool

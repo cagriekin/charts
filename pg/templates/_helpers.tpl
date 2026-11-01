@@ -1946,6 +1946,10 @@ silently on that hidden copy. values.yaml is now the only default. `fail`, not `
 A key present with a nil value counts as absent: Helm deletes a nulled ha.agent key, but a
 nulled repmgr.agent alias key survives as nil and pg.normalizeValues' mergeOverwrite copies it
 over the ha.agent value, which toString would report as the non-duration "<nil>".
+`helm upgrade --reuse-values` also lands here for a key newer than the release's chart
+(saturationGrace, 2.5.0): Helm renders on the OLD chart's values.yaml, so the message names
+--reset-then-reuse-values. The env name in the message is the key in SCREAMING_SNAKE, the same
+spelling statefulset.yaml emits, so no second key->env table has to agree with it.
 */ -}}
 {{- define "pg.haAgentDuration" -}}
 {{- $agent := index . 0 -}}
@@ -1953,8 +1957,7 @@ over the ha.agent value, which toString would report as the non-duration "<nil>"
 {{- if and (hasKey $agent $key) (not (kindIs "invalid" (index $agent $key))) -}}
 {{- index $agent $key | toString -}}
 {{- else -}}
-{{- $env := get (dict "leaseDuration" "LEASE_DURATION" "renewDeadline" "RENEW_DEADLINE" "retryPeriod" "RETRY_PERIOD" "reconcileInterval" "RECONCILE_INTERVAL" "saturationGrace" "SATURATION_GRACE") $key -}}
-{{- fail (printf "ha.agent.%s is missing. The chart's values.yaml sets it, so it was removed: `--set ha.agent.%s=null` deletes the key, and so does a values file that sets it to null, under ha.agent or the deprecated repmgr.agent alias. The agent reads it as %s and the chart supplies no hidden fallback. Set it to a Go duration, e.g. \"15s\", or drop the override to get the chart's value (#367)." $key $key $env) -}}
+{{- fail (printf "ha.agent.%s is missing. The chart's values.yaml sets it, so either it was removed -- `--set ha.agent.%s=null` deletes the key, and so does a values file that sets it to null, under ha.agent or the deprecated repmgr.agent alias -- or this is `helm upgrade --reuse-values` from a chart version that predates the key (Helm then renders on the OLD chart's values.yaml; use --reset-then-reuse-values). The agent reads it as %s and the chart supplies no hidden fallback. Set it to a Go duration, e.g. \"15s\", or drop the override to get the chart's value (#367)." $key $key ($key | snakecase | upper)) -}}
 {{- end -}}
 {{- end -}}
 
