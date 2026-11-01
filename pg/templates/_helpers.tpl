@@ -1160,8 +1160,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            scale step. Standalone has no agent: PostgreSQL's own 3.
          - reserved_connections (PostgreSQL 16+): roles with pg_use_reserved_connections,
            i.e. pgpool's check role: pgpool.reservedConnections, at least 2 per pgpool
-           replica (a health check and a streaming check; 3 with pgpool.metrics, whose
-           exporter logs in as the check role) plus 1. 0 without pgpool.
+           pod (a health check and a streaming check; 3 with pgpool.metrics, whose
+           exporter logs in as the check role), counting the pod a rollout surges (#368),
+           plus 1. 0 without pgpool.
          - the rest: everyone else, applications included.
        Chart-owned: setting either in postgresql.configuration is refused, so there is one
        source of truth and the sizing cannot silently drift from the topology. */ -}}
@@ -1182,17 +1183,30 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end -}}
 
+{{- /* The pgpool Deployment's rollingUpdate.maxSurge, in one place: pg.reservedConnections
+       sizes the check-role reserve over replicaCount + this many pods (#368), so the two can
+       only move together. */ -}}
+{{- define "pg.pgpoolMaxSurge" -}}1{{- end -}}
+
 {{- define "pg.reservedConnections" -}}
 {{- if .Values.pgpool.enabled -}}
-{{- /* Per pgpool replica: a health check and a streaming check, plus the metrics exporter's
-       one session when pgpool.metrics is on (it logs in as the check role too). +1 covers a
-       reconnect, whose old backend connection stays cached in another pgpool child until
-       connection_life_time. */ -}}
-{{- $perReplica := ternary 3 2 .Values.pgpool.metrics.enabled -}}
-{{- $want := add (mul .Values.pgpool.replicaCount $perReplica) 1 -}}
+{{- /* Per pgpool pod: a health check and a streaming check, plus the metrics exporter's
+       one session when pgpool.metrics is on (it logs in as the check role too). Counted over
+       replicaCount + 1 pods (#368): the Deployment rolls with maxSurge 1 and maxUnavailable 0,
+       so every rollout (an image bump, a config change, the roll a chart upgrade brings) runs
+       one pod more than replicaCount, and the surge pod logs in as the check role from its
+       wait-check-role init container on. Sized on replicaCount alone, a rollout on a node at
+       max_connections could leave the surge pod's check a 53300 from an exhausted reserve,
+       and pgpool would detach the backend -- the failure the reserve exists to prevent. +1
+       covers a reconnect, whose old backend connection stays cached in another pgpool child
+       until connection_life_time. */ -}}
+{{- $perPod := ternary 3 2 .Values.pgpool.metrics.enabled -}}
+{{- $surge := include "pg.pgpoolMaxSurge" . | int -}}
+{{- $pods := add .Values.pgpool.replicaCount $surge -}}
+{{- $want := add (mul $pods $perPod) 1 -}}
 {{- $have := required "pgpool.reservedConnections is required when pgpool.enabled: it sets reserved_connections for pgpool's check role" .Values.pgpool.reservedConnections | int -}}
 {{- if lt $have $want -}}
-{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (per replica a health check and a streaming check%s, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own." $have (int .Values.pgpool.replicaCount) $want (ternary " and the metrics exporter" "" (eq $perReplica 3))) -}}
+{{- fail (printf "pgpool.reservedConnections is %d, but pgpool.replicaCount=%d needs at least %d (%d pods during a rollout, which surges %d pod: per pod a health check and a streaming check%s, plus 1). Raise pgpool.reservedConnections; it needs a PostgreSQL restart, which is why it does not follow replicaCount on its own (#368)." $have (int .Values.pgpool.replicaCount) $want (int $pods) $surge (ternary " and the metrics exporter" "" (eq $perPod 3))) -}}
 {{- end -}}
 {{- $have -}}
 {{- else -}}
