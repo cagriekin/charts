@@ -1928,16 +1928,31 @@ here -- but the caller must be careful not to have replaced it with a default fi
 {{- end -}}
 
 {{- /*
-pg.haAgentDuration -- the effective value of one ha.agent duration key, WITHOUT collapsing an
-explicitly-set empty string into the chart default. `$agent.x | default "15s"` does collapse it,
-which is how an empty leaseDuration used to be validated as 15s while statefulset.yaml emitted
-`value: ""` -- and Go rejects "", so config.Load fail-fasts and every pod CrashLoopBackOffs
-after a clean render (#291 review). hasKey is the distinction `default` cannot make.
+pg.haAgentDuration -- the value of one ha.agent duration key, as set, for both readers: the
+pg.validateLeaseTimings guard and the agent env in statefulset.yaml, so the two can never
+diverge.
+
+An explicitly-set empty string is returned as "", NOT collapsed into a default.
+`$agent.x | default "15s"` does collapse it, which is how an empty leaseDuration used to be
+validated as 15s while statefulset.yaml emitted `value: ""` -- and Go rejects "", so config.Load
+fail-fasts and every pod CrashLoopBackOffs after a clean render (#291 review). hasKey is the
+distinction `default` cannot make; "" then fails the guard as "not a Go duration".
+
+An ABSENT key fails the render (#367). It used to fall back to a default written into each call
+site, a second and third copy of values.yaml's that had to agree by hand, and a key removed with
+`--set ha.agent.<key>=null` (Helm deletes a nulled key) or nulled in a values file rendered
+silently on that hidden copy. values.yaml is now the only default. `fail`, not `required`:
+`required` rejects "" too, which would swap the explicit-empty message for this one.
 */ -}}
 {{- define "pg.haAgentDuration" -}}
 {{- $agent := index . 0 -}}
 {{- $key := index . 1 -}}
-{{- if hasKey $agent $key -}}{{- index $agent $key | toString -}}{{- else -}}{{- index . 2 -}}{{- end -}}
+{{- if hasKey $agent $key -}}
+{{- index $agent $key | toString -}}
+{{- else -}}
+{{- $env := get (dict "leaseDuration" "LEASE_DURATION" "renewDeadline" "RENEW_DEADLINE" "retryPeriod" "RETRY_PERIOD" "reconcileInterval" "RECONCILE_INTERVAL" "saturationGrace" "SATURATION_GRACE") $key -}}
+{{- fail (printf "ha.agent.%s is missing. The chart's values.yaml sets it, so it was removed: `--set ha.agent.%s=null` deletes the key, and so does a values file that sets it to null. The agent reads it as %s and the chart supplies no hidden fallback. Set it to a Go duration, e.g. \"15s\", or drop the override to get the chart's value (#367)." $key $key $env) -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "pg.validateLeaseTimings" -}}
@@ -1954,14 +1969,14 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- $agent := .Values.ha.agent | default dict -}}
 {{- /* Every ha.agent key the agent parses with time.ParseDuration, not just the ordering
        triple: config.Load treats them all the same way, so an unparseable reconcileInterval
-       refuses the boot exactly like an unparseable leaseDuration (#291 review). Defaults here
-       must match values.yaml. */ -}}
+       refuses the boot exactly like an unparseable leaseDuration (#291 review). values.yaml
+       holds the only default; an absent key fails here, naming it (#367). */ -}}
 {{- $durations := list
-      (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration"     "15s")))
-      (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline"     "10s")))
-      (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod"       "2s")))
-      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s")))
-      (list "saturationGrace"   (include "pg.haAgentDuration" (list $agent "saturationGrace"   "2m"))) -}}
+      (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration")))
+      (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline")))
+      (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod")))
+      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval")))
+      (list "saturationGrace"   (include "pg.haAgentDuration" (list $agent "saturationGrace"))) -}}
 {{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
        time.ParseDuration rejects `15`, `20 s`, `15S` and ``, so the agent would refuse to start
        and every pod would CrashLoopBackOff after a clean render (#291 review). */ -}}

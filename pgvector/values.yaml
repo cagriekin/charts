@@ -404,6 +404,9 @@ ha:
 
   # Agent tunables. Defaults suit a stable control plane; raise for managed clouds
   # (e.g. 30s/20s/4s) so brief apiserver blips do not trip an unnecessary demote.
+  # The five durations (leaseDuration .. saturationGrace) are required: these values are
+  # the only defaults, and removing one (e.g. `--set ha.agent.leaseDuration=null`) fails
+  # the render, naming it (#367).
   agent:
     leaseDuration: 15s
     renewDeadline: 10s

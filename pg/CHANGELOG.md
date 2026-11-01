@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **A missing `ha.agent` duration fails the render instead of running on a hidden default
+  (#367).** `leaseDuration`, `renewDeadline`, `retryPeriod`, `reconcileInterval` and
+  `saturationGrace` reached the agent through a helper that substituted a default written into
+  the template when the key was absent, a second copy of `values.yaml`'s that had to agree by
+  hand. A key removed with `--set ha.agent.<key>=null` (Helm deletes a nulled key), or nulled in a
+  values file, rendered silently on that copy. Now an absent key fails the render with a message
+  naming it, and `values.yaml` holds the only default. An explicit empty value fails as before
+  ("not a Go duration"), the deprecated `repmgr.agent.*` spelling still works, and standalone
+  (`ha.enabled: false`) is unaffected. **Upgrade note:** a release that nulls one of these keys
+  must set it or drop the override.
+
 - **pgpool's check-role reserve counts the pod a rollout surges (#368).** The
   `pgpool.reservedConnections` minimum was sized on `pgpool.replicaCount` alone, but the pgpool
   Deployment rolls with `maxSurge: 1, maxUnavailable: 0`, so every rollout (an image bump, a
