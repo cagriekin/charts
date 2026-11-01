@@ -1943,15 +1943,18 @@ site, a second and third copy of values.yaml's that had to agree by hand, and a 
 `--set ha.agent.<key>=null` (Helm deletes a nulled key) or nulled in a values file rendered
 silently on that hidden copy. values.yaml is now the only default. `fail`, not `required`:
 `required` rejects "" too, which would swap the explicit-empty message for this one.
+A key present with a nil value counts as absent: Helm deletes a nulled ha.agent key, but a
+nulled repmgr.agent alias key survives as nil and pg.normalizeValues' mergeOverwrite copies it
+over the ha.agent value, which toString would report as the non-duration "<nil>".
 */ -}}
 {{- define "pg.haAgentDuration" -}}
 {{- $agent := index . 0 -}}
 {{- $key := index . 1 -}}
-{{- if hasKey $agent $key -}}
+{{- if and (hasKey $agent $key) (not (kindIs "invalid" (index $agent $key))) -}}
 {{- index $agent $key | toString -}}
 {{- else -}}
 {{- $env := get (dict "leaseDuration" "LEASE_DURATION" "renewDeadline" "RENEW_DEADLINE" "retryPeriod" "RETRY_PERIOD" "reconcileInterval" "RECONCILE_INTERVAL" "saturationGrace" "SATURATION_GRACE") $key -}}
-{{- fail (printf "ha.agent.%s is missing. The chart's values.yaml sets it, so it was removed: `--set ha.agent.%s=null` deletes the key, and so does a values file that sets it to null. The agent reads it as %s and the chart supplies no hidden fallback. Set it to a Go duration, e.g. \"15s\", or drop the override to get the chart's value (#367)." $key $key $env) -}}
+{{- fail (printf "ha.agent.%s is missing. The chart's values.yaml sets it, so it was removed: `--set ha.agent.%s=null` deletes the key, and so does a values file that sets it to null, under ha.agent or the deprecated repmgr.agent alias. The agent reads it as %s and the chart supplies no hidden fallback. Set it to a Go duration, e.g. \"15s\", or drop the override to get the chart's value (#367)." $key $key $env) -}}
 {{- end -}}
 {{- end -}}
 

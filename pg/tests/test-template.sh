@@ -6430,6 +6430,11 @@ for _k in leaseDuration renewDeadline retryPeriod reconcileInterval saturationGr
     --set "ha.agent.${_k}=null" >/dev/null 2>&1 || _miss_rc=$?
   assert_eq "#367: standalone with ha.agent.${_k}=null still renders" "0" "${_miss_rc}"
 done
+# A nulled 1.x alias key survives coalescing as nil and is merged over ha.agent; it is absent too,
+# not the non-duration "<nil>".
+_alias_null_out=$(helm template test-pg "${CHART_DIR}" --set repmgr.agent.leaseDuration=null 2>&1 || true)
+assert_contains "#367: repmgr.agent.leaseDuration=null fails as missing" "${_alias_null_out}" "ha.agent.leaseDuration is missing"
+assert_not_contains "#367: ...not as the non-duration \"<nil>\"" "${_alias_null_out}" '"<nil>"'
 # The #291 distinction holds: an explicit empty value is present, so it fails as a non-duration.
 assert_contains "#367: an explicit empty leaseDuration still fails as not a Go duration" \
   "$(helm template test-pg "${CHART_DIR}" --set-string 'ha.agent.leaseDuration=' 2>&1 || true)" 'is "", which is not a Go duration'
