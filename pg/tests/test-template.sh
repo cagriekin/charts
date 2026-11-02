@@ -6418,6 +6418,33 @@ helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.rep
   --set ha.agent.leaseDuration=5s --set ha.agent.renewDeadline=10s --set ha.agent.retryPeriod=2s \
   >/dev/null 2>&1 || sa_bad_rc=$?
 assert_eq "#298: standalone ignores an out-of-order leftover lease triple" "0" "${sa_bad_rc}"
+# #367: values.yaml is the only default for the five agent durations. A key removed with
+# `--set ...=null` (Helm deletes it) fails the render in agent mode, naming the key, instead of
+# rendering on a fallback written into the template; standalone still ignores them.
+for _k in leaseDuration renewDeadline retryPeriod reconcileInterval saturationGrace; do
+  _miss_out=$(helm template test-pg "${CHART_DIR}" --set "ha.agent.${_k}=null" 2>&1 || true)
+  assert_contains "#367: agent mode with ha.agent.${_k}=null fails, naming the key" "${_miss_out}" "ha.agent.${_k} is missing"
+  assert_not_contains "#367: ...not with a raw nil-pointer (${_k})" "${_miss_out}" "nil pointer evaluating"
+  _miss_rc=0
+  helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+    --set "ha.agent.${_k}=null" >/dev/null 2>&1 || _miss_rc=$?
+  assert_eq "#367: standalone with ha.agent.${_k}=null still renders" "0" "${_miss_rc}"
+done
+# A nulled 1.x alias key survives coalescing as nil and is merged over ha.agent; it is absent too,
+# not the non-duration "<nil>".
+_alias_null_out=$(helm template test-pg "${CHART_DIR}" --set repmgr.agent.leaseDuration=null 2>&1 || true)
+assert_contains "#367: repmgr.agent.leaseDuration=null fails as missing" "${_alias_null_out}" "ha.agent.leaseDuration is missing"
+assert_not_contains "#367: ...not as the non-duration \"<nil>\"" "${_alias_null_out}" '"<nil>"'
+# The #291 distinction holds: an explicit empty value is present, so it fails as a non-duration.
+assert_contains "#367: an explicit empty leaseDuration still fails as not a Go duration" \
+  "$(helm template test-pg "${CHART_DIR}" --set-string 'ha.agent.leaseDuration=' 2>&1 || true)" 'is "", which is not a Go duration'
+# The 1.x alias still fills the key; the other four come from values.yaml.
+alias_env=$(helm template test-pg "${CHART_DIR}" --set repmgr.agent.leaseDuration=20s --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#367: repmgr.agent.leaseDuration still reaches LEASE_DURATION" "$(grep -A1 'name: LEASE_DURATION$' <<< "${alias_env}")" 'value: "20s"'
+assert_contains "#367: ...and SATURATION_GRACE comes from values.yaml" "$(grep -A1 'name: SATURATION_GRACE$' <<< "${alias_env}")" 'value: "2m"'
+# No call site carries its own default any more.
+assert_eq "#367: no pg.haAgentDuration call passes a default" "0" \
+  "$(cat "${CHART_DIR}"/templates/*.yaml "${CHART_DIR}"/templates/*.tpl | grep -cE 'haAgentDuration" \(list [^)]*"[0-9][^"]*"\)' || true)"
 # ...and the guard still fires in HA mode, which is the point of scoping rather than deleting.
 ha_bad_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=5s >/dev/null 2>&1 || ha_bad_rc=$?

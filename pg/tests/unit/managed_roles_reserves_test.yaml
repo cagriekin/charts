@@ -138,6 +138,14 @@ tests:
       - failedTemplate:
           errorPattern: 'ha\.agent\.saturationGrace is "0s": it must be a positive duration'
 
+  - it: a removed saturationGrace fails the render, naming it, instead of a hidden default (#367)
+    template: templates/statefulset.yaml
+    set:
+      ha.agent.saturationGrace: null
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ha\.agent\.saturationGrace is missing\..*SATURATION_GRACE.*\(#367\)'
+
   - it: the agent receives SATURATION_GRACE
     template: templates/statefulset.yaml
     asserts:

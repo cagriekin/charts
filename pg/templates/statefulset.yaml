@@ -881,21 +881,22 @@ spec:
             {{- /* Rendered through pg.haAgentDuration -- the SAME helper the
                    pg.validateLeaseTimings guard reads -- so the emitted value can never
                    diverge from the validated one (#298 review): `--set
-                   ha.agent.leaseDuration=null` DELETES the key, the validator then
-                   checks the default, but the raw `.Values` render emitted `value: ""`,
+                   ha.agent.leaseDuration=null` DELETES the key, the validator once
+                   checked a default, but the raw `.Values` render emitted `value: ""`,
                    which config.Load refuses -- every pod CrashLoopBackOffed after a
                    clean render, the exact failure class the #291 validator exists to
-                   prevent. Defaults must match values.yaml. */}}
+                   prevent. values.yaml holds the only default: an absent key fails the
+                   render in pg.validateLeaseTimings above, naming it (#367). */}}
             - name: LEASE_DURATION
-              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "leaseDuration" "15s") | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "leaseDuration") | quote }}
             - name: RENEW_DEADLINE
-              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "renewDeadline" "10s") | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "renewDeadline") | quote }}
             - name: RETRY_PERIOD
-              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "retryPeriod" "2s") | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "retryPeriod") | quote }}
             - name: RECONCILE_INTERVAL
-              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval" "5s") | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval") | quote }}
             - name: SATURATION_GRACE
-              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "saturationGrace" "2m") | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "saturationGrace") | quote }}
 {{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and
