@@ -1153,3 +1153,28 @@ func TestRestartNotGatedWhenRestoreIsDisabled(t *testing.T) {
 		t.Errorf("submitted = %v", h.nd.submitted)
 	}
 }
+
+// #275: the loop never switches over to a nofailover member, so the API refuses it rather
+// than recording a request the loop would sit on.
+func TestSwitchoverRefusesANoFailoverCandidate(t *testing.T) {
+	h := newHarness(t, nil)
+	h.cl.marker.NoFailover = []string{"pg-1"}
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "nofailover") {
+		t.Errorf("body: %s", rec.Body.String())
+	}
+	if h.cl.switchTarget != "" {
+		t.Error("nothing should be written")
+	}
+}
+
+func TestClusterShowsMemberTags(t *testing.T) {
+	h := newHarness(t, nil)
+	h.cl.marker.NoFailover = []string{"pg-1"}
+	h.cl.marker.NoLoadBalance = []string{"pg-2"}
+	resp := decode[ClusterResponse](t, h.do("GET", "/v1/cluster", "", "ops"))
+	if strings.Join(resp.Intents.NoFailover, ",") != "pg-1" || strings.Join(resp.Intents.NoLoadBalance, ",") != "pg-2" {
+		t.Errorf("intents: %+v", resp.Intents)
+	}
+}

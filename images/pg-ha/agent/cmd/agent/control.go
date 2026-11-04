@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/control"
@@ -415,6 +416,8 @@ func (c clusterAPI) Marker(ctx context.Context) (control.MarkerView, error) {
 		PausedBy:         m.PausedBy,
 		SwitchoverTarget: m.SwitchoverTarget,
 		Primary:          m.Primary,
+		NoFailover:       m.NoFailover,
+		NoLoadBalance:    m.NoLoadBalance,
 	}, nil
 }
 
@@ -608,6 +611,8 @@ func (a *agent) publishSnapshot(ctx context.Context, obs reconcile.Observation, 
 		SwitchoverTarget: obs.SwitchoverTarget,
 		MarkerPresent:    obs.Marker.Present,
 		MarkerPrimary:    obs.Marker.Primary,
+		NoFailover:       sortedMembers(obs.NoFailover),
+		NoLoadBalance:    sortedMembers(obs.NoLoadBalance),
 		Local: control.MemberState{
 			Name:       a.cfg.PodName,
 			Self:       true,
@@ -754,4 +759,17 @@ func intentBudget(reconcileInterval time.Duration) time.Duration {
 // routes. Safe to construct unconditionally: nothing runs until a route is called.
 func newPgbackrest(stanza, statusPath string) pgbackrest.Client {
 	return pgbackrest.Client{Exec: pg.OSExec{}, Stanza: stanza, StatusPath: statusPath}
+}
+
+// sortedMembers lists a member-tag set in a stable order for the API (#275).
+func sortedMembers(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }

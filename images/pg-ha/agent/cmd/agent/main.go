@@ -298,6 +298,9 @@ type agent struct {
 	// paused and towards keeping the highwater armed, and it is re-read every tick.
 	lastMarker   k8s.Marker
 	lastMarkerOK bool
+	// lastMemberTags is the member-tag state last logged (#275), so a change is logged once
+	// rather than every tick.
+	lastMemberTags string
 
 	// fenceGen counts COMPLETED demotes -- OnLost's fence and every planned step-down. It
 	// exists to sequence tick()'s servingRW derivation against them (#298 review).
@@ -494,6 +497,7 @@ func (a *agent) run() {
 	// lease: the etcd backend revokes its session lease in a deferred releaseSession and
 	// the K8s backend empties the Lease after OnStoppedLeading. The shutdown path below
 	// waits on it before closing the client (#298 review).
+	a.initialCandidacy(ctx)
 	dcsDone := make(chan struct{})
 	go func() {
 		defer close(dcsDone)
@@ -1398,6 +1402,19 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	}
 	// Controlled switchover (Part H2): the requested handoff target, if any.
 	o.SwitchoverTarget = m.SwitchoverTarget
+	// Member tags (#275).
+	o.NoFailover = memberSet(m.NoFailover)
+	o.NoLoadBalance = memberSet(m.NoLoadBalance)
+	a.logMemberTags(m)
+	// Candidacy follows the tag, with two exceptions that are both "resuming is not a
+	// failover": a tagged node whose data is primary-state, and the primary the marker
+	// records, keep contending (leadershipCandidate). Without them, tagging the primary and
+	// restarting the cluster would leave its data -- the most advanced there is -- to be
+	// rewound under a standby's promotion. Left alone when the marker could not be read at
+	// all: no tags is a guess there, not an observation.
+	if !o.MarkerUnreadable {
+		a.dcs.SetCandidate(leadershipCandidate(o))
+	}
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover. Suppressed while
@@ -3939,7 +3956,68 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 	if _, err := a.kube.PatchWriteSelector(ctx, a.cfg.MasterService, a.cfg.PodName); err != nil {
 		return err
 	}
-	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers))
+	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers, obs.NoLoadBalance))
+}
+
+// initialCandidacy parks the election before it starts when this pod is tagged
+// pg-ha/nofailover (#275). The first tick sets candidacy from the full observation, but
+// boot() runs before it and can take minutes (a clone), and a tagged standby contending for
+// all of that time can win the lock just as the primary goes away. Best-effort: on a failed
+// read the node contends as before, and the decider still never promotes it. A tagged
+// primary-state node is re-enabled by the first tick (see observe).
+func (a *agent) initialCandidacy(ctx context.Context) {
+	mctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer cancel()
+	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
+	if err != nil {
+		return
+	}
+	if memberSet(m.NoFailover)[a.cfg.PodName] {
+		a.dcs.SetCandidate(false)
+	}
+}
+
+// leadershipCandidate is the candidacy rule observe applies (#275): an eligible node always
+// contends (untagged, or the primary the marker records -- see reconcile.FailoverEligible); a
+// nofailover node otherwise contends only while its data is primary-state, so winning
+// resumes a role it already holds rather than failing over onto it.
+func leadershipCandidate(o reconcile.Observation) bool {
+	return reconcile.FailoverEligible(o, o.LocalNode) || (o.Local.HasData && !o.Local.InRecovery)
+}
+
+// memberSet turns a parsed member-tag list into the lookup set the Observation carries
+// (#275); nil for an empty list, so an untagged cluster's Observation is unchanged.
+func memberSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// logMemberTags logs the member tags when they change (#275), and names any entry that is
+// not a pod of this cluster: a typo such as "pg-1" for "mydb-pg-1" tags nobody, and the
+// operator who set it believes a node is out of the election when it is not.
+func (a *agent) logMemberTags(m k8s.Marker) {
+	key := strings.Join(m.NoFailover, ",") + "|" + strings.Join(m.NoLoadBalance, ",")
+	if key == a.lastMemberTags {
+		return
+	}
+	a.lastMemberTags = key
+	a.log.Info("member tags", "nofailover", m.NoFailover, "noloadbalance", m.NoLoadBalance)
+	for _, l := range []struct {
+		ann   string
+		names []string
+	}{{k8s.NoFailoverAnnotation, m.NoFailover}, {k8s.NoLoadBalanceAnnotation, m.NoLoadBalance}} {
+		for _, n := range l.names {
+			if !a.validPeerName(n) {
+				a.log.Warn("member tag names no pod of this cluster; it tags nobody", "annotation", l.ann, "name", n, "expected", a.base+"-<ordinal>")
+			}
+		}
+	}
 }
 
 // assertSyncStandbySlots reconciles synchronized_standby_slots to the primary's current
@@ -4018,18 +4096,28 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
 }
 
+// RoleLabelStandbyNoLoadBalance is the pg-role value of a noloadbalance-tagged standby (#275).
+const RoleLabelStandbyNoLoadBalance = "standby-noloadbalance"
+
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the
 // #140 3-way classification): self is the primary; an in-recovery peer is a
 // standby (joins the read-only Service); a reachable non-recovery peer is an
 // orphan (a divergent second primary -- kept OUT of read traffic); an unreachable
 // peer is omitted so ReconcilePodLabels leaves its label untouched rather than
 // churning a node it cannot classify.
-func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]string {
+//
+// A standby tagged pg-ha/noloadbalance (#275) is labeled RoleLabelStandbyNoLoadBalance
+// instead: Service selectors are equality-only, so the read-only Service (which selects
+// pg-role=standby) can only drop a pod whose label VALUE differs. Its pg-role still says it
+// is a standby, and untagging it puts it back on the next primary tick.
+func desiredRoleLabels(self string, peers []reconcile.PeerState, noLoadBalance map[string]bool) map[string]string {
 	m := map[string]string{self: "primary"}
 	for _, p := range peers {
 		switch {
 		case !p.Reachable:
 			// omit: leave the label untouched
+		case p.Role == pg.RoleStandby && noLoadBalance[p.Name]:
+			m[p.Name] = RoleLabelStandbyNoLoadBalance
 		case p.Role == pg.RoleStandby:
 			m[p.Name] = "standby"
 		case p.Role == pg.RolePrimary:

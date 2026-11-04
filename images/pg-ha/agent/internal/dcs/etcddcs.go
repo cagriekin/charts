@@ -56,6 +56,7 @@ type EtcdDCS struct {
 	mu            sync.Mutex
 	resign        context.CancelFunc // cancels the current election iteration (Release/shutdown)
 	cooldownUntil time.Time
+	notCandidate  atomic.Bool // #275: park before campaigning (zero value: a candidate)
 }
 
 // tlsConfig builds the client TLS config from the configured files. All three
@@ -146,7 +147,12 @@ func (e *EtcdDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 			}
 		}
 
-		e.runElection(iterCtx, identity, cb)
+		// Candidacy gate (#275), symmetric with K8sDCS: parked BEFORE a session exists, so
+		// an ineligible node holds no queued candidate key that would win the election in
+		// create-revision order the moment the leader's key goes away.
+		if parkWhileNotCandidate(iterCtx, &e.notCandidate, e.retryPeriod()) {
+			e.runElection(iterCtx, identity, cb)
+		}
 
 		cancel()
 		e.mu.Lock()
@@ -316,6 +322,23 @@ func (e *EtcdDCS) observe(ctx context.Context, el *concurrency.Election) {
 		if len(resp.Kvs) > 0 {
 			e.leader.Store(string(resp.Kvs[0].Value))
 		}
+	}
+}
+
+// SetCandidate implements DCS (#275). Withdrawing candidacy also cancels an iteration that
+// is still campaigning, which closes its session and revokes its queued candidate key --
+// otherwise that key wins in create-revision order the moment the leader's goes away. Same
+// shape and same reasoning as K8sDCS.SetCandidate; a ctx cancel is never counted as a lapse.
+func (e *EtcdDCS) SetCandidate(candidate bool) {
+	was := e.notCandidate.Swap(!candidate)
+	if candidate || was {
+		return
+	}
+	e.mu.Lock()
+	cancel := e.resign
+	e.mu.Unlock()
+	if cancel != nil && !e.isLeader.Load() {
+		cancel()
 	}
 }
 

@@ -581,3 +581,29 @@ func TestMarkerAcceptLagTarget(t *testing.T) {
 		t.Errorf("absent marker must be a no-op: %v", err)
 	}
 }
+
+// #275: member tags are pod-name lists on the marker.
+func TestMarkerMemberTags(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: ns, Annotations: map[string]string{
+			NoFailoverAnnotation:    " pg-1, pg-2 ,,pg-1",
+			NoLoadBalanceAnnotation: "pg-2",
+		}},
+		Data: map[string]string{"primary": "pg-0", "timeline": "3"},
+	})
+	m, err := NewWithClient(cs, ns).ReadMarker(context.Background(), "pg-primary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(m.NoFailover, ",") != "pg-1,pg-2" || strings.Join(m.NoLoadBalance, ",") != "pg-2" {
+		t.Errorf("nofailover=%q noloadbalance=%q", m.NoFailover, m.NoLoadBalance)
+	}
+}
+
+func TestParseMemberList(t *testing.T) {
+	for in, want := range map[string]string{"": "", " , ": "", "pg-0": "pg-0", "pg-1,pg-0,pg-1": "pg-1,pg-0", " pg-0 ,\tpg-2 ": "pg-0,pg-2"} {
+		if got := strings.Join(ParseMemberList(in), ","); got != want {
+			t.Errorf("ParseMemberList(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -173,6 +173,9 @@ type fakeDCS struct {
 	// the pre-promote check and gone at the post-promote one (#298 review).
 	leaderSeq   []bool
 	leaderCalls int
+	// candidacySet/candidate record the last SetCandidate call (#275).
+	candidacySet bool
+	candidate    bool
 }
 
 func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
@@ -189,6 +192,10 @@ func (f *fakeDCS) IsLeader() bool {
 }
 func (f *fakeDCS) Leader() string { return "" }
 func (f *fakeDCS) Release()       { f.released = true }
+func (f *fakeDCS) SetCandidate(c bool) {
+	f.candidacySet = true
+	f.candidate = c
+}
 
 // execProber is a Prober whose SQL goes through ExecQuerier over e, so a fake Exec
 // answers probes by inspecting the psql argument list.
@@ -1124,7 +1131,7 @@ func TestDesiredRoleLabels(t *testing.T) {
 		{Name: "pg-2", Reachable: true, Role: pg.RolePrimary},  // a second primary -> orphan (out of reads)
 		{Name: "pg-3", Reachable: false, Role: pg.RoleUnknown}, // unreachable -> omitted (label untouched)
 	}
-	got := desiredRoleLabels("pg-0", peers)
+	got := desiredRoleLabels("pg-0", peers, nil)
 
 	want := map[string]string{"pg-0": "primary", "pg-1": "standby", "pg-2": "orphan"}
 	if len(got) != len(want) {
@@ -1137,6 +1144,79 @@ func TestDesiredRoleLabels(t *testing.T) {
 	}
 	if _, ok := got["pg-3"]; ok {
 		t.Error("unreachable peer must be omitted so its label is left untouched (#140)")
+	}
+}
+
+// #275: a noloadbalance standby gets a pg-role value the read-only Service does not
+// select; the tag changes nothing for the primary or an orphan.
+func TestDesiredRoleLabelsNoLoadBalance(t *testing.T) {
+	peers := []reconcile.PeerState{
+		{Name: "pg-1", Reachable: true, Role: pg.RoleStandby},
+		{Name: "pg-2", Reachable: true, Role: pg.RoleStandby},
+		{Name: "pg-3", Reachable: true, Role: pg.RolePrimary},
+		{Name: "pg-4", Reachable: false, Role: pg.RoleUnknown},
+	}
+	got := desiredRoleLabels("pg-0", peers, map[string]bool{"pg-0": true, "pg-2": true, "pg-3": true, "pg-4": true})
+	want := map[string]string{"pg-0": "primary", "pg-1": "standby", "pg-2": RoleLabelStandbyNoLoadBalance, "pg-3": "orphan"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("label[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestLeadershipCandidate(t *testing.T) {
+	cases := []struct {
+		name  string
+		node  string
+		local reconcile.LocalState
+		want  bool
+	}{
+		{"untagged standby contends", "pg-2", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, true},
+		{"tagged standby does not", "pg-1", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, false},
+		{"tagged stopped standby-state does not", "pg-1", reconcile.LocalState{HasData: true, InRecovery: true}, false},
+		{"tagged empty node does not", "pg-1", reconcile.LocalState{}, false},
+		{"tagged primary keeps contending", "pg-1", reconcile.LocalState{HasData: true, Running: true}, true},
+		{"tagged stopped primary-state contends to resume", "pg-1", reconcile.LocalState{HasData: true}, true},
+		{"tagged read-only node the marker records as primary contends", "pg-3", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, true},
+	}
+	for _, c := range cases {
+		o := reconcile.Observation{LocalNode: c.node, Local: c.local, NoFailover: map[string]bool{"pg-1": true, "pg-3": true},
+			Marker: reconcile.MarkerState{Present: true, Timeline: 1, Primary: "pg-3"}}
+		if got := leadershipCandidate(o); got != c.want {
+			t.Errorf("%s: candidate = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The election is parked before it starts when the marker already tags this pod (#275).
+func TestInitialCandidacyReadsTheMarker(t *testing.T) {
+	for _, c := range []struct {
+		ann      string
+		wantSet  bool
+		wantCand bool
+	}{{"pg-1", true, false}, {"pg-2", false, false}, {"", false, false}} {
+		var anns map[string]string
+		if c.ann != "" {
+			anns = map[string]string{k8s.NoFailoverAnnotation: c.ann}
+		}
+		cs := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: "ns", Annotations: anns},
+			Data:       map[string]string{"primary": "pg-0", "timeline": "1"},
+		})
+		f := &fakeDCS{}
+		a := &agent{
+			cfg:  &config.Config{PodName: "pg-1", MarkerName: "pg-primary", RenewDeadline: time.Second},
+			dcs:  f,
+			kube: k8s.NewWithClient(cs, "ns"),
+		}
+		a.initialCandidacy(context.Background())
+		if f.candidacySet != c.wantSet || (f.candidacySet && f.candidate != c.wantCand) {
+			t.Errorf("tag %q: set=%v candidate=%v", c.ann, f.candidacySet, f.candidate)
+		}
 	}
 }
 

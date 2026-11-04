@@ -258,7 +258,7 @@ jobs:
         pg_major: ["18", "17"]
         # #294: the mechanism axis is GONE. It existed for the repmgr-to-native transition
         # (#288/#295) and carried 11 exclusions to keep the fan-out honest; native is now the
-        # only mechanism, so 25 suites x 2 majors = 50 legs with no exclusions at all. Anything
+        # only mechanism, so 27 suites x 2 majors = 54 legs with no exclusions at all. Anything
         # that reads as mechanism-conditional below is a leftover and should be deleted, not
         # re-gated.
         suite:
@@ -277,6 +277,7 @@ jobs:
           - sync-replication-slots
           - agent-rolling
           - agent-lag-gate
+          - agent-member-tags
           - backup-restore
           - backup-concurrent
           - pgbackrest-restore

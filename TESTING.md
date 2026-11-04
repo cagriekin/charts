@@ -100,7 +100,7 @@ the behavioral and cross-render coverage. Both share the `tests/values-*.yaml` f
 There was one, from #288/#295, while the repmgr-to-native transition was in flight: a real
 `mechanism: [repmgr, native]` matrix key with 11 exclusions, 62 legs, and a
 `pg/tests/set-mechanism.sh` that retargeted the working tree. All of it is gone. `native` is the
-only mechanism, so the matrix is **25 suites x 2 majors = 50 legs, no exclusions**, and the chart
+only mechanism, so the matrix is **27 suites x 2 majors = 54 legs, no exclusions**, and the chart
 emits `MECHANISM` unconditionally rather than only at a non-default value -- an image built before
 #294 assumes repmgr when the variable is absent, so omitting it at the new default would run the
 removed mechanism during the image-then-chart release this repo does.

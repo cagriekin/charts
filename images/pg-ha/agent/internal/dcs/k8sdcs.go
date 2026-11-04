@@ -42,6 +42,7 @@ type K8sDCS struct {
 	mu            sync.Mutex
 	stepDown      context.CancelFunc // cancels the current election iteration (set while contending/leading)
 	cooldownUntil time.Time          // suppress re-contention until this time (set by Release)
+	notCandidate  atomic.Bool        // #275: park before contending (zero value: a candidate)
 }
 
 // NewK8sDCS builds a K8sDCS from the resolved apiserver config -- KUBECONFIG when
@@ -145,7 +146,8 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 				// shutdown cancels the outer ctx (#298 review).
 				if cb.OnRenewFailure != nil && ctx.Err() == nil {
 					k.mu.Lock()
-					voluntary := time.Now().Before(k.cooldownUntil)
+					// A withdrawn candidacy (#275) cancels a contending iteration on purpose.
+					voluntary := time.Now().Before(k.cooldownUntil) || k.notCandidate.Load()
 					k.mu.Unlock()
 					if !voluntary {
 						cb.OnRenewFailure()
@@ -201,6 +203,17 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 				return
 			case <-time.After(d):
 			}
+		}
+
+		// Candidacy gate (#275), after the cooldown so a Release followed by SetCandidate(false)
+		// parks rather than re-contending. A Release while parked cancels elerCtx; the next
+		// iteration re-reads both.
+		if !parkWhileNotCandidate(elerCtx, &k.notCandidate, k.cfg.RetryPeriod) {
+			cancel()
+			k.mu.Lock()
+			k.stepDown = nil
+			k.mu.Unlock()
+			continue
 		}
 
 		le, err := leaderelection.NewLeaderElector(lec)
@@ -297,6 +310,29 @@ func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb 
 	rec.AcquireTime = now
 	if err := lock.Update(ctx, *rec); err != nil {
 		slog.Warn("could not release the leader Lease; a peer will acquire it at TTL expiry instead", "err", err)
+	}
+}
+
+// SetCandidate implements DCS (#275). Withdrawing candidacy also cancels an iteration that
+// is still only CONTENDING: a standby sits inside le.Run retrying the acquire for as long as
+// someone else leads, so a gate consulted only at the next iteration would never be reached
+// before the very failover it exists for (observed live: the tagged standby won the Lease the
+// moment the primary went, and released it a tick later). A leading iteration is left alone
+// -- Decide releases it, through the ordered demote-then-release path. Cancelling a contender
+// that wins the Lease in the same instant is benign: it is a node that may not promote, its
+// OnLost is the no-fence standby branch, and the loss is not counted as a renew failure.
+// Only on the transition, so a tick that repeats false does not churn a parked loop.
+func (k *K8sDCS) SetCandidate(candidate bool) {
+	was := k.notCandidate.Swap(!candidate)
+	if candidate || was {
+		return
+	}
+	k.mu.Lock()
+	cancel := k.stepDown
+	leading := k.isLeader.Load()
+	k.mu.Unlock()
+	if cancel != nil && !leading {
+		cancel()
 	}
 }
 

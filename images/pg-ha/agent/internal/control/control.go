@@ -115,12 +115,15 @@ type Snapshot struct {
 	SwitchoverTarget string
 	MarkerPresent    bool
 	MarkerPrimary    string
-	Local            MemberState
-	Peers            []MemberState
-	Decision         DecisionView
-	Recovery         RecoveryView
-	LastRestore      pgbackrest.RestoreRecord
-	ObservedAt       time.Time
+	// NoFailover and NoLoadBalance are the member tags the last tick acted on (#275).
+	NoFailover    []string
+	NoLoadBalance []string
+	Local         MemberState
+	Peers         []MemberState
+	Decision      DecisionView
+	Recovery      RecoveryView
+	LastRestore   pgbackrest.RestoreRecord
+	ObservedAt    time.Time
 }
 
 // MarkerView is a FRESH read of the cluster's intent markers, used for preconditions
@@ -132,6 +135,9 @@ type MarkerView struct {
 	PausedBy         string
 	SwitchoverTarget string
 	Primary          string
+	// NoFailover and NoLoadBalance are the member tags (#275).
+	NoFailover    []string
+	NoLoadBalance []string
 }
 
 // IntentKind is a node-local operation the reconcile loop performs on behalf of the
