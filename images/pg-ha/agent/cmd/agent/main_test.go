@@ -1196,16 +1196,19 @@ func TestLeadershipCandidate(t *testing.T) {
 func TestInitialCandidacyReadsTheMarker(t *testing.T) {
 	for _, c := range []struct {
 		ann      string
+		primary  string
 		wantSet  bool
 		wantCand bool
-	}{{"pg-1", true, false}, {"pg-2", false, false}, {"", false, false}} {
+	}{{"pg-1", "pg-0", true, false}, {"pg-2", "pg-0", false, false}, {"", "pg-0", false, false},
+		// The recorded primary keeps contending through boot, as observe would let it.
+		{"pg-1", "pg-1", false, false}} {
 		var anns map[string]string
 		if c.ann != "" {
 			anns = map[string]string{k8s.NoFailoverAnnotation: c.ann}
 		}
 		cs := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: "ns", Annotations: anns},
-			Data:       map[string]string{"primary": "pg-0", "timeline": "1"},
+			Data:       map[string]string{"primary": c.primary, "timeline": "1"},
 		})
 		f := &fakeDCS{}
 		a := &agent{

@@ -139,15 +139,16 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 				}
 			},
 			OnStoppedLeading: func() {
-				k.isLeader.Store(false)
+				wasLeader := k.isLeader.Swap(false)
 				// Involuntary loss means client-go could not renew within RenewDeadline.
 				// The two voluntary exits are distinguishable without new state: Release
 				// arms the step-down cooldown BEFORE cancelling the election, and a
 				// shutdown cancels the outer ctx (#298 review).
 				if cb.OnRenewFailure != nil && ctx.Err() == nil {
 					k.mu.Lock()
-					// A withdrawn candidacy (#275) cancels a contending iteration on purpose.
-					voluntary := time.Now().Before(k.cooldownUntil) || k.notCandidate.Load()
+					// A withdrawn candidacy (#275) cancels a CONTENDING iteration on purpose; a
+					// lease actually held and then lost stays a renew failure whatever the tag.
+					voluntary := time.Now().Before(k.cooldownUntil) || (k.notCandidate.Load() && !wasLeader)
 					k.mu.Unlock()
 					if !voluntary {
 						cb.OnRenewFailure()

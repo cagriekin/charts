@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/control"
@@ -766,10 +767,5 @@ func sortedMembers(set map[string]bool) []string {
 	if len(set) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(set))
-	for n := range set {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	return slices.Sorted(maps.Keys(set))
 }

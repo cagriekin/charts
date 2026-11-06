@@ -1405,7 +1405,6 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// Member tags (#275).
 	o.NoFailover = memberSet(m.NoFailover)
 	o.NoLoadBalance = memberSet(m.NoLoadBalance)
-	a.logMemberTags(m)
 	// Candidacy follows the tag, with two exceptions that are both "resuming is not a
 	// failover": a tagged node whose data is primary-state, and the primary the marker
 	// records, keep contending (leadershipCandidate). Without them, tagging the primary and
@@ -1413,6 +1412,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// rewound under a standby's promotion. Left alone when the marker could not be read at
 	// all: no tags is a guess there, not an observation.
 	if !o.MarkerUnreadable {
+		a.logMemberTags(m)
 		a.dcs.SetCandidate(leadershipCandidate(o))
 	}
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
@@ -3963,8 +3963,11 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 // pg-ha/nofailover (#275). The first tick sets candidacy from the full observation, but
 // boot() runs before it and can take minutes (a clone), and a tagged standby contending for
 // all of that time can win the lock just as the primary goes away. Best-effort: on a failed
-// read the node contends as before, and the decider still never promotes it. A tagged
-// primary-state node is re-enabled by the first tick (see observe).
+// read the node contends as before, and the decider still never promotes it. The primary the
+// marker records keeps contending through boot by the same rule observe applies
+// (reconcile.FailoverEligible): parking it here would hand a full-cluster restart's lock to an
+// eligible standby that promotes past it before its first tick. A tagged primary-state node
+// the marker does not record is re-enabled by the first tick (see observe).
 func (a *agent) initialCandidacy(ctx context.Context) {
 	mctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 	defer cancel()
@@ -3972,7 +3975,11 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	if memberSet(m.NoFailover)[a.cfg.PodName] {
+	o := reconcile.Observation{
+		NoFailover: memberSet(m.NoFailover),
+		Marker:     reconcile.MarkerState{Present: m.Present, Malformed: m.Malformed, Primary: m.Primary},
+	}
+	if !reconcile.FailoverEligible(o, a.cfg.PodName) {
 		a.dcs.SetCandidate(false)
 	}
 }
