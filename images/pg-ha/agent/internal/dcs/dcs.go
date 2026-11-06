@@ -44,7 +44,13 @@ type DCS interface {
 // parkWhileNotCandidate blocks while notCandidate is set (#275), re-checking every
 // period, and reports false if ctx ended first (a Release or a shutdown). Shared by both
 // backends so the gate behaves identically whichever one is wired.
-func parkWhileNotCandidate(ctx context.Context, notCandidate *atomic.Bool, period time.Duration) bool {
+//
+// refreshLeader runs on every parked period. Both backends otherwise learn the leader only
+// from inside an election (client-go's OnNewLeader, etcd's Election.Observe), which a parked
+// node never enters: without it Leader() froze at whatever it last saw -- "" for a node parked
+// from boot -- so a nofailover standby never re-pointed at the primary a failover produced and
+// kept streaming from (or waiting on) the dead one.
+func parkWhileNotCandidate(ctx context.Context, notCandidate *atomic.Bool, period time.Duration, refreshLeader func(context.Context)) bool {
 	if period <= 0 {
 		period = 2 * time.Second
 	}
@@ -53,6 +59,9 @@ func parkWhileNotCandidate(ctx context.Context, notCandidate *atomic.Bool, perio
 		if !logged {
 			slog.Info("not contending for leadership: this node is tagged nofailover (#275)")
 			logged = true
+		}
+		if refreshLeader != nil {
+			refreshLeader(ctx)
 		}
 		select {
 		case <-ctx.Done():

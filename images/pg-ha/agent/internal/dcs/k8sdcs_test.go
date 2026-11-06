@@ -374,3 +374,29 @@ func TestK8sDCSWithdrawnCandidacyLeavesARunningContention(t *testing.T) {
 		t.Errorf("a withdrawn candidacy counted %d renew failures", renewFailures.Load())
 	}
 }
+
+// #275: a node parked out of the election still learns who leads, or a nofailover standby
+// never re-points at the primary a failover produced.
+func TestK8sDCSParkedNodeTracksLeader(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cfg := K8sConfig{Namespace: "ns", LeaseName: "pg-leader", LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 100 * time.Millisecond}
+	holder := NewK8sDCSWithClient(cfg, cs)
+	tagged := NewK8sDCSWithClient(cfg, cs)
+	tagged.SetCandidate(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tagged.Run(ctx, "pod-1", Callbacks{})
+	go holder.Run(ctx, "pod-0", Callbacks{})
+
+	deadline := time.Now().Add(15 * time.Second)
+	for tagged.Leader() != "pod-0" {
+		if time.Now().After(deadline) {
+			t.Fatalf("parked node reports leader %q, want pod-0", tagged.Leader())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if tagged.IsLeader() {
+		t.Fatal("parked node claims leadership")
+	}
+}

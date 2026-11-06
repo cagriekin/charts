@@ -150,7 +150,7 @@ func (e *EtcdDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 		// Candidacy gate (#275), symmetric with K8sDCS: parked BEFORE a session exists, so
 		// an ineligible node holds no queued candidate key that would win the election in
 		// create-revision order the moment the leader's key goes away.
-		if parkWhileNotCandidate(iterCtx, &e.notCandidate, e.retryPeriod()) {
+		if parkWhileNotCandidate(iterCtx, &e.notCandidate, e.retryPeriod(), e.readLeader) {
 			e.runElection(iterCtx, identity, cb)
 		}
 
@@ -323,6 +323,23 @@ func (e *EtcdDCS) observe(ctx context.Context, el *concurrency.Election) {
 			e.leader.Store(string(resp.Kvs[0].Value))
 		}
 	}
+}
+
+// readLeader refreshes Leader() for a node parked outside any election (#275), with the
+// same read Election.Leader does: the lowest-create-revision key under the election prefix.
+// No key clears the cache -- nobody leads. Best-effort: a failed read keeps the last value.
+func (e *EtcdDCS) readLeader(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(ctx, e.retryPeriod())
+	defer cancel()
+	resp, err := e.client.Get(rctx, e.cfg.Prefix+"/", clientv3.WithFirstCreate()...)
+	if err != nil {
+		return
+	}
+	if len(resp.Kvs) == 0 {
+		e.leader.Store("")
+		return
+	}
+	e.leader.Store(string(resp.Kvs[0].Value))
 }
 
 // SetCandidate implements DCS (#275). Withdrawing candidacy also cancels an iteration that

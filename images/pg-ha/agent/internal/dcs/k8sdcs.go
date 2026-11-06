@@ -209,7 +209,7 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 		// Candidacy gate (#275), after the cooldown so a Release followed by SetCandidate(false)
 		// parks rather than re-contending. A Release while parked cancels elerCtx; the next
 		// iteration re-reads both.
-		if !parkWhileNotCandidate(elerCtx, &k.notCandidate, k.cfg.RetryPeriod) {
+		if !parkWhileNotCandidate(elerCtx, &k.notCandidate, k.cfg.RetryPeriod, func(c context.Context) { k.readLeader(c, lock) }) {
 			cancel()
 			k.mu.Lock()
 			k.stepDown = nil
@@ -323,18 +323,34 @@ func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb 
 // that wins the Lease in the same instant is benign: it is a node that may not promote, its
 // OnLost is the no-fence standby branch, and the loss is not counted as a renew failure.
 // Only on the transition, so a tick that repeats false does not churn a parked loop.
+//
+// The leading check and the cancel happen under the mutex OnStartedLeading takes before it
+// sets isLeader: either the callback ran first (leading, left alone) or it then sees its
+// context already cancelled and never marks the node leader, so the cancelled iteration
+// cannot reach OnStoppedLeading as a held-and-lost lease and count a renew failure.
 func (k *K8sDCS) SetCandidate(candidate bool) {
 	was := k.notCandidate.Swap(!candidate)
 	if candidate || was {
 		return
 	}
 	k.mu.Lock()
-	cancel := k.stepDown
-	leading := k.isLeader.Load()
-	k.mu.Unlock()
-	if cancel != nil && !leading {
-		cancel()
+	defer k.mu.Unlock()
+	if k.stepDown != nil && !k.isLeader.Load() {
+		k.stepDown()
 	}
+}
+
+// readLeader refreshes Leader() for a node parked outside any election (#275): client-go
+// reports the holder only through OnNewLeader, from inside le.Run. Best-effort: a failed
+// read keeps the last value.
+func (k *K8sDCS) readLeader(ctx context.Context, lock *resourcelock.LeaseLock) {
+	rctx, cancel := context.WithTimeout(ctx, k.cfg.RetryPeriod)
+	defer cancel()
+	rec, _, err := lock.Get(rctx)
+	if err != nil || rec == nil {
+		return
+	}
+	k.leader.Store(rec.HolderIdentity)
 }
 
 // Release voluntarily steps down: it cancels the current election so the Lease is
