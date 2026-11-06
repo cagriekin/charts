@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
@@ -42,6 +43,7 @@ type K8sDCS struct {
 	mu            sync.Mutex
 	stepDown      context.CancelFunc // cancels the current election iteration (set while contending/leading)
 	cooldownUntil time.Time          // suppress re-contention until this time (set by Release)
+	notCandidate  atomic.Bool        // #275: park before contending (zero value: a candidate)
 }
 
 // NewK8sDCS builds a K8sDCS from the resolved apiserver config -- KUBECONFIG when
@@ -138,14 +140,16 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 				}
 			},
 			OnStoppedLeading: func() {
-				k.isLeader.Store(false)
+				wasLeader := k.isLeader.Swap(false)
 				// Involuntary loss means client-go could not renew within RenewDeadline.
 				// The two voluntary exits are distinguishable without new state: Release
 				// arms the step-down cooldown BEFORE cancelling the election, and a
 				// shutdown cancels the outer ctx (#298 review).
 				if cb.OnRenewFailure != nil && ctx.Err() == nil {
 					k.mu.Lock()
-					voluntary := time.Now().Before(k.cooldownUntil)
+					// A withdrawn candidacy (#275) cancels a CONTENDING iteration on purpose; a
+					// lease actually held and then lost stays a renew failure whatever the tag.
+					voluntary := time.Now().Before(k.cooldownUntil) || (k.notCandidate.Load() && !wasLeader)
 					k.mu.Unlock()
 					if !voluntary {
 						cb.OnRenewFailure()
@@ -201,6 +205,17 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 				return
 			case <-time.After(d):
 			}
+		}
+
+		// Candidacy gate (#275), after the cooldown so a Release followed by SetCandidate(false)
+		// parks rather than re-contending. A Release while parked cancels elerCtx; the next
+		// iteration re-reads both.
+		if !parkWhileNotCandidate(elerCtx, &k.notCandidate, k.cfg.RetryPeriod, func(c context.Context) { k.readLeader(c, lock) }) {
+			cancel()
+			k.mu.Lock()
+			k.stepDown = nil
+			k.mu.Unlock()
+			continue
 		}
 
 		le, err := leaderelection.NewLeaderElector(lec)
@@ -298,6 +313,50 @@ func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb 
 	if err := lock.Update(ctx, *rec); err != nil {
 		slog.Warn("could not release the leader Lease; a peer will acquire it at TTL expiry instead", "err", err)
 	}
+}
+
+// SetCandidate implements DCS (#275). Withdrawing candidacy also cancels an iteration that
+// is still only CONTENDING: a standby sits inside le.Run retrying the acquire for as long as
+// someone else leads, so a gate consulted only at the next iteration would never be reached
+// before the very failover it exists for (observed live: the tagged standby won the Lease the
+// moment the primary went, and released it a tick later). A leading iteration is left alone
+// -- Decide releases it, through the ordered demote-then-release path. Cancelling a contender
+// that wins the Lease in the same instant is benign: it is a node that may not promote, its
+// OnLost is the no-fence standby branch, and the loss is not counted as a renew failure.
+// Only on the transition, so a tick that repeats false does not churn a parked loop.
+//
+// The leading check and the cancel happen under the mutex OnStartedLeading takes before it
+// sets isLeader: either the callback ran first (leading, left alone) or it then sees its
+// context already cancelled and never marks the node leader, so the cancelled iteration
+// cannot reach OnStoppedLeading as a held-and-lost lease and count a renew failure.
+func (k *K8sDCS) SetCandidate(candidate bool) {
+	was := k.notCandidate.Swap(!candidate)
+	if candidate || was {
+		return
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.stepDown != nil && !k.isLeader.Load() {
+		k.stepDown()
+	}
+}
+
+// readLeader refreshes Leader() for a node parked outside any election (#275): client-go
+// reports the holder only through OnNewLeader, from inside le.Run. No Lease clears the
+// cache -- nobody leads -- as EtcdDCS.readLeader does for no key. Best-effort: any other
+// failed read keeps the last value.
+func (k *K8sDCS) readLeader(ctx context.Context, lock *resourcelock.LeaseLock) {
+	rctx, cancel := context.WithTimeout(ctx, k.cfg.RetryPeriod)
+	defer cancel()
+	rec, _, err := lock.Get(rctx)
+	if apierrors.IsNotFound(err) {
+		k.leader.Store("")
+		return
+	}
+	if err != nil || rec == nil {
+		return
+	}
+	k.leader.Store(rec.HolderIdentity)
 }
 
 // Release voluntarily steps down: it cancels the current election so the Lease is

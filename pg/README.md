@@ -866,6 +866,50 @@ The serving primary waits until that target is a **caught-up, same-timeline stan
 
 Caveats: this is a planned handoff layered on the lease election, not a fenced zero-RPO transaction — the directed target promotes deterministically on a two-pod cluster; with three or more pods the most-advanced standby wins the freed lease (usually but not necessarily the named target). For strict RPO=0 use synchronous replication (not enabled in this chart).
 
+### Member tags: nofailover / noloadbalance (#275)
+
+To take one node out of the election, or out of read routing, without pausing the whole
+cluster, tag it on the primary-marker ConfigMap. Each annotation is a comma-separated list of
+pod names (Patroni's `nofailover` / `noloadbalance` tags):
+
+```bash
+# Never promote pg-2 automatically (a DR replica, a node on weaker hardware):
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/nofailover=<release>-pg-2 --overwrite
+# Keep pg-1 out of the read-only Service (a reporting or backup replica):
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/noloadbalance=<release>-pg-1 --overwrite
+# Remove a tag:
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/nofailover-
+```
+
+The tags live on the marker rather than on the pods because a pod annotation dies with the pod,
+and the StatefulSet recreates every pod on each chart upgrade. The marker is created by the
+agent, not rendered by Helm, so upgrades leave the tags alone. They persist until removed.
+
+**`nofailover`.** A tagged standby stops contending for the leader lease. If it holds the lease
+anyway (it was already queued when the tag was set), it releases the lease instead of promoting.
+Its peers do not rank it as a handoff target, and a switchover to it is refused (`POST
+/v1/switchover` answers 409; the annotation route leaves the request pending and the decision
+reason names the tag). The tag does **not** fail over a node that is already the primary, and it
+does not stop the node the marker records as primary from resuming that role after a restart,
+even when the restart brought it up read-only so its position could be ranked. Resuming is not a
+failover onto it. To move the primary off a tagged node, run a switchover.
+If every surviving standby is tagged, the cluster has no primary until the old one returns or
+a tag is removed. The cost is Patroni's: when a tagged standby holds the most WAL, the
+most-advanced *eligible* standby promotes, and the tagged node's extra WAL is discarded when it
+rewinds onto the new timeline. `ha.agent.maximumLagOnFailover` bounds that loss exactly as it
+bounds any other failover.
+
+**`noloadbalance`.** The primary labels a tagged standby `pg-role=standby-noloadbalance`
+instead of `pg-role=standby`. The `-readonly` Service selects `pg-role=standby`, so the standby
+drops out of read routing, and out of pgpool's read backend, which is that Service. It keeps
+replicating and stays a failover candidate. If every standby is tagged, the `-readonly`
+Service has no endpoints: pgpool detaches its read backend and sends reads to the primary.
+Removing the tag restores the label on the primary's next tick.
+
+The agent logs every tag change, and warns about a name that is no pod of the cluster (such a
+name tags nobody). `GET /v1/cluster` lists the tags under `intents`.
+Needs the pg-ha image at 2.5.0 or later. Older agents ignore the annotations.
+
 ### Control REST API (agent mode) — `ha.agent.control`
 
 The pause and switchover runbooks above are `kubectl annotate` calls: they work, they are
@@ -897,7 +941,7 @@ equivalent, so nothing you learn about one is wasted on the other.
 | `GET /v1/status` | this pod | Role, timeline, LSN, lease holder, pause/switchover intents (read fresh), WAL-replay progress, and the last restore recorded on this data volume |
 | `GET /v1/cluster` | this pod's view | Every member's position, plus the reconcile loop's latest decision and its reason |
 | `POST /v1/pause` / `POST /v1/resume` | cluster | Maintenance mode; idempotent, and it warns when the cluster is already degraded |
-| `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable standby on the **current primary's** timeline and the cluster is not paused |
+| `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable standby on the **current primary's** timeline, is not tagged `pg-ha/nofailover`, and the cluster is not paused |
 | `DELETE /v1/switchover` | cluster | Cancel a pending request |
 | `POST /v1/restart` / `POST /v1/reload` | this pod | Restart or SIGHUP the supervised postmaster, via the reconcile loop |
 | `POST /v1/reinitialize` | this pod | **Replica only.** Discard this standby's data directory so the loop re-clones it from the primary |
@@ -3332,7 +3376,7 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 i
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
 
-PGPool-II has failover disabled by design on the RW backend (the agent owns it and re-points the Services), so a primary change never detaches it. The RO backend is detached by the health check when the `-readonly` Service stops answering and re-attached by the loop in the pgpool container once it answers again (`pgpool.reattach`, #361), so a backend that stays `down` with a healthy Service is the loop reporting a problem: look for `[reattach]` lines in the pgpool log. The loop also re-attaches a node you detached by hand with `pcp_detach_node`: under this chart membership is the agent's (`pg-role` labels and the Services), so take a standby out of the read pool by making it unready or scaling it away, and set `pgpool.reattach.enabled=false` first if you want PgPool-level manual control. With the loop off, re-attach with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
+PGPool-II has failover disabled by design on the RW backend (the agent owns it and re-points the Services), so a primary change never detaches it. The RO backend is detached by the health check when the `-readonly` Service stops answering and re-attached by the loop in the pgpool container once it answers again (`pgpool.reattach`, #361), so a backend that stays `down` with a healthy Service is the loop reporting a problem: look for `[reattach]` lines in the pgpool log. The loop also re-attaches a node you detached by hand with `pcp_detach_node`: under this chart membership is the agent's (`pg-role` labels and the Services), so take a standby out of the read pool by tagging it `pg-ha/noloadbalance` on the marker (#275), and set `pgpool.reattach.enabled=false` first if you want PgPool-level manual control. With the loop off, re-attach with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
 
 ### Recovering After Failover
 

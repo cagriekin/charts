@@ -7,6 +7,9 @@
        carry no pg-role label until one is applied (fresh installs, upgrades from
        older chart versions, scale-ups), so they are simply absent from the
        endpoints until labeled -- the primary can never be selected by accident.
+       A standby tagged pg-ha/noloadbalance on the marker is labeled
+       pg-role=standby-noloadbalance instead, which this equality selector skips
+       (#275).
        HA-only: standalone installs run a single pod with no standbys. */}}
 apiVersion: v1
 kind: Service

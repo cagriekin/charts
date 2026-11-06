@@ -65,6 +65,46 @@ const (
 // `kubectl annotate configmap <fullname>-primary pg-ha/accept-failover-lag=<pod>`.
 const AcceptLagAnnotation = "pg-ha/accept-failover-lag"
 
+// NoFailoverAnnotation and NoLoadBalanceAnnotation are the per-member tags (#275,
+// Patroni's nofailover / noloadbalance), each a comma-separated list of pod names on the
+// marker ConfigMap:
+//
+//	kubectl annotate configmap <fullname>-primary pg-ha/nofailover=<pod>[,<pod>...]
+//	kubectl annotate configmap <fullname>-primary pg-ha/noloadbalance=<pod>[,<pod>...]
+//
+// A nofailover member is never promoted automatically and never a switchover target; a
+// noloadbalance standby is kept out of the read-only Service. Neither touches a member
+// that is already the primary.
+//
+// On the marker rather than on the pods, for the same reason pause and switchover-target
+// are: a pod annotation dies with the pod, and the StatefulSet recreates every pod on each
+// chart upgrade, so a node an operator took out of the election would silently come back
+// into it on the next rollout. The marker is created and kept by the agent, not rendered
+// by Helm, so an upgrade does not strip annotations from it either. Persistent until
+// removed (`pg-ha/nofailover-`), unlike the one-shot switchover and accept-lag intents.
+const (
+	NoFailoverAnnotation    = "pg-ha/nofailover"
+	NoLoadBalanceAnnotation = "pg-ha/noloadbalance"
+)
+
+// ParseMemberList splits a member-tag annotation value into pod names: comma-separated,
+// whitespace trimmed, empty entries and duplicates dropped, order kept. Names are not
+// validated here -- a tag naming no current pod matches nothing -- the agent warns about
+// them instead, since a typo silently tagging no one is the failure worth surfacing.
+func ParseMemberList(v string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range strings.Split(v, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
+}
+
 // Marker is the durable highwater primary marker (<fullname>-primary ConfigMap):
 // the highest-timeline primary ever recorded, so a node booting first under
 // OrderedReady can tell it is stale (#125). Malformed is set when the marker
@@ -85,6 +125,10 @@ type Marker struct {
 	SwitchoverTarget string
 	// AcceptLagTarget is the pod named by AcceptLagAnnotation ("" if none), #273.
 	AcceptLagTarget string
+	// NoFailover and NoLoadBalance are the pods named by the member-tag annotations
+	// (#275), nil when unset.
+	NoFailover    []string
+	NoLoadBalance []string
 	// LSN is the serving primary's last recorded write position (PostgreSQL text form
 	// "X/Y"), "" when none was ever recorded (#273). It is the reference the lag gate
 	// compares a failover candidate against: the marker outlives the primary's pod, which
@@ -119,6 +163,8 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 		PausedBy:         strings.TrimSpace(cm.Annotations[PausedByAnnotation]),
 		SwitchoverTarget: strings.TrimSpace(cm.Annotations[SwitchoverTargetAnnotation]),
 		AcceptLagTarget:  strings.TrimSpace(cm.Annotations[AcceptLagAnnotation]),
+		NoFailover:       ParseMemberList(cm.Annotations[NoFailoverAnnotation]),
+		NoLoadBalance:    ParseMemberList(cm.Annotations[NoLoadBalanceAnnotation]),
 		LSN:              strings.TrimSpace(cm.Data["lsn"]),
 	}
 	if v, perr := strconv.Atoi(cm.Data["schemaVersion"]); perr == nil {

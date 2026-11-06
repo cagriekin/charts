@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **Per-member tags: `pg-ha/nofailover` and `pg-ha/noloadbalance` (#275).** These are
+  Patroni's `nofailover` and `noloadbalance` tags, as comma-separated pod-name lists on the
+  `<fullname>-primary` marker ConfigMap. They take one node out of the election, or out of read
+  routing, without pausing the cluster:
+  - A `nofailover` standby stops contending for the leader lease and releases it instead of
+    promoting if it holds it. Peers do not rank it as a handoff target, and a switchover to it
+    is refused.
+  - A tagged node that is already the primary keeps the role, and the node the marker records
+    as primary still resumes it after a restart.
+  - A `noloadbalance` standby is labeled `pg-role=standby-noloadbalance`, so it leaves the
+    `-readonly` Service and pgpool's read backend. It still replicates and can still be failed
+    over to.
+
+  The tags live on the marker, which the agent owns, so they survive pod restarts and chart
+  upgrades. `GET /v1/cluster` lists them. They take effect once the chart pins a pg-ha image at
+  2.5.0 or later. Older agents ignore them.
+
 ### Fixed
 
 - **A missing `ha.agent` duration fails the render instead of running on a hidden default
