@@ -206,7 +206,20 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	}) {
 		return
 	}
-	e.isLeader.Store(true)
+	// Set under the mutex SetCandidate (#275) takes for its leading check, and only if the
+	// iteration is still live -- symmetric with K8sDCS's OnStartedLeading guard. A withdrawn
+	// candidacy that cancels in the instant Campaign wins then either sees this node leading
+	// (and leaves it to Decide's ordered release) or finds the win discarded here, before any
+	// OnAcquired: the key is a candidate's again and releaseSession revokes it.
+	e.mu.Lock()
+	live := ctx.Err() == nil
+	if live {
+		e.isLeader.Store(true)
+	}
+	e.mu.Unlock()
+	if !live {
+		return
+	}
 	heldLeadership = true
 	e.leader.Store(identity)
 	if cb.OnAcquired != nil {
@@ -351,11 +364,12 @@ func (e *EtcdDCS) SetCandidate(candidate bool) {
 	if candidate || was {
 		return
 	}
+	// The leading check and the cancel happen under the mutex runElection takes to set
+	// isLeader, as in K8sDCS.SetCandidate.
 	e.mu.Lock()
-	cancel := e.resign
-	e.mu.Unlock()
-	if cancel != nil && !e.isLeader.Load() {
-		cancel()
+	defer e.mu.Unlock()
+	if e.resign != nil && !e.isLeader.Load() {
+		e.resign()
 	}
 }
 

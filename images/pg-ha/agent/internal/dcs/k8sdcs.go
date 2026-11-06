@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
@@ -341,12 +342,17 @@ func (k *K8sDCS) SetCandidate(candidate bool) {
 }
 
 // readLeader refreshes Leader() for a node parked outside any election (#275): client-go
-// reports the holder only through OnNewLeader, from inside le.Run. Best-effort: a failed
-// read keeps the last value.
+// reports the holder only through OnNewLeader, from inside le.Run. No Lease clears the
+// cache -- nobody leads -- as EtcdDCS.readLeader does for no key. Best-effort: any other
+// failed read keeps the last value.
 func (k *K8sDCS) readLeader(ctx context.Context, lock *resourcelock.LeaseLock) {
 	rctx, cancel := context.WithTimeout(ctx, k.cfg.RetryPeriod)
 	defer cancel()
 	rec, _, err := lock.Get(rctx)
+	if apierrors.IsNotFound(err) {
+		k.leader.Store("")
+		return
+	}
 	if err != nil || rec == nil {
 		return
 	}

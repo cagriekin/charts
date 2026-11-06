@@ -292,6 +292,12 @@ func Decide(o Observation) Decision {
 	// confirm the role. A previously-ready node now frozen is caught by LocalStuck
 	// below (self-health failover), so exclude that case.
 	if o.LocalProcessAlive && !o.Local.Running && !o.LocalStuck {
+		// A nofailover holder still starting as a standby (#275) will release the moment it is
+		// ready anyway (the Running && InRecovery branch below); holding the lock through a
+		// replay that can run for minutes only keeps an eligible peer from taking over.
+		if o.HoldLease && o.Local.HasData && o.Local.InRecovery && !FailoverEligible(o, o.LocalNode) {
+			return d(ReleaseLease, "", NoFailoverReason+": this starting standby is tagged pg-ha/nofailover on the marker, so it never promotes automatically; releasing the lease for an eligible peer")
+		}
 		if o.HoldLease && o.Local.HasData && o.Local.InRecovery && o.LocalSaturationExpired {
 			return d(ReleaseLease, "", "lease holder is a standby that has refused new connections past the saturation grace; releasing the lease so a peer can take over")
 		}
@@ -406,6 +412,12 @@ func Decide(o Observation) Decision {
 			return d(StayPrimary, "", "primary holds lease and is current")
 
 		default: // has data, not running
+			// A nofailover holder with standby-state data (#275) releases before starting or
+			// rejoining: either would hold the lock for the whole start, only to release it
+			// once running. As a non-holder it starts (or rejoins) as a standby next tick.
+			if o.Local.InRecovery && !FailoverEligible(o, o.LocalNode) {
+				return d(ReleaseLease, "", NoFailoverReason+": this stopped standby is tagged pg-ha/nofailover on the marker, so it never promotes automatically; releasing the lease for an eligible peer")
+			}
 			if newer != nil {
 				return d(RejoinForward, newer.Name, "lease holder has data on an older timeline; rejoin forward before starting (never start stale data read-write)")
 			}

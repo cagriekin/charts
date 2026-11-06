@@ -1181,14 +1181,23 @@ func TestLeadershipCandidate(t *testing.T) {
 		{"tagged empty node does not", "pg-1", reconcile.LocalState{}, false},
 		{"tagged primary keeps contending", "pg-1", reconcile.LocalState{HasData: true, Running: true}, true},
 		{"tagged stopped primary-state contends to resume", "pg-1", reconcile.LocalState{HasData: true}, true},
+		{"tagged saturated primary keeps contending", "pg-1", reconcile.LocalState{HasData: true, Saturated: true}, true},
 		{"tagged read-only node the marker records as primary contends", "pg-3", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, true},
 	}
 	for _, c := range cases {
 		o := reconcile.Observation{LocalNode: c.node, Local: c.local, NoFailover: map[string]bool{"pg-1": true, "pg-3": true},
 			Marker: reconcile.MarkerState{Present: true, Timeline: 1, Primary: "pg-3"}}
+		o.LocalProcessAlive = c.local.Running || c.local.Saturated
 		if got := leadershipCandidate(o); got != c.want {
 			t.Errorf("%s: candidate = %v, want %v", c.name, got, c.want)
 		}
+	}
+	// A freshly cloned standby still starting reads "in production" from pg_control (#181);
+	// that is not primary-state, so a tagged one stays parked through the replay.
+	o := reconcile.Observation{LocalNode: "pg-1", LocalProcessAlive: true, Local: reconcile.LocalState{HasData: true},
+		NoFailover: map[string]bool{"pg-1": true}, Marker: reconcile.MarkerState{Present: true, Timeline: 1, Primary: "pg-0"}}
+	if leadershipCandidate(o) {
+		t.Errorf("tagged starting node with in-production pg_control: candidate = true, want false")
 	}
 }
 

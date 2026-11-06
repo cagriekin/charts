@@ -3988,8 +3988,15 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 // contends (untagged, or the primary the marker records -- see reconcile.FailoverEligible); a
 // nofailover node otherwise contends only while its data is primary-state, so winning
 // resumes a role it already holds rather than failing over onto it.
+//
+// A postmaster that is up but not yet accepting SQL does not count as primary-state: its
+// role is then read from pg_control, which right after pg_basebackup still carries the
+// source primary's "in production" (#181), so every freshly cloned tagged standby would
+// contend for the whole replay to consistency. A saturated node is excepted -- it is
+// running, and its pg_control state is real.
 func leadershipCandidate(o reconcile.Observation) bool {
-	return reconcile.FailoverEligible(o, o.LocalNode) || (o.Local.HasData && !o.Local.InRecovery)
+	starting := o.LocalProcessAlive && !o.Local.Running && !o.Local.Saturated
+	return reconcile.FailoverEligible(o, o.LocalNode) || (o.Local.HasData && !o.Local.InRecovery && !starting)
 }
 
 // memberSet turns a parsed member-tag list into the lookup set the Observation carries
@@ -4020,7 +4027,10 @@ func (a *agent) logMemberTags(m k8s.Marker) {
 		names []string
 	}{{k8s.NoFailoverAnnotation, m.NoFailover}, {k8s.NoLoadBalanceAnnotation, m.NoLoadBalance}} {
 		for _, n := range l.names {
-			if !a.validPeerName(n) {
+			// An ordinal past spec.replicas (a scaled-away pod, "-5" on three nodes) names
+			// the right shape but no pod, and tags nobody just the same.
+			ord, _ := podname.Ordinal(n)
+			if !a.validPeerName(n) || (a.expectedNodes() > 0 && ord >= a.expectedNodes()) {
 				a.log.Warn("member tag names no pod of this cluster; it tags nobody", "annotation", l.ann, "name", n, "expected", a.base+"-<ordinal>")
 			}
 		}
