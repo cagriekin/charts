@@ -387,12 +387,16 @@ jobs:
           # the pull themselves and the suite fails with its own diagnosis rather than this one.
           pulled=""
           for attempt in 1 2 3; do
-            if docker pull "$ref"; then pulled=1; break; fi
+            if docker pull --platform linux/amd64 "$ref"; then pulled=1; break; fi
             echo "docker pull $ref failed (attempt $attempt); retrying"
             sleep $((attempt * 15))
           done
           if [ -n "$pulled" ]; then
-            kind load docker-image "$ref" --name pg-test
+            # Not `kind load docker-image`: it runs a plain `docker save`, which under the
+            # containerd image store writes a multi-arch index whose other platforms' layers
+            # were never pulled, and the node import fails on them (#275; see the base images).
+            docker save --platform linux/amd64 "$ref" -o /tmp/from-image.tar
+            kind load image-archive /tmp/from-image.tar --name pg-test
           else
             echo "::warning::could not pre-load $ref; the kind workers will pull it in-cluster"
           fi
