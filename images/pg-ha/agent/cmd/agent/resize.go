@@ -46,11 +46,19 @@ func (s podSize) String() string {
 // within a minute rather than lasting until the next role change.
 const resizeRecheck = time.Minute
 
+// resizeRetry is the back-off after a failure that says nothing about the size: an unreadable
+// pod or a patch that timed out / hit a 5xx / was throttled. Short, because a fresh primary
+// waiting on its raise should not wait a whole resizeRecheck over an apiserver blip; non-zero,
+// because retrying every tick against a blackholed apiserver would spend a resize budget on
+// every tick and push the lease holder's tick past the /healthz staleness threshold (#298).
+const resizeRetry = 15 * time.Second
+
 // resizeState is resizeTick's memory between ticks (reconcile goroutine only).
 type resizeState struct {
 	target    podSize          // the size last asked for
 	settled   bool             // target was actuated, or is in a state only time or an operator changes
 	checkedAt time.Time        // last GET of the pod
+	retryAt   time.Time        // after a transient failure for target: no apiserver call before this
 	logged    string           // last logged state, so the log carries one line per change
 	now       func() time.Time // nil = time.Now; tests set it
 }
@@ -116,16 +124,25 @@ func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reco
 	if want == rs.target && rs.settled && now.Sub(rs.checkedAt) < resizeRecheck {
 		return
 	}
-	// Bounded like topologyTick: tick()'s context has no deadline, and a blackholed apiserver
-	// must not stall the reconcile loop into a /healthz failure over a resize.
-	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	if want == rs.target && now.Before(rs.retryAt) {
+		return
+	}
+	// Bounded like refreshNodeCount, at HALF the fence budget: tick()'s context has no
+	// deadline, and this GET (+PATCH) runs on the same tick as observe()'s marker/gossip reads,
+	// the marker block, act() and topologyTick, each already spending a full budget against a
+	// blackholed apiserver. A whole budget more would push the lease holder's worst-case tick
+	// past 3x the reconcile interval and have the kubelet kill the serving primary over a
+	// stale /healthz while the apiserver is unreachable (#298). A GET and one PATCH fit.
+	rctx, cancel := context.WithTimeout(ctx, a.fenceBudget()/2)
 	defer cancel()
 	sizes := a.resizeSizes(want)
 	st, err := a.kube.PodResizeStatus(rctx, a.cfg.PodName, sizes)
 	if err != nil {
+		rs.target, rs.settled, rs.retryAt = want, false, now.Add(resizeRetry)
 		a.logResize(want, "unreadable", fmt.Sprintf("read pod for resize: %v", err), false)
 		return
 	}
+	rs.retryAt = time.Time{}
 	var refused error
 	if !st.SpecMatches {
 		refused = a.kube.ResizePod(rctx, a.cfg.PodName, sizes, st.Containers)
@@ -137,6 +154,14 @@ func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reco
 			// The apiserver's own allocatable check (Kubernetes 1.35+): the kubelet's
 			// Infeasible, answered at admission instead of on a pod condition.
 			st.Pending, st.Message, refused = k8s.ResizeInfeasible, refused.Error(), nil
+		case k8s.ResizeRefusedTransient(refused):
+			// A timeout, 5xx, throttle or conflict says nothing about the size: retry after
+			// resizeRetry rather than settle on it for a whole resizeRecheck, which would leave
+			// a fresh primary at the standby size for a minute over one apiserver blip.
+			rs.target, rs.settled, rs.retryAt = want, false, now.Add(resizeRetry)
+			a.metr.SetResize(observe.ResizeStats{Pending: true})
+			a.logResize(want, "retrying", refused.Error(), false)
+			return
 		}
 	}
 	rs.target, rs.checkedAt = want, now

@@ -251,3 +251,33 @@ func TestResizeTickAdmissionRefusalIsInfeasible(t *testing.T) {
 		t.Errorf("want an Error with state=Infeasible, got:\n%s", h.logs)
 	}
 }
+
+// A transient patch failure (5xx, timeout) is retried after resizeRetry, not settled on for a
+// whole resizeRecheck: a fresh primary must not sit at the standby size for a minute over one
+// apiserver blip. And it is not retried every tick either (#298: the tick's apiserver budget).
+func TestResizeTickTransientRefusalRetriesSoon(t *testing.T) {
+	h := newResizeHarness(t)
+	fail := true
+	h.cs.PrependReactor("patch", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if fail {
+			return true, nil, apierrors.NewInternalError(errors.New("etcdserver: leader changed"))
+		}
+		return false, nil, nil
+	})
+	h.tickAsPrimary()
+	if strings.Contains(h.logs.String(), "level=ERROR") {
+		t.Errorf("a transient failure is not the primary-cannot-be-raised Error:\n%s", h.logs)
+	}
+	gets := h.count("get")
+	h.tickAsPrimary()
+	if h.count("get") != gets {
+		t.Error("a transient failure must not be retried on the very next tick")
+	}
+	fail = false
+	h.clock = h.clock.Add(resizeRetry)
+	h.tickAsPrimary()
+	p, _ := h.cs.CoreV1().Pods("ns").Get(context.Background(), "pg-0", metav1.GetOptions{})
+	if got := p.Spec.Containers[0].Resources.Limits.Memory(); got.Cmp(resource.MustParse("4Gi")) != 0 {
+		t.Errorf("after resizeRetry the raise should be retried; memory limit = %s, want 4Gi", got)
+	}
+}

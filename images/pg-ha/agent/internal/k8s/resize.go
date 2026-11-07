@@ -35,6 +35,22 @@ func ResizeRefusedInfeasible(err error) bool {
 	return err != nil && apierrors.IsForbidden(err) && strings.Contains(err.Error(), "enough allocatable")
 }
 
+// ResizeRefusedTransient reports whether a failed resize patch is worth retrying soon (#386):
+// a timeout, throttle, conflict or server-side error says nothing about the size. A refusal
+// the apiserver will repeat (forbidden -- quota, allocatable, RBAC --, invalid, not found) is
+// not, and is retried only on the slower recheck.
+func ResizeRefusedTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case apierrors.IsForbidden(err), apierrors.IsInvalid(err), apierrors.IsBadRequest(err),
+		apierrors.IsNotFound(err), apierrors.IsMethodNotSupported(err), apierrors.IsUnauthorized(err):
+		return false
+	}
+	return true
+}
+
 // resizeResources are the resources the agent manages on a resize. Anything else in a
 // container's requests/limits (ephemeral-storage, hugepages, extended resources) is left
 // exactly as the StatefulSet template rendered it.
