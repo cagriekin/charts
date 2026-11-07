@@ -42,6 +42,8 @@
        more specific mistake, and the floor (#373) should only speak when the tag is otherwise
        a sound 2.x pin that is simply too old for this chart. */}}
 {{- include "pg.validateAgentImageFloor" . }}
+{{- /* #386, after the floor: a tag below 2.4.0 is the more basic mistake. */}}
+{{- include "pg.validateStandbyResources" . }}
 {{- if and (not .Values.ha.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true" }}
 {{- end }}
@@ -897,6 +899,15 @@ spec:
               value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval") | quote }}
             - name: SATURATION_GRACE
               value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "saturationGrace") | quote }}
+{{- if eq (include "pg.standbyResize" .) "true" }}
+            {{- /* #386: the sizes the agent swaps this pod between on a role change. The
+                   template below carries the standby size; the agent raises its own pod to
+                   the primary size through pods/resize once it is the primary, and lowers it
+                   again once it runs as a standby. A change to either size changes this
+                   value, so the pods roll exactly as a resources change always did. */}}
+            - name: PG_HA_RESIZE
+              value: {{ include "pg.resizeSpec" . | quote }}
+{{- end }}
 {{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and
@@ -1552,8 +1563,20 @@ spec:
 {{- end }}
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
+{{- /* #386: with standbyResources set the template carries the STANDBY size, so any pod
+       the controller creates starts small and only the elected primary is raised (by its
+       agent, in place). resizePolicy NotRequired on cpu and memory -- the defaults, spelled
+       out because a restart on resize would bounce the primary at the moment it took over --
+       and rendered only with the feature on, so the default render does not move. */}}
+{{- if eq (include "pg.standbyResize" .) "true" }}
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+{{- end }}
           resources:
-            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+            {{- toYaml (.Values.postgresql.standbyResources | default .Values.postgresql.resources) | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -1667,8 +1690,18 @@ spec:
 {{- with .Values.pgbackrest.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
+{{- /* #386: same as the postgresql container -- the backup CronJob only ever execs into
+       the primary's sidecar, so standbys can run it small and the agent raises it with
+       postgresql in one resize. */}}
+{{- if eq (include "pg.standbyResize" .) "true" }}
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: NotRequired
+            - resourceName: memory
+              restartPolicy: NotRequired
+{{- end }}
           resources:
-            {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
+            {{- toYaml (.Values.pgbackrest.standbyResources | default .Values.pgbackrest.resources) | nindent 12 }}
 {{- end }}
       volumes:
         - name: postgresql-config

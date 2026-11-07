@@ -5,13 +5,17 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // defaultPGMajor is assumed when PG_MAJOR is unset -- an image built before the
@@ -183,6 +187,60 @@ type Config struct {
 	// absent means this release has no repository, and those routes say so.
 	PGBackrestEnabled bool
 	PGBackrestStanza  string
+
+	// Resize is the in-place pod resize spec (#386), from PG_HA_RESIZE: per container
+	// ("postgresql", "pgbackrest"), the size it runs at while this pod is the primary and
+	// while it is not. Nil when the env is absent -- standbyResources unset, every pod one
+	// size -- and the agent then never touches its pod's resources.
+	Resize map[string]ResizePair
+}
+
+// ResizeContainers are the containers PG_HA_RESIZE may name (#386): the two whose load
+// follows the role. postgresql serves the writes (and runs archive-push and this agent);
+// pgbackrest is where the backup CronJob execs, only ever on the primary.
+var ResizeContainers = []string{"postgresql", "pgbackrest"}
+
+// ResizePair is one container's two sizes (#386).
+type ResizePair struct {
+	Primary corev1.ResourceRequirements `json:"primary"`
+	Standby corev1.ResourceRequirements `json:"standby"`
+}
+
+// parseResize decodes PG_HA_RESIZE (#386). Strict: an unknown container or field, an
+// unparseable quantity, or a size without cpu and memory requests and limits is a boot
+// error, not a silently skipped container -- a half-read spec would leave the primary at
+// the standby size with nothing reporting it. The chart guards the same at render time.
+func parseResize(v string) (map[string]ResizePair, error) {
+	dec := json.NewDecoder(strings.NewReader(v))
+	dec.DisallowUnknownFields()
+	var m map[string]ResizePair
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	if len(m) == 0 {
+		return nil, fmt.Errorf("names no container")
+	}
+	for name, p := range m {
+		if !slices.Contains(ResizeContainers, name) {
+			return nil, fmt.Errorf("unknown container %q (want one of %s)", name, strings.Join(ResizeContainers, ", "))
+		}
+		for _, sz := range []struct {
+			which string
+			r     corev1.ResourceRequirements
+		}{{"primary", p.Primary}, {"standby", p.Standby}} {
+			for _, list := range []struct {
+				kind string
+				l    corev1.ResourceList
+			}{{"requests", sz.r.Requests}, {"limits", sz.r.Limits}} {
+				for _, res := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+					if _, ok := list.l[res]; !ok {
+						return nil, fmt.Errorf("%s.%s.%s.%s is missing", name, sz.which, list.kind, res)
+					}
+				}
+			}
+		}
+	}
+	return m, nil
 }
 
 // RestoreStatusPath is where the chart's restore.sh records the outcome of the last
@@ -393,6 +451,15 @@ func Load(get func(string) string) (*Config, error) {
 			MechanismRepmgr, MechanismNative, MechanismNative))
 	default:
 		l.invalid = append(l.invalid, fmt.Sprintf("MECHANISM=%q (want %s)", c.Mechanism, MechanismNative))
+	}
+
+	// In-place resize on a role change (#386). Optional -- absent means off.
+	if v := strings.TrimSpace(get("PG_HA_RESIZE")); v != "" {
+		r, perr := parseResize(v)
+		if perr != nil {
+			l.invalid = append(l.invalid, fmt.Sprintf("PG_HA_RESIZE is not a valid resize spec: %v (it is rendered from postgresql.standbyResources / pgbackrest.standbyResources)", perr))
+		}
+		c.Resize = r
 	}
 
 	// Cross-field validation that the lease timings are internally consistent

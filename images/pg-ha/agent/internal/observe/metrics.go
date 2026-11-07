@@ -82,7 +82,17 @@ type Metrics struct {
 	topologyStreaming    atomic.Int64
 	topologyExpected     atomic.Int64
 	topologyUnidentified atomic.Int64
-	now                  func() time.Time
+	// In-place pod resize on a role change (#386), published only when postgresql/pgbackrest
+	// standbyResources is set. Gauges of CURRENT state: sizedAsPrimary is 1 while this pod is
+	// the primary and the kubelet has actuated the primary size on it; resizePending is 1 while
+	// the size this pod's role calls for is not yet in effect (patch refused, Deferred, Infeasible or in
+	// progress); resizeInfeasible is 1 while the kubelet reports the requested size cannot fit
+	// the node at all. An Infeasible raise leaves a promoted primary serving at the standby
+	// size, which nothing else surfaces -- hence the gauge an alert can key on.
+	sizedAsPrimary   atomic.Int64
+	resizePending    atomic.Int64
+	resizeInfeasible atomic.Int64
+	now              func() time.Time
 }
 
 // SlotStats is the aggregate slot picture the primary publishes each tick (#289).
@@ -188,6 +198,20 @@ func (m *Metrics) SetSlots(s SlotStats) {
 // lifetime and keep paging after the condition moved or was resolved.
 func (m *Metrics) ClearSlots() { m.SetSlots(SlotStats{}) }
 
+// ResizeStats is this pod's in-place resize state (#386).
+type ResizeStats struct {
+	SizedAsPrimary bool
+	Pending        bool
+	Infeasible     bool
+}
+
+// SetResize publishes this pod's in-place resize state (#386).
+func (m *Metrics) SetResize(r ResizeStats) {
+	m.sizedAsPrimary.Store(b2i(r.SizedAsPrimary))
+	m.resizePending.Store(b2i(r.Pending))
+	m.resizeInfeasible.Store(b2i(r.Infeasible))
+}
+
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
 
@@ -253,6 +277,9 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots reserving WAL with no active consumer.", "gauge", m.slotsInactive.Load()},
 		{"pg_ha_agent_replication_slots_invalidated", "Physical replication slots PostgreSQL invalidated for exceeding max_slot_wal_keep_size; the standby behind each needs a full re-clone.", "gauge", m.slotsInvalidated.Load()},
 		{"pg_ha_agent_replication_slots_recycled_total", "Invalidated replication slots the agent dropped and re-created for a live standby. The slot is usable again; the standby behind it still needs a full re-clone.", "counter", m.slotsRecycled.Load()},
+		{"pg_ha_agent_pod_sized_as_primary", "1 while this pod is the primary and the kubelet has actuated the primary size (postgresql/pgbackrest resources) on it (#386). Always 0 when standbyResources is unset.", "gauge", m.sizedAsPrimary.Load()},
+		{"pg_ha_agent_pod_resize_pending", "1 while the size this pod's role calls for is not yet in effect: the resize was refused, Deferred, Infeasible or is still in progress (#386).", "gauge", m.resizePending.Load()},
+		{"pg_ha_agent_pod_resize_infeasible", "1 while the kubelet reports the size this pod's role calls for cannot fit its node (PodResizePending reason Infeasible). A primary in this state serves at the standby size (#386).", "gauge", m.resizeInfeasible.Load()},
 		{"pg_ha_agent_replication_slot_max_retained_wal_bytes", "Largest WAL volume retained by any one physical replication slot.", "gauge", m.slotMaxRetainedWALBytes.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)

@@ -4,6 +4,31 @@
 
 ### Added
 
+- **Standby sizing with in-place resize on a role change (#386).** New
+  `postgresql.standbyResources` and `pgbackrest.standbyResources`, both empty by default. Empty
+  means one size and a render identical to before. When set:
+  - The StatefulSet template carries the standby size.
+  - The pg-ha agent resizes its own pod in place through `pods/resize`, without a restart. It
+    raises the pod to `resources` on the tick it promotes, and whenever it serves read-write
+    with the lease. It lowers the pod once it runs as a standby again.
+  - postgresql and the pgbackrest sidecar move together. The backup CronJob only execs into the
+    primary's sidecar, so standbys can run it small.
+  - A raise the node cannot fit never blocks a promotion. It is reported by an Error log line,
+    `pg_ha_agent_pod_resize_pending` / `pg_ha_agent_pod_resize_infeasible`, and the new
+    `PGHAPodResizeInfeasible` alert. Any other resize left pending for 15m (`Deferred` on a full
+    node, a lowered memory limit the kubelet will not apply) fires `PGHAPodResizeStuck`.
+  - The render fails without agent mode, below Kubernetes 1.34 (1.33 cannot lower a memory limit
+    in place, so a demoted primary would never shrink), on a pg-ha image older than 2.5.0, or on
+    a size without cpu and memory under both requests and limits.
+  - The agent's Role gains `patch` on `pods/resize`, scoped to the StatefulSet's pods, only with
+    the feature on.
+  - Opt in only when standbys serve no reads. pgpool load-balances reads to the standbys, so
+    `standbyResources` with `pgpool.enabled` fails the render unless
+    `postgresql.standbyResourcesAcknowledgeReads: true` (every standby tagged
+    `pg-ha/noloadbalance`, or reads at the standby size intended).
+- **The pg-ha image moves to 2.5.0** (`ha.image.tag` and `etcd.rbac.bootstrapImage.tag`:
+  `2.5.0-pg18`). It carries the #386 resize and puts the #275 member tags into effect.
+
 - **Per-member tags: `pg-ha/nofailover` and `pg-ha/noloadbalance` (#275).** These are
   Patroni's `nofailover` and `noloadbalance` tags, as comma-separated pod-name lists on the
   `<fullname>-primary` marker ConfigMap. They take one node out of the election, or out of read
@@ -18,8 +43,8 @@
     over to.
 
   The tags live on the marker, which the agent owns, so they survive pod restarts and chart
-  upgrades. `GET /v1/cluster` lists them. They take effect once the chart pins a pg-ha image at
-  2.5.0 or later. Older agents ignore them.
+  upgrades. `GET /v1/cluster` lists them. They need the pg-ha image at 2.5.0 or later, which
+  this release pins. Older agents ignore them.
 
 ### Fixed
 

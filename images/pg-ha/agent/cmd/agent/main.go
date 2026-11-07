@@ -16,11 +16,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,7 +106,13 @@ func logStartupConfig(log *slog.Logger, cfg *config.Config) {
 		"cascadeReplication", cfg.CascadeReplication,
 		"syncReplicationSlots", cfg.SyncReplicationSlots,
 		"pgMajor", cfg.PGMajor,
+		"resizeContainers", resizeContainerNames(cfg.Resize), // #386: empty = one size, no resize
 	)
+}
+
+// resizeContainerNames lists the containers PG_HA_RESIZE sizes by role, sorted (#386).
+func resizeContainerNames(m map[string]config.ResizePair) []string {
+	return slices.Sorted(maps.Keys(m))
 }
 
 // runRBACBootstrap reads the bootstrap inputs from env and drives the etcd Auth API.
@@ -235,6 +243,10 @@ type agent struct {
 	// one line per CHANGE instead of one per tick (#288). A rolling restart legitimately parks a
 	// peer off-stream for a while, and warning every 5s about it would bury everything else.
 	lastTopologyGap string
+
+	// resize is resizeTick's state (#386): the size last asked for and whether it is in
+	// effect, so a settled pod costs one GET a minute and the log one line per change.
+	resize resizeState
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -933,6 +945,10 @@ func (a *agent) tick(ctx context.Context) {
 		// delay. Out here it cannot, and its extra LIST stays off the promote critical path.
 		a.topologyTick(ctx)
 	}
+	// #386: size this pod for its role. After act() and outside opMu for the reason
+	// topologyTick is: it is apiserver I/O that must never hold up a fence or a routing write,
+	// and nothing waits on the kubelet acting on it. Gated inside on PG_HA_RESIZE.
+	a.resizeTick(ctx, dec, obs, err)
 	// Publish what the control API serves. Gated on the API being enabled so a release
 	// without it does exactly the work it did before -- notably no extra replay probe.
 	if a.cfg.ControlEnabled {

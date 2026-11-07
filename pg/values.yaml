@@ -42,6 +42,42 @@ postgresql:
       cpu: 1000m
       memory: 1Gi
 
+  # Size of the postgresql container on every pod that is NOT the primary (#386). Empty
+  # (the default) = every pod runs `resources` above, exactly as before. When set:
+  #   - the StatefulSet template carries THIS size, so every pod the controller creates
+  #     (install, rolling update, a rescheduled primary) starts small;
+  #   - the pg-ha agent resizes its own pod IN PLACE (the pods/resize subresource, no
+  #     restart) to `resources` when it becomes the primary -- on the promotion tick, without
+  #     waiting for the kubelet -- and back to this size once it runs as a standby again. A
+  #     demoted primary is lowered only after its server has restarted as a standby, so its
+  #     memory use fits under the lower limit;
+  #   - a raise the node cannot fit (Deferred / Infeasible) never blocks a promotion: the
+  #     primary keeps serving at the size it has, the agent logs an Error and publishes
+  #     pg_ha_agent_pod_resize_infeasible=1 (and _pending=1 until it takes effect).
+  # Opt in ONLY when standbys serve no reads: a standby here replays WAL and nothing else.
+  # Releases that read from standbys (the -readonly Service, pgpool load balancing) keep
+  # one size, or tag every standby pg-ha/noloadbalance (#275). pgpool always load-balances
+  # reads to the standbys, so with pgpool.enabled the render fails until you set
+  # standbyResourcesAcknowledgeReads below.
+  # The memory limit must still cover shared_buffers plus the standby's working set:
+  # shared_buffers only changes on a restart, the promoted standby keeps the value it
+  # started with, and the chart cannot check it for you (it sets no shared_buffers).
+  # A standby catching up from the pgBackRest repo also runs archive-get (zstd decompress)
+  # in this container. Requirements, each enforced at render time: agent mode,
+  # Kubernetes >= 1.34 (1.33 cannot lower a memory limit in place), a pg-ha image >= 2.5.0, and cpu and memory under both requests and
+  # limits. QoS needs no care: in-place resize cannot change a pod's QoS class, but these
+  # pods are always Burstable (the setup-config init container's requests are below its limits).
+  # Example:
+  #   standbyResources:
+  #     requests: {cpu: 50m, memory: 256Mi}
+  #     limits:   {cpu: 500m, memory: 512Mi}
+  standbyResources: {}
+  # With standbyResources set and pgpool.enabled, the render fails: pgpool load-balances
+  # reads to the standbys, which would serve them at the standby size. Set true only once
+  # every standby is tagged pg-ha/noloadbalance (#275), or when reads at the standby size are
+  # what you want (#386). Ignored without standbyResources.
+  standbyResourcesAcknowledgeReads: false
+
   persistence:
     enabled: true
     storageClass: ""
@@ -546,7 +582,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.4.0-pg18
+    tag: 2.5.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -1454,6 +1490,21 @@ pgbackrest:
       cpu: 1000m
       memory: 1Gi
 
+  # Size of this sidecar on every pod that is NOT the primary (#386). Empty = one size.
+  # The backup CronJob only ever execs into the PRIMARY's sidecar (process-max=2, zstd);
+  # on a standby it runs `sleep infinity`. When set, the agent resizes this container
+  # together with postgresql (one pods/resize patch), so it follows the same rules as
+  # postgresql.standbyResources: cpu and memory under requests and limits, and it requires
+  # pgbackrest.enabled. A backup that was running on
+  # a primary that is demoted fails with the demotion either way; the lower size is applied
+  # once the pod runs as a standby. The bootstrap init container, the restore Job and the
+  # validation CronJob have their own sizes and do not change.
+  # Example:
+  #   standbyResources:
+  #     requests: {cpu: 10m, memory: 32Mi}
+  #     limits:   {cpu: 100m, memory: 64Mi}
+  standbyResources: {}
+
   # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
   # finds the current primary via the headless primary service endpoints
   # (repointed by the agent on every promotion) and
@@ -1699,4 +1750,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.4.0-pg18
+      tag: 2.5.0-pg18

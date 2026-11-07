@@ -286,6 +286,7 @@ jobs:
           - agent-rolling
           - agent-lag-gate
           - agent-member-tags
+          - agent-standby-resize
           - backup-restore
           - backup-concurrent
           - pgbackrest-restore

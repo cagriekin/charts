@@ -2094,6 +2094,92 @@ spelling statefulset.yaml emits, so no second key->env table has to agree with i
 {{- end -}}
 
 {{- /*
+pg.standbyResize -- "true" when postgresql.standbyResources or pgbackrest.standbyResources is
+set (#386): the StatefulSet template then carries the standby size, the agent gets
+PG_HA_RESIZE and resizes its own pod in place on a role change, and its Role may patch
+pods/resize. Empty otherwise, and the render is byte-identical to a chart without the feature.
+pgbackrest.standbyResources counts only with pgbackrest enabled; set without it,
+pg.validateStandbyResources refuses the render rather than ignoring it.
+*/ -}}
+{{- define "pg.standbyResize" -}}
+{{- if or (not (empty .Values.postgresql.standbyResources)) (and .Values.pgbackrest.enabled (not (empty .Values.pgbackrest.standbyResources))) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.resizeSpec -- the PG_HA_RESIZE value (#386): per container that has a standby size, the
+size it runs at while the pod is the primary and while it is not. Only those containers: a
+container without standbyResources keeps one size and the agent never touches it. Compact
+JSON, keys sorted by toJson, so an unchanged values file renders an unchanged env.
+*/ -}}
+{{- define "pg.resizeSpec" -}}
+{{- $spec := dict -}}
+{{- if not (empty .Values.postgresql.standbyResources) -}}
+{{- $_ := set $spec "postgresql" (dict "primary" .Values.postgresql.resources "standby" .Values.postgresql.standbyResources) -}}
+{{- end -}}
+{{- if and .Values.pgbackrest.enabled (not (empty .Values.pgbackrest.standbyResources)) -}}
+{{- $_ := set $spec "pgbackrest" (dict "primary" .Values.pgbackrest.resources "standby" .Values.pgbackrest.standbyResources) -}}
+{{- end -}}
+{{- toJson $spec -}}
+{{- end -}}
+
+{{- define "pg.validateStandbyResources" -}}
+{{- /* #386. Each guard below is a way the feature renders cleanly and then leaves a primary
+       running at the standby size with nothing saying so -- the one outcome it must not have.
+       No QoS guard: in-place resize cannot change a pod's QoS class, but every pod of this
+       chart is Burstable whatever the values say -- the unconditional setup-config init
+       container runs pg.initResources, whose requests are below its limits -- so no pair of
+       sizes can move it. test-template.sh pins that, so making that init container
+       Guaranteed fails there and points back here. */ -}}
+{{- if and (not .Values.pgbackrest.enabled) (not (empty .Values.pgbackrest.standbyResources)) -}}
+{{- fail "pgbackrest.standbyResources is set but pgbackrest.enabled=false: there is no pgbackrest sidecar to size. Remove pgbackrest.standbyResources, or enable pgbackrest (#386)." -}}
+{{- end -}}
+{{- if eq (include "pg.standbyResize" .) "true" -}}
+{{- if ne (include "pg.agentMode" .) "true" -}}
+{{- fail "postgresql.standbyResources / pgbackrest.standbyResources need the pg-ha agent (ha.enabled=true): it is the agent that raises the primary's pod to postgresql.resources. Standalone mode runs no agent and has no standby; remove standbyResources (#386)." -}}
+{{- end -}}
+{{- /* 1.34, not 1.33: pods/resize exists from 1.33, but 1.33's apiserver refuses to LOWER a
+       memory limit under resizePolicy NotRequired (only RestartContainer could), and 1.34
+       lifted that. On 1.33 every demoted primary would be refused its standby size, keep the
+       primary's memory limit for good and retry every minute -- the raise works, the lower
+       never does, and the feature quietly reserves the primary size twice. */ -}}
+{{- if not (semverCompare ">=1.34.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "postgresql.standbyResources / pgbackrest.standbyResources need Kubernetes 1.34 or later (in-place pod resize, the pods/resize subresource, with memory-limit decreases; 1.33 refuses those, so a demoted primary would keep the primary size for good), but the target cluster is %s. Upgrade the cluster or remove standbyResources; with `helm template`, pass --kube-version (#386)." .Capabilities.KubeVersion.Version) -}}
+{{- end -}}
+{{- /* pgpool in agent mode load-balances every read to the -readonly backend whenever standbys
+       exist (load_balance_mode = on, primary weight 0): with standbyResources set, the read
+       half of the release's traffic lands on pods sized to replay WAL and nothing else, and is
+       throttled or OOM-killed there. The render cannot see #275's noloadbalance tags (they are
+       runtime marker annotations), so it refuses the pair and takes an explicit
+       acknowledgement for a release whose standbys are all tagged, or whose reads are meant
+       to run at the standby size. */ -}}
+{{- if and .Values.pgpool.enabled (gt (int .Values.postgresql.replicaCount) 0) (not .Values.postgresql.standbyResourcesAcknowledgeReads) -}}
+{{- fail "postgresql.standbyResources / pgbackrest.standbyResources are set with pgpool.enabled=true, and pgpool load-balances reads to the standbys -- which would serve them at the standby size. Remove standbyResources, disable pgpool, or, once every standby is tagged pg-ha/noloadbalance (#275) or reads at the standby size are intended, set postgresql.standbyResourcesAcknowledgeReads=true (#386)." -}}
+{{- end -}}
+{{- $ver := include "pg.haImageSchemeVersion" . -}}
+{{- if and $ver (semverCompare "< 2.5.0" $ver) -}}
+{{- fail (printf "ha.image.tag is %q, but postgresql.standbyResources / pgbackrest.standbyResources need the pg-ha agent at 2.5.0 or later: an older agent ignores PG_HA_RESIZE, so every pod -- the primary too -- would run at the standby size. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.5.0-pg<major> or later, or remove standbyResources (#386)." (.Values.ha.image.tag | toString)) -}}
+{{- end -}}
+{{- range $c := list "postgresql" "pgbackrest" -}}
+{{- $sr := (index $.Values $c).standbyResources -}}
+{{- if not (empty $sr) -}}
+{{- range $kind := list "requests" "limits" -}}
+{{- range $res := list "cpu" "memory" -}}
+{{- if not (hasKey ((index $sr $kind) | default dict) $res) -}}
+{{- fail (printf "%s.standbyResources.%s.%s is missing: a standby size sets cpu and memory under both requests and limits, because the agent swaps the whole size on a role change and a key left to the template's default would not come back when the pod is raised. Set it, e.g. %s.standbyResources.%s.%s (#386)." $c $kind $res $c $kind $res) -}}
+{{- end -}}
+{{- if not (hasKey ((index (index $.Values $c).resources $kind) | default dict) $res) -}}
+{{- fail (printf "%s.standbyResources is set, but %s.resources.%s.%s is missing: the primary size is what the agent raises the pod to, so it needs cpu and memory under both requests and limits too (#386)." $c $c $kind $res) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 pg.managedRoleDO -- the DO block that creates and converges one chart-managed role (#372).
 BYTE-IDENTICAL to managedRoleDO in images/pg-ha/agent/internal/pg/roles.go, which the agent
 runs in HA mode; the standalone postStart hook includes this one twice (app role, pgpool

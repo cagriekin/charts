@@ -6810,5 +6810,112 @@ assert_contains "#292: the runbook looks for the diverged dir at the right path"
 assert_contains "#292: the suite looks for the diverged dir at the right path" \
   "${mig_src}" '${PGDATA_DIR}.diverged.'
 
+
+# ---------------------------------------------------------------------------------------------
+# #386: standbyResources -- the template carries the standby size, the agent resizes in place.
+# ---------------------------------------------------------------------------------------------
+sr_args=(-f "${SCRIPT_DIR}/values-pgbackrest.yaml" --kube-version 1.35.0 --set postgresql.replicaCount=2)
+sr_pg=(--set postgresql.standbyResources.requests.cpu=50m --set postgresql.standbyResources.requests.memory=256Mi
+       --set postgresql.standbyResources.limits.cpu=500m --set postgresql.standbyResources.limits.memory=512Mi)
+sr_br=(--set pgbackrest.standbyResources.requests.cpu=10m --set pgbackrest.standbyResources.requests.memory=32Mi
+       --set pgbackrest.standbyResources.limits.cpu=100m --set pgbackrest.standbyResources.limits.memory=64Mi)
+sr_ctr() { # sr_ctr <render> <container> -> that container's block of the StatefulSet
+  awk -v c="$2" '/^kind: StatefulSet/{s=1} s && /^      containers:/{k=1} k && $0 ~ "^        - name: "c"$"{p=1; print; next} p && /^        - name: /{exit} p{print}' <<< "$1"
+}
+
+# Off (the default): nothing of the feature in the render.
+sr_off=$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" 2>&1)
+assert_not_contains "#386: off by default: no PG_HA_RESIZE" "${sr_off}" "PG_HA_RESIZE"
+assert_not_contains "#386: off by default: no resizePolicy" "${sr_off}" "resizePolicy"
+assert_not_contains "#386: off by default: no pods/resize grant" "${sr_off}" "pods/resize"
+
+# On, both containers.
+sr_on=$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" "${sr_br[@]}" 2>&1)
+sr_on_pg=$(sr_ctr "${sr_on}" postgresql)
+sr_on_br=$(sr_ctr "${sr_on}" pgbackrest)
+assert_contains "#386: the postgresql container carries the standby memory limit" "${sr_on_pg}" "memory: 512Mi"
+assert_not_contains "#386: ...not the primary's" "${sr_on_pg}" "memory: 1Gi"
+assert_contains "#386: the pgbackrest container carries the standby memory limit" "${sr_on_br}" "memory: 64Mi"
+assert_contains "#386: postgresql gets resizePolicy NotRequired" "${sr_on_pg}" "restartPolicy: NotRequired"
+assert_contains "#386: pgbackrest gets resizePolicy NotRequired" "${sr_on_br}" "restartPolicy: NotRequired"
+sr_env=$(awk '/- name: PG_HA_RESIZE$/{getline; print; exit}' <<< "${sr_on}" | sed 's/\\"/"/g')
+assert_contains "#386: PG_HA_RESIZE holds the postgresql primary size" "${sr_env}" '"postgresql":{"primary":{"limits":{"cpu":"1000m","memory":"1Gi"}'
+assert_contains "#386: ...and its standby size" "${sr_env}" '"standby":{"limits":{"cpu":"500m","memory":"512Mi"}'
+assert_contains "#386: PG_HA_RESIZE holds the pgbackrest pair" "${sr_env}" '"pgbackrest":{"primary":'
+sr_rbac=$(awk '/pods\/resize/{p=1} p{print} p && /verbs:/{exit}' <<< "${sr_on}")
+assert_contains "#386: the agent may patch pods/resize" "${sr_rbac}" '"patch"'
+assert_contains "#386: ...scoped to the StatefulSet's own pods" "${sr_rbac}" '"test-pg-2"'
+assert_not_contains "#386: ...and no further" "${sr_rbac}" '"test-pg-3"'
+
+# On, postgresql only: pgbackrest keeps one size and is not in the spec.
+sr_pgonly=$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" 2>&1)
+assert_contains "#386: postgresql-only: pgbackrest keeps pgbackrest.resources" "$(sr_ctr "${sr_pgonly}" pgbackrest)" "memory: 1Gi"
+assert_not_contains "#386: postgresql-only: pgbackrest is not in PG_HA_RESIZE" \
+  "$(awk '/- name: PG_HA_RESIZE$/{getline; print; exit}' <<< "${sr_pgonly}")" "pgbackrest"
+
+# Guards, each with its message.
+sr_fail() { # sr_fail <label> <expected message fragment> <helm args...>
+  local label="$1" want="$2"; shift 2
+  local out rc=0
+  out=$(helm template test-pg "${CHART_DIR}" "$@" 2>&1) || rc=$?
+  assert_eq "${label} fails the render" "1" "$([ "${rc}" -ne 0 ] && echo 1 || echo 0)"
+  assert_contains "${label}: the message says why" "${out}" "${want}"
+  assert_contains "${label}: the message cites #386" "${out}" "(#386)"
+}
+sr_fail "#386 guard: standalone" "need the pg-ha agent" \
+  --kube-version 1.35.0 --set ha.enabled=false --set postgresql.replicaCount=0 "${sr_pg[@]}"
+sr_fail "#386 guard: Kubernetes 1.33 (cannot lower a memory limit in place)" "need Kubernetes 1.34 or later" \
+  "${sr_args[@]/1.35.0/1.33.0}" "${sr_pg[@]}"
+sr_k134_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]/1.35.0/1.34.0}" "${sr_pg[@]}" >/dev/null 2>&1 || sr_k134_rc=$?
+assert_eq "#386: Kubernetes 1.34 passes the floor" "0" "${sr_k134_rc}"
+# pgpool load-balances reads to the standbys: the pair needs an explicit acknowledgement.
+sr_fail "#386 guard: pgpool load-balances reads to small standbys" "set postgresql.standbyResourcesAcknowledgeReads=true" \
+  "${sr_args[@]}" "${sr_pg[@]}" --set pgpool.enabled=true
+sr_ack_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set pgpool.enabled=true \
+  --set postgresql.standbyResourcesAcknowledgeReads=true >/dev/null 2>&1 || sr_ack_rc=$?
+assert_eq "#386: pgpool + standbyResources renders once acknowledged" "0" "${sr_ack_rc}"
+sr_nosr_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set pgpool.enabled=true >/dev/null 2>&1 || sr_nosr_rc=$?
+assert_eq "#386: pgpool without standbyResources needs no acknowledgement" "0" "${sr_nosr_rc}"
+sr_fail "#386 guard: a 2.4.0 image" "need the pg-ha agent at 2.5.0 or later" \
+  "${sr_args[@]}" --set repmgr.image.tag=2.4.0-pg18 --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 "${sr_pg[@]}"
+sr_fail "#386 guard: a standby size without a memory limit" "postgresql.standbyResources.limits.memory is missing" \
+  "${sr_args[@]}" --set postgresql.standbyResources.requests.cpu=50m --set postgresql.standbyResources.requests.memory=256Mi \
+  --set postgresql.standbyResources.limits.cpu=500m
+sr_fail "#386 guard: a primary size without limits" "postgresql.resources.limits.cpu is missing" \
+  "${sr_args[@]}" "${sr_pg[@]}" --set postgresql.resources.limits=null
+sr_fail "#386 guard: pgbackrest.standbyResources without pgbackrest" "pgbackrest.enabled=false" \
+  --kube-version 1.35.0 -f "${SCRIPT_DIR}/values-agent.yaml" --set pgbackrest.enabled=false "${sr_br[@]}"
+# A custom tag is the operator's call, as for the other image floors.
+sr_custom_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set repmgr.image.tag=internal-build-42 \
+  --set etcd.rbac.bootstrapImage.tag=internal-build-42 >/dev/null 2>&1 || sr_custom_rc=$?
+assert_eq "#386: a custom image tag passes the floor" "0" "${sr_custom_rc}"
+# The Infeasible alert ships only where a primary can end up at the standby size.
+assert_contains "#386: PGHAPodResizeInfeasible is rendered with standbyResources" \
+  "$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)" \
+  "alert: PGHAPodResizeInfeasible"
+assert_not_contains "#386: ... and not without" \
+  "$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)" \
+  "PGHAPodResizeInfeasible"
+sr_rule=$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#386: PGHAPodResizeStuck is rendered with standbyResources" "${sr_rule}" "alert: PGHAPodResizeStuck"
+assert_contains "#386: ... and excludes Infeasible, which PGHAPodResizeInfeasible owns" \
+  "$(awk '/alert: PGHAPodResizeStuck/{getline; print; exit}' <<< "${sr_rule}")" \
+  'pg_ha_agent_pod_resize_pending{ namespace="default",service="test-pg-headless" } - pg_ha_agent_pod_resize_infeasible'
+assert_not_contains "#386: ... and PGHAPodResizeStuck is not without" \
+  "$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)" \
+  "PGHAPodResizeStuck"
+# No QoS guard, because no pair of sizes can change this chart's pod QoS class: the
+# unconditional setup-config init container is Burstable (requests below limits), so every
+# pod is Burstable whatever the containers say. If this ever stops holding, in-place resize
+# can be rejected for a QoS change and pg.validateStandbyResources needs a QoS guard (#386).
+sr_setup=$(awk '/^kind: StatefulSet/{s=1} s && /^        - name: setup-config$/{p=1} p && /^      containers:/{exit} p{print}' <<< "${sr_on}")
+assert_contains "#386: setup-config is present in every render" "${sr_setup}" "name: setup-config"
+assert_contains "#386: setup-config requests 10m cpu" "${sr_setup}" "cpu: 10m"
+assert_contains "#386: ...below its 100m limit, so the pod is never Guaranteed" "${sr_setup}" "cpu: 100m"
+
 end_suite
 print_summary

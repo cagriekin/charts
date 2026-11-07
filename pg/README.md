@@ -112,6 +112,8 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.resources.requests.memory` | Memory request | `256Mi` |
 | `postgresql.resources.limits.cpu` | CPU limit | `1000m` |
 | `postgresql.resources.limits.memory` | Memory limit | `1Gi` |
+| `postgresql.standbyResources` | Size of every pod that is not the primary; the agent resizes its own pod in place to `postgresql.resources` on promotion and back on demotion. Empty = one size. See [Standby sizing](#standby-sizing-386) | `{}` |
+| `postgresql.standbyResourcesAcknowledgeReads` | Allow `standbyResources` with `pgpool.enabled`, whose read load balancing sends reads to the standbys. Set only once every standby is tagged `pg-ha/noloadbalance`, or when reads at the standby size are intended. See [Standby sizing](#standby-sizing-386) | `false` |
 | `postgresql.persistence.enabled` | Enable persistence | `true` |
 | `postgresql.persistence.size` | Storage size | `10Gi` |
 | `postgresql.persistence.emptyDir.sizeLimit` | `sizeLimit` for the non-persistent (`persistence.enabled=false`) PGDATA emptyDir; empty = fall back to `persistence.size` (never unbounded) | `""` |
@@ -518,7 +520,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.4.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -581,7 +583,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 ha:
   image:
-    tag: 2.4.0-pg17
+    tag: 2.5.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
 # `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
@@ -592,7 +594,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.4.0-pg17
+      tag: 2.5.0-pg17
 ```
 
 The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
@@ -909,6 +911,87 @@ Removing the tag restores the label on the primary's next tick.
 The agent logs every tag change, and warns about a name that is no pod of the cluster (such a
 name tags nobody). `GET /v1/cluster` lists the tags under `intents`.
 Needs the pg-ha image at 2.5.0 or later. Older agents ignore the annotations.
+
+### Standby sizing (#386)
+
+By default every pod of the StatefulSet runs `postgresql.resources` (and `pgbackrest.resources`),
+so a standby reserves and caps the primary's size. A standby that serves no reads only replays
+WAL, and its pgbackrest sidecar is idle (the backup CronJob only ever execs into the primary's),
+so both can run much smaller:
+
+```yaml
+postgresql:
+  resources:          # the primary
+    requests: {cpu: 200m, memory: 512Mi}
+    limits:   {cpu: "2", memory: 4Gi}
+  standbyResources:   # every pod that is not the primary
+    requests: {cpu: 50m, memory: 256Mi}
+    limits:   {cpu: 500m, memory: 1Gi}
+pgbackrest:
+  standbyResources:   # optional; the sidecar on every pod that is not the primary
+    requests: {cpu: 10m, memory: 32Mi}
+    limits:   {cpu: 100m, memory: 64Mi}
+```
+
+How it works:
+
+- The StatefulSet template carries the **standby** size, so every pod the controller creates
+  starts small: a fresh install, a rolling update, a rescheduled primary.
+- The pg-ha agent resizes **its own** pod in place, through the `pods/resize` subresource, without
+  a restart (`resizePolicy: NotRequired`). It raises the pod to `resources` on the tick it
+  promotes, without waiting for the kubelet, and whenever it finds itself serving read-write
+  with the lease, which covers a primary recreated small by a rollout. It lowers the pod to
+  `standbyResources` once it runs as a standby again. A demoted primary is lowered only after its
+  server has restarted as a standby, so its memory use fits under the lower limit.
+- postgresql and pgbackrest move together, in one resize. A container without `standbyResources`
+  keeps one size and the agent never touches it.
+- After a rolling update the primary runs at the standby size until its agent's next tick, a few
+  seconds.
+
+When a raise does not fit:
+
+- The kubelet reports `Deferred` (no room now, it retries) or `Infeasible` (the size exceeds the
+  node's allocatable). From Kubernetes 1.35 the apiserver refuses the second case outright
+  ("node didn't have enough allocatable resources"), and the agent reports that refusal as
+  `Infeasible` too, retrying once a minute. Neither blocks anything: the primary keeps serving
+  at the size it has.
+- The agent logs one line per state change, an Error when the primary cannot be raised, and
+  publishes `pg_ha_agent_pod_resize_pending` and `pg_ha_agent_pod_resize_infeasible` on port
+  9200. With `ha.agent.monitoring.prometheusRule.enabled`, `PGHAPodResizeInfeasible` (warning,
+  10m) fires on the latter, and `PGHAPodResizeStuck` (warning, 15m) on any other resize that
+  stays pending: `Deferred` on a full node, a kubelet still applying it, or a lowered memory limit
+  the kubelet will not apply while usage is above it.
+- Scheduling uses requests, so a primary request larger than any node's free room is exactly the
+  `Infeasible` case. Size the primary for the nodes the pods land on, or switch over onto a
+  standby on a roomier node.
+
+Before you opt in:
+
+- **Reads.** Only when standbys serve no reads. The `-readonly` Service and pgpool's read load
+  balancing send queries to standbys; with those in use, keep one size, or tag every standby
+  `pg-ha/noloadbalance` ([member tags](#member-tags-nofailover--noloadbalance-275)). pgpool
+  always balances reads to the standbys, so `standbyResources` with `pgpool.enabled` fails the
+  render until `postgresql.standbyResourcesAcknowledgeReads: true` says the standbys are tagged,
+  or that reads at the standby size are intended. The tags are set at runtime, so the chart cannot
+  check them. Direct clients of the `-readonly` Service are not visible to the chart at all.
+- **Memory floor.** The standby's `postgresql` memory limit must cover `shared_buffers` plus the
+  standby's working set. `shared_buffers` only changes on a restart, so a promoted standby keeps
+  the value it started with. The chart sets no `shared_buffers` (PostgreSQL's default is 128MB),
+  so it cannot check this for you.
+- **Catch-up.** A standby that falls behind replays from the pgBackRest repository with
+  `archive-get` (zstd decompress) in its `postgresql` container, so a very small CPU limit slows
+  catch-up after an outage.
+- **Unchanged.** The pgbackrest bootstrap init container, the restore Job and the validation
+  CronJob keep their own sizes.
+
+Enforced at render time: agent mode (`ha.enabled`), Kubernetes 1.34 or later (`helm template`
+needs `--kube-version`; 1.33 has `pods/resize` but refuses to lower a memory limit in place, so a
+demoted primary would never shrink), `postgresql.standbyResourcesAcknowledgeReads` with pgpool, a pg-ha image at 2.5.0 or later (a custom tag is not checked), cpu and
+memory under both requests and limits in each standby size and in the primary size it pairs
+with, and `pgbackrest.enabled` for `pgbackrest.standbyResources`. QoS needs no check: in-place
+resize cannot change a pod's QoS class, but this chart's pods are always Burstable, because the
+`setup-config` init container's requests are below its limits. The agent's Role gains `patch` on
+`pods/resize`, scoped to the StatefulSet's own pod names, only with the feature on.
 
 ### Control REST API (agent mode) — `ha.agent.control`
 
@@ -1353,7 +1436,7 @@ Progress, honestly:
 
 ### Monitoring the agent (agent mode)
 
-The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`, `_marker_tamper_suspected_total`, the `_replicas_*` topology gauges and the `_replication_slot*` gauges). With the Prometheus Operator installed:
+The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`, `_marker_tamper_suspected_total`, the `_replicas_*` topology gauges, the `_replication_slot*` gauges, and with `standbyResources` set the `_pod_sized_as_primary` / `_pod_resize_pending` / `_pod_resize_infeasible` resize gauges). With the Prometheus Operator installed:
 
 ```yaml
 ha:
@@ -2491,6 +2574,7 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.resources.requests.memory` | Sidecar memory request | `256Mi` |
 | `pgbackrest.resources.limits.cpu` | Sidecar CPU limit | `1000m` |
 | `pgbackrest.resources.limits.memory` | Sidecar memory limit | `1Gi` |
+| `pgbackrest.standbyResources` | Sidecar size on every pod that is not the primary, resized together with postgresql (the backup CronJob only execs into the primary's sidecar). Empty = one size. See [Standby sizing](#standby-sizing-386) | `{}` |
 | `pgbackrest.cronjob.image.repository` | CronJob image | `alpine/k8s` |
 | `pgbackrest.cronjob.image.tag` | CronJob image tag | `1.31.3` |
 | `pgbackrest.cronjob.concurrencyPolicy` | CronJob concurrency policy | `Forbid` |
@@ -2961,6 +3045,7 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
+| *unreleased* | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
 | 2.6.0 *(current)* | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |

@@ -100,6 +100,9 @@ func TestEveryMetricIsWiredToItsOwnSetter(t *testing.T) {
 		{"pg_ha_agent_replication_slots_inactive", "6", func(m *Metrics) { m.SetSlots(SlotStats{Inactive: 6}) }},
 		{"pg_ha_agent_replication_slots_invalidated", "7", func(m *Metrics) { m.SetSlots(SlotStats{Invalidated: 7}) }},
 		{"pg_ha_agent_replication_slot_max_retained_wal_bytes", "8", func(m *Metrics) { m.SetSlots(SlotStats{MaxRetainedWALBytes: 8}) }},
+		{"pg_ha_agent_pod_sized_as_primary", "1", func(m *Metrics) { m.SetResize(ResizeStats{SizedAsPrimary: true}) }},
+		{"pg_ha_agent_pod_resize_pending", "1", func(m *Metrics) { m.SetResize(ResizeStats{Pending: true}) }},
+		{"pg_ha_agent_pod_resize_infeasible", "1", func(m *Metrics) { m.SetResize(ResizeStats{Infeasible: true}) }},
 	} {
 		m := New()
 		before := scrape(m)
