@@ -101,10 +101,14 @@ func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reco
 		return
 	}
 	want := desiredSize(dec, obs, actErr)
+	rs := &a.resize
 	if want == sizeKeep {
+		// The role is in flux, so no size is called for: clear the gauges rather than leave a
+		// past role's infeasible/sized-as-primary paging, and re-read on the next sizing tick.
+		rs.settled = false
+		a.metr.SetResize(observe.ResizeStats{})
 		return
 	}
-	rs := &a.resize
 	now := time.Now()
 	if rs.now != nil {
 		now = rs.now()
@@ -124,7 +128,7 @@ func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reco
 	}
 	var refused error
 	if !st.SpecMatches {
-		refused = a.kube.ResizePod(rctx, a.cfg.PodName, sizes)
+		refused = a.kube.ResizePod(rctx, a.cfg.PodName, sizes, st.Containers)
 		switch {
 		case refused == nil:
 			// The kubelet has not seen it yet; whatever it reports next tick is the news.

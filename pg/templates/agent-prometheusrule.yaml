@@ -233,6 +233,23 @@ spec:
           annotations:
             summary: "A pg pod cannot be resized for its role ({{ include "pg.fullname" . }})"
             description: "For 10m a pod's role size has been Infeasible on its node (the kubelet's PodResizePending reason Infeasible, or the apiserver refusing the resize for lack of node allocatable). On the primary this means it serves at postgresql.standbyResources / pgbackrest.standbyResources instead of postgresql.resources / pgbackrest.resources. The pod is the one whose pg_ha_agent_pod_resize_infeasible is 1; its agent log names the requested size and the reason (grep 'cannot be raised to the primary size'). Then free room on its node, lower the primary size, or move the pod (a switchover onto a standby on a roomier node)."
+        {{- /* #386: every resize that stays pending for a reason other than Infeasible (which the
+               alert above owns, so one pod never pages twice). Deferred is the kubelet waiting
+               for room that other pods hold -- it retries on its own, but a primary can sit at
+               the standby size behind it indefinitely; a lowered memory limit the kubelet will
+               not apply while usage is above it leaves a standby reserving the primary size; an
+               apiserver refusal (anything but the allocatable check) is retried every minute and
+               never lands. Per pod, then max(): pending and infeasible share their labels, so the
+               subtraction pairs each pod with itself. 15m, not 10m: a Deferred raise right after
+               a failover routinely clears once the old primary's pod is gone or lowered. */}}
+        - alert: PGHAPodResizeStuck
+          expr: max(pg_ha_agent_pod_resize_pending{ {{ $m }} } - pg_ha_agent_pod_resize_infeasible{ {{ $m }} }) == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A pg pod's in-place resize has not taken effect ({{ include "pg.fullname" . }})"
+            description: "For 15m a pod's role size has been requested but not in effect, for a reason other than Infeasible: the kubelet reports it Deferred (the node has the capacity but other pods hold it), is still applying it, will not lower a memory limit below current usage, or the apiserver keeps refusing the patch. A primary in this state serves at postgresql.standbyResources / pgbackrest.standbyResources; a standby keeps reserving the primary size. The pod is the one whose pg_ha_agent_pod_resize_pending is 1; read its agent log (grep 'in-place pod resize') and kubectl get pod <pod> -o jsonpath='{.status.conditions}' for the PodResizePending / PodResizeInProgress message. Then free room on its node, or move the pod (a switchover onto a standby on a roomier node)."
 {{- end }}
 {{- if .Values.postgresql.tls.enabled }}
         {{- /* #335: only rendered where TLS was actually requested. The gauge is 0 on a

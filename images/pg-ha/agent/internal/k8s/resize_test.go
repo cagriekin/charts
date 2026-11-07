@@ -60,7 +60,7 @@ func TestResizePodPatchesResizeSubresourceWithBothContainers(t *testing.T) {
 		"postgresql": size("200m", "1Gi", "2", "4Gi"),
 		"pgbackrest": size("100m", "256Mi", "1", "1Gi"),
 	}
-	if err := c.ResizePod(context.Background(), "pg-0", want); err != nil {
+	if err := c.ResizePod(context.Background(), "pg-0", want, []string{"postgresql", "pgbackrest"}); err != nil {
 		t.Fatal(err)
 	}
 	if sub != "resize" {

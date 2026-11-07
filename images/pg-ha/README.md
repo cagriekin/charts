@@ -91,7 +91,7 @@ the role over with `COMMENT ON ROLE <name> IS 'managed by the pg chart'` and res
 Since 2.5.0 the agent can size its own pod by role (#386). With `PG_HA_RESIZE` set (the chart
 renders it from `postgresql.standbyResources` / `pgbackrest.standbyResources`), it patches the
 `pods/resize` subresource of its own pod to the primary size once it is, or is becoming, the
-primary, and to the standby size once it runs as a standby again. That needs Kubernetes 1.33 or
+primary, and to the standby size once it runs as a standby again. That needs Kubernetes 1.34 or
 later and `patch` on `pods/resize`, which the chart grants only with the feature on. A resize the
 node cannot fit never blocks a promotion: the agent logs it and publishes
 `pg_ha_agent_pod_resize_pending` / `pg_ha_agent_pod_resize_infeasible`.

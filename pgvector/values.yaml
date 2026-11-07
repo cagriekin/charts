@@ -52,6 +52,9 @@ postgresql:
   # resizes its own pod in place to `resources` on promotion and back on demotion.
   # Opt in only when standbys serve no reads. See the pg chart README "Standby sizing".
   standbyResources: {}
+  # Required to combine standbyResources with pgpool, which load-balances reads to the
+  # standbys. Set true once every standby is tagged pg-ha/noloadbalance (#275) (#386).
+  standbyResourcesAcknowledgeReads: false
 
   persistence:
     enabled: true

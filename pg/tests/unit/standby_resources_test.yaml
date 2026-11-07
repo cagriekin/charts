@@ -34,14 +34,32 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'postgresql\.standbyResources\.limits\.memory is missing'
-  - it: a cluster older than Kubernetes 1.33 fails the render
+  - it: Kubernetes 1.33 fails the render (it cannot lower a memory limit in place)
     capabilities:
       majorVersion: 1
-      minorVersion: 32
+      minorVersion: 33
     set:
       postgresql.standbyResources:
         requests: {cpu: 50m, memory: 256Mi}
         limits: {cpu: 500m, memory: 512Mi}
     asserts:
       - failedTemplate:
-          errorPattern: 'need Kubernetes 1\.33 or later'
+          errorPattern: 'need Kubernetes 1\.34 or later'
+  - it: standbyResources with pgpool fails the render without the acknowledgement
+    set:
+      pgpool.enabled: true
+      postgresql.standbyResources:
+        requests: {cpu: 50m, memory: 256Mi}
+        limits: {cpu: 500m, memory: 512Mi}
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgpool load-balances reads to the standbys'
+  - it: standbyResources with pgpool renders once acknowledged
+    set:
+      pgpool.enabled: true
+      postgresql.standbyResourcesAcknowledgeReads: true
+      postgresql.standbyResources:
+        requests: {cpu: 50m, memory: 256Mi}
+        limits: {cpu: 500m, memory: 512Mi}
+    asserts:
+      - notFailedTemplate: {}

@@ -15,12 +15,17 @@
     primary's sidecar, so standbys can run it small.
   - A raise the node cannot fit never blocks a promotion. It is reported by an Error log line,
     `pg_ha_agent_pod_resize_pending` / `pg_ha_agent_pod_resize_infeasible`, and the new
-    `PGHAPodResizeInfeasible` alert.
-  - The render fails without agent mode, below Kubernetes 1.33, on a pg-ha image older than
-    2.5.0, or on a size without cpu and memory under both requests and limits.
+    `PGHAPodResizeInfeasible` alert. Any other resize left pending for 15m (`Deferred` on a full
+    node, a lowered memory limit the kubelet will not apply) fires `PGHAPodResizeStuck`.
+  - The render fails without agent mode, below Kubernetes 1.34 (1.33 cannot lower a memory limit
+    in place, so a demoted primary would never shrink), on a pg-ha image older than 2.5.0, or on
+    a size without cpu and memory under both requests and limits.
   - The agent's Role gains `patch` on `pods/resize`, scoped to the StatefulSet's pods, only with
     the feature on.
-  - Opt in only when standbys serve no reads.
+  - Opt in only when standbys serve no reads. pgpool load-balances reads to the standbys, so
+    `standbyResources` with `pgpool.enabled` fails the render unless
+    `postgresql.standbyResourcesAcknowledgeReads: true` (every standby tagged
+    `pg-ha/noloadbalance`, or reads at the standby size intended).
 - **The pg-ha image moves to 2.5.0** (`ha.image.tag` and `etcd.rbac.bootstrapImage.tag`:
   `2.5.0-pg18`). It carries the #386 resize and puts the #275 member tags into effect.
 

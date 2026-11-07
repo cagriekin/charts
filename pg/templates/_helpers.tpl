@@ -2139,8 +2139,23 @@ JSON, keys sorted by toJson, so an unchanged values file renders an unchanged en
 {{- if ne (include "pg.agentMode" .) "true" -}}
 {{- fail "postgresql.standbyResources / pgbackrest.standbyResources need the pg-ha agent (ha.enabled=true): it is the agent that raises the primary's pod to postgresql.resources. Standalone mode runs no agent and has no standby; remove standbyResources (#386)." -}}
 {{- end -}}
-{{- if not (semverCompare ">=1.33.0-0" .Capabilities.KubeVersion.Version) -}}
-{{- fail (printf "postgresql.standbyResources / pgbackrest.standbyResources need Kubernetes 1.33 or later (in-place pod resize, the pods/resize subresource), but the target cluster is %s. On it the primary would stay at the standby size for good. Upgrade the cluster or remove standbyResources; with `helm template`, pass --kube-version (#386)." .Capabilities.KubeVersion.Version) -}}
+{{- /* 1.34, not 1.33: pods/resize exists from 1.33, but 1.33's apiserver refuses to LOWER a
+       memory limit under resizePolicy NotRequired (only RestartContainer could), and 1.34
+       lifted that. On 1.33 every demoted primary would be refused its standby size, keep the
+       primary's memory limit for good and retry every minute -- the raise works, the lower
+       never does, and the feature quietly reserves the primary size twice. */ -}}
+{{- if not (semverCompare ">=1.34.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "postgresql.standbyResources / pgbackrest.standbyResources need Kubernetes 1.34 or later (in-place pod resize, the pods/resize subresource, with memory-limit decreases; 1.33 refuses those, so a demoted primary would keep the primary size for good), but the target cluster is %s. Upgrade the cluster or remove standbyResources; with `helm template`, pass --kube-version (#386)." .Capabilities.KubeVersion.Version) -}}
+{{- end -}}
+{{- /* pgpool in agent mode load-balances every read to the -readonly backend whenever standbys
+       exist (load_balance_mode = on, primary weight 0): with standbyResources set, the read
+       half of the release's traffic lands on pods sized to replay WAL and nothing else, and is
+       throttled or OOM-killed there. The render cannot see #275's noloadbalance tags (they are
+       runtime marker annotations), so it refuses the pair and takes an explicit
+       acknowledgement for a release whose standbys are all tagged, or whose reads are meant
+       to run at the standby size. */ -}}
+{{- if and .Values.pgpool.enabled (gt (int .Values.postgresql.replicaCount) 0) (not .Values.postgresql.standbyResourcesAcknowledgeReads) -}}
+{{- fail "postgresql.standbyResources / pgbackrest.standbyResources are set with pgpool.enabled=true, and pgpool load-balances reads to the standbys -- which would serve them at the standby size. Remove standbyResources, disable pgpool, or, once every standby is tagged pg-ha/noloadbalance (#275) or reads at the standby size are intended, set postgresql.standbyResourcesAcknowledgeReads=true (#386)." -}}
 {{- end -}}
 {{- $ver := include "pg.haImageSchemeVersion" . -}}
 {{- if and $ver (semverCompare "< 2.5.0" $ver) -}}

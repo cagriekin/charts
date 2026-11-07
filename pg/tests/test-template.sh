@@ -6864,8 +6864,21 @@ sr_fail() { # sr_fail <label> <expected message fragment> <helm args...>
 }
 sr_fail "#386 guard: standalone" "need the pg-ha agent" \
   --kube-version 1.35.0 --set ha.enabled=false --set postgresql.replicaCount=0 "${sr_pg[@]}"
-sr_fail "#386 guard: Kubernetes 1.32" "need Kubernetes 1.33 or later" \
-  "${sr_args[@]/1.35.0/1.32.0}" "${sr_pg[@]}"
+sr_fail "#386 guard: Kubernetes 1.33 (cannot lower a memory limit in place)" "need Kubernetes 1.34 or later" \
+  "${sr_args[@]/1.35.0/1.33.0}" "${sr_pg[@]}"
+sr_k134_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]/1.35.0/1.34.0}" "${sr_pg[@]}" >/dev/null 2>&1 || sr_k134_rc=$?
+assert_eq "#386: Kubernetes 1.34 passes the floor" "0" "${sr_k134_rc}"
+# pgpool load-balances reads to the standbys: the pair needs an explicit acknowledgement.
+sr_fail "#386 guard: pgpool load-balances reads to small standbys" "set postgresql.standbyResourcesAcknowledgeReads=true" \
+  "${sr_args[@]}" "${sr_pg[@]}" --set pgpool.enabled=true
+sr_ack_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set pgpool.enabled=true \
+  --set postgresql.standbyResourcesAcknowledgeReads=true >/dev/null 2>&1 || sr_ack_rc=$?
+assert_eq "#386: pgpool + standbyResources renders once acknowledged" "0" "${sr_ack_rc}"
+sr_nosr_rc=0
+helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set pgpool.enabled=true >/dev/null 2>&1 || sr_nosr_rc=$?
+assert_eq "#386: pgpool without standbyResources needs no acknowledgement" "0" "${sr_nosr_rc}"
 sr_fail "#386 guard: a 2.4.0 image" "need the pg-ha agent at 2.5.0 or later" \
   "${sr_args[@]}" --set repmgr.image.tag=2.4.0-pg18 --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 "${sr_pg[@]}"
 sr_fail "#386 guard: a standby size without a memory limit" "postgresql.standbyResources.limits.memory is missing" \
@@ -6887,6 +6900,14 @@ assert_contains "#386: PGHAPodResizeInfeasible is rendered with standbyResources
 assert_not_contains "#386: ... and not without" \
   "$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)" \
   "PGHAPodResizeInfeasible"
+sr_rule=$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" "${sr_pg[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#386: PGHAPodResizeStuck is rendered with standbyResources" "${sr_rule}" "alert: PGHAPodResizeStuck"
+assert_contains "#386: ... and excludes Infeasible, which PGHAPodResizeInfeasible owns" \
+  "$(awk '/alert: PGHAPodResizeStuck/{getline; print; exit}' <<< "${sr_rule}")" \
+  'pg_ha_agent_pod_resize_pending{ namespace="default",service="test-pg-headless" } - pg_ha_agent_pod_resize_infeasible'
+assert_not_contains "#386: ... and PGHAPodResizeStuck is not without" \
+  "$(helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set ha.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)" \
+  "PGHAPodResizeStuck"
 # No QoS guard, because no pair of sizes can change this chart's pod QoS class: the
 # unconditional setup-config init container is Burstable (requests below limits), so every
 # pod is Burstable whatever the containers say. If this ever stops holding, in-place resize

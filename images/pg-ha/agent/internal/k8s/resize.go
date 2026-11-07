@@ -53,6 +53,9 @@ type PodResize struct {
 	InProgress bool
 	// Message is the kubelet's message on whichever resize condition is set, for the log.
 	Message string
+	// Containers is the pod's spec container order, which ResizePod's patch must follow;
+	// carried from this read so a resize costs one GET, not two.
+	Containers []string
 }
 
 // PodResizeStatus reads pod and compares it with want, keyed by container name (#386).
@@ -84,6 +87,7 @@ func resizeStateOf(p *corev1.Pod, want map[string]corev1.ResourceRequirements) (
 	spec := map[string]corev1.ResourceRequirements{}
 	for _, ctr := range p.Spec.Containers {
 		spec[ctr.Name] = ctr.Resources
+		st.Containers = append(st.Containers, ctr.Name)
 	}
 	status := map[string]*corev1.ResourceRequirements{}
 	for _, cs := range p.Status.ContainerStatuses {
@@ -140,15 +144,9 @@ func sameQty(a, b corev1.ResourceList, r corev1.ResourceName) bool {
 // to the patch's order, and the apiserver refuses any resize that renames or reorders
 // containers -- a name-sorted patch against a pod whose spec runs postgresql before
 // pgbackrest was rejected on every attempt (found by the KinD suite).
-func (c *Client) ResizePod(ctx context.Context, pod string, want map[string]corev1.ResourceRequirements) error {
-	p, err := c.cs.CoreV1().Pods(c.namespace).Get(ctx, pod, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get pod %s: %w", pod, err)
-	}
-	order := make([]string, 0, len(p.Spec.Containers))
-	for _, ctr := range p.Spec.Containers {
-		order = append(order, ctr.Name)
-	}
+//
+// order is the pod's spec container order, as PodResizeStatus read it (PodResize.Containers).
+func (c *Client) ResizePod(ctx context.Context, pod string, want map[string]corev1.ResourceRequirements, order []string) error {
 	body, err := resizePatch(want, order)
 	if err != nil {
 		return err
