@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	corev1 "k8s.io/api/core/v1"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -831,4 +832,55 @@ func TestLoadTrimmedRequiredValuesRejectWhitespace(t *testing.T) {
 			t.Errorf("whitespace-only %s must fail as missing, got %v", key, err)
 		}
 	}
+}
+
+// #386: PG_HA_RESIZE is optional (absent = every pod one size), and what the chart renders
+// -- helm's toJson of the values maps, so quantities arrive as strings or bare numbers --
+// parses into both sizes per container.
+func TestLoadResize(t *testing.T) {
+	env := fullEnv()
+	c, err := Load(getter(env))
+	if err != nil || c.Resize != nil {
+		t.Fatalf("absent PG_HA_RESIZE: resize=%v err=%v", c.Resize, err)
+	}
+	env["PG_HA_RESIZE"] = `{"postgresql":{"primary":{"limits":{"cpu":2,"memory":"4Gi"},"requests":{"cpu":"200m","memory":"512Mi"}},"standby":{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"50m","memory":"256Mi"}}},"pgbackrest":{"primary":{"limits":{"cpu":"1","memory":"1Gi"},"requests":{"cpu":"100m","memory":"256Mi"}},"standby":{"limits":{"cpu":"100m","memory":"64Mi"},"requests":{"cpu":"10m","memory":"32Mi"}}}}`
+	c, err = Load(getter(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := qty(c.Resize["postgresql"].Primary.Limits, "cpu"); got != "2" {
+		t.Errorf("postgresql primary cpu limit = %s, want 2", got)
+	}
+	if got := qty(c.Resize["pgbackrest"].Standby.Limits, "memory"); got != "64Mi" {
+		t.Errorf("pgbackrest standby memory limit = %s, want 64Mi", got)
+	}
+}
+
+// A spec the agent cannot fully use is a boot error, never a silently skipped container: a
+// half-read spec would leave the primary at the standby size with nothing reporting it.
+func TestLoadResizeRejectsBadSpecs(t *testing.T) {
+	full := `"requests":{"cpu":"1","memory":"1Gi"},"limits":{"cpu":"1","memory":"1Gi"}`
+	for name, v := range map[string]string{
+		"not json":          `{`,
+		"empty":             `{}`,
+		"unknown container": `{"exporter":{"primary":{` + full + `},"standby":{` + full + `}}}`,
+		"unknown field":     `{"postgresql":{"primary":{` + full + `},"standby":{` + full + `},"replica":{}}}`,
+		"bad quantity":      `{"postgresql":{"primary":{"requests":{"cpu":"lots","memory":"1Gi"},"limits":{"cpu":"1","memory":"1Gi"}},"standby":{` + full + `}}}`,
+		"missing standby":   `{"postgresql":{"primary":{` + full + `}}}`,
+		"missing mem limit": `{"postgresql":{"primary":{` + full + `},"standby":{"requests":{"cpu":"1","memory":"1Gi"},"limits":{"cpu":"1"}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := fullEnv()
+			env["PG_HA_RESIZE"] = v
+			_, err := Load(getter(env))
+			if err == nil || !strings.Contains(err.Error(), "PG_HA_RESIZE") {
+				t.Fatalf("want a PG_HA_RESIZE error, got %v", err)
+			}
+		})
+	}
+}
+
+func qty(l corev1.ResourceList, name corev1.ResourceName) string {
+	q := l[name]
+	return q.String()
 }

@@ -294,6 +294,14 @@
         "resources": {
           "$ref": "#/definitions/resources"
         },
+        "standbyResources": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/resources"
+            }
+          ],
+          "description": "Size of the postgresql container on every pod that is not the primary (#386). Empty = every pod runs postgresql.resources. When set, the StatefulSet template carries this size and the pg-ha agent resizes its own pod in place to postgresql.resources when it becomes the primary, and back when it is a standby again. Opt in only when standbys serve no reads."
+        },
         "app": {
           "type": "object",
           "description": "Application role: a non-superuser LOGIN provisioned by the chart. Owns postgresql.database, except the maintenance database \"postgres\", where it gets CONNECT and USAGE, CREATE on schema public.",
@@ -798,6 +806,14 @@
         },
         "resources": {
           "$ref": "#/definitions/resources"
+        },
+        "standbyResources": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/resources"
+            }
+          ],
+          "description": "Size of the pgbackrest sidecar on every pod that is not the primary (#386). Empty = one size. When set, the pg-ha agent resizes its own pod in place to pgbackrest.resources when it becomes the primary (the backup CronJob only ever execs into the primary's sidecar) and back to this when it is a standby again."
         },
         "cronjob": {
           "type": "object",

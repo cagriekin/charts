@@ -48,6 +48,11 @@ postgresql:
       cpu: 1000m
       memory: 1Gi
 
+  # Size of every non-primary pod (#386). Empty = one size. When set, the pg-ha agent
+  # resizes its own pod in place to `resources` on promotion and back on demotion.
+  # Opt in only when standbys serve no reads. See the pg chart README "Standby sizing".
+  standbyResources: {}
+
   persistence:
     enabled: true
     storageClass: ""
@@ -371,7 +376,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.4.0-pg18
+    tag: 2.5.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -1095,6 +1100,9 @@ pgbackrest:
       cpu: 1000m
       memory: 1Gi
 
+  # Sidecar size on every non-primary pod (#386); resized with postgresql. Empty = one size.
+  standbyResources: {}
+
   # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
   # finds the current primary via the headless primary service endpoints
   # (repointed by the agent on every promotion) and
@@ -1339,4 +1347,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.4.0-pg18
+      tag: 2.5.0-pg18

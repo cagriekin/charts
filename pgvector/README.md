@@ -236,7 +236,7 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.4.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -268,7 +268,7 @@ postgresql:
     tag: pg17-trixie           # the pgvector image for the SAME major
 ha:
   image:
-    tag: 2.4.0-pg17
+    tag: 2.5.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs the
 # HA image, and the render FAILS unless this reference matches ha.image exactly -- see the pg
@@ -277,7 +277,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.4.0-pg17
+      tag: 2.5.0-pg17
 ```
 
 **`postgresql.image.tag` matters here even with `ha.enabled`** — unlike in the `pg` chart. This chart ships `postgresql.extensions.enabled=true`, and the `copy-ext` init container copies `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` **out of the pgvector image** into the server container, which is how `vector` reaches a server that runs from the HA image. Those paths are built from `postgresql.majorVersion`, so the pgvector image must be the matching major (`pgvector/pgvector:pg17-trixie`) or the copy finds nothing and `CREATE EXTENSION vector` fails.
@@ -304,6 +304,8 @@ A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a
 Must satisfy `leaseDuration > renewDeadline > retryPeriod` — **enforced at render time** since 2.0.0 (#291): client-go requires it and the agent refuses to start otherwise, so a violating triple used to render cleanly and then CrashLoopBackOff every pod at once. The realistic way to produce one is mixing the `repmgr.agent.*` alias with `ha.agent.*` across two values files — these three keys are cross-validated, so taking one from a legacy file and two from a newer `-f` yields a combination neither file contains. Set all three under the same name. A value that is not a Go duration (`15`, `20 s`) is rejected too, and the `etcd` DCS backend additionally requires `leaseDuration >= 5s` — its lease TTL is whole seconds. Units are case-sensitive (`15S` is an error), an empty value is rejected, a removed key (`--set ha.agent.<key>=null`, or `null` in a values file) fails the render naming it rather than falling back to a default (#367), and `reconcileInterval` is checked the same way even though it is not part of the ordering. Values Go accepts are accepted: `.5s`, `5.s`, `+15s`, `1m30s`, `2h45m`, `15µs`. widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-the-lease-based-agent) for the full agent behaviour and the **2.0.0 migration runbook** (a release that pinned `failoverMode: repmgrd` needs a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`, because `podManagementPolicy` is immutable). See `ENVIRONMENT.md` for the injected-variable catalog.
 
 **Member tags (#275).** `pg-ha/nofailover=<pod>[,<pod>...]` on the `<fullname>-primary` ConfigMap keeps those pods from ever being promoted automatically or chosen as a switchover target. A tagged node that is already the primary keeps the role. `pg-ha/noloadbalance=<pod>[,...]` relabels those standbys `pg-role=standby-noloadbalance`, so they drop out of the `-readonly` Service and pgpool's read backend. The tags persist on the marker across pod restarts and chart upgrades, and need the pg-ha image at 2.5.0 or later. See the [pg chart README](../pg/README.md#member-tags-nofailover--noloadbalance-275).
+
+**Standby sizing (#386).** `postgresql.standbyResources` (and optionally `pgbackrest.standbyResources`) sizes every pod that is not the primary. The StatefulSet template carries that size, and the pg-ha agent resizes its own pod in place (`pods/resize`, no restart) to `resources` on promotion and back on demotion. Opt in only when standbys serve no reads. Needs Kubernetes 1.33 or later and the pg-ha image at 2.5.0 or later. See the [pg chart README](../pg/README.md#standby-sizing-386).
 
 ### Routing the agent's apiserver traffic — `KUBECONFIG` (#317)
 

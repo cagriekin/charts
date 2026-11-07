@@ -52,6 +52,20 @@ rules:
     verbs:
       - "get"
       - "patch"
+{{- if eq (include "pg.standbyResize" .) "true" }}
+  # In-place resize on a role change (#386): each agent patches the pods/resize subresource
+  # of its OWN pod -- up to postgresql/pgbackrest.resources when it becomes the primary, down
+  # to standbyResources when it is a standby again. Scoped to the same <fullname>-0..N names
+  # as the rule above, so a leaked token can resize no other pod; only rendered with
+  # standbyResources set.
+  - apiGroups: [""]
+    resources: ["pods/resize"]
+    resourceNames:
+      {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
+      - {{ printf "%s-%d" (include "pg.fullname" $) $i | quote }}
+      {{- end }}
+    verbs: ["patch"]
+{{- end }}
 {{- if eq (include "pg.agentMode" .) "true" }}
   # Durable primary marker (<fullname>-primary): the agent records the highest
   # timeline here (#125) via Get -> Create-if-absent -> Update, and the serving
