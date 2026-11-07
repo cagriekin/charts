@@ -1,6 +1,6 @@
 # pg chart changelog
 
-## Unreleased
+## 2.7.0 - 2026-11-07
 
 ### Added
 

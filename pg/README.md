@@ -3045,8 +3045,8 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
-| *unreleased* | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
-| 2.6.0 *(current)* | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 2.7.0 *(current)* | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
+| 2.6.0 | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |
 | 1.11.0 – 1.13.0 | `trixie-5.5.0-31` | 18.x (default) or 17.x | as above |
