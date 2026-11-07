@@ -374,8 +374,8 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) (int, 
 	}
 	// Read fresh from the marker, like pause: the loop's switchover gate refuses a tagged
 	// target (#275), so accepting one would be the silent no-op this preflight exists to
-	// prevent.
-	if slices.Contains(m.NoFailover, req.Candidate) {
+	// prevent. The primary the marker records is exempt, as in the loop's FailoverEligible.
+	if slices.Contains(m.NoFailover, req.Candidate) && m.Primary != req.Candidate {
 		writeErr(w, http.StatusConflict,
 			fmt.Sprintf("%s is tagged pg-ha/nofailover, so it would never promote", req.Candidate),
 			"remove it from the pg-ha/nofailover annotation on the marker ConfigMap first, or pick another candidate")

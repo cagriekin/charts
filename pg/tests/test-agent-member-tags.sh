@@ -33,6 +33,9 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   --set postgresql.replicaCount=2 \
   --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
+# The marker is agent-owned and survives helm upgrade, so a rerun after a mid-suite failure
+# would start with the previous run's tags and switchover request still set.
+kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/nofailover- pg-ha/noloadbalance- pg-ha/switchover-target- >/dev/null 2>&1 || true
 
 in_recovery() { pg_exec "${NAMESPACE}" "$1" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo ""; }
 holder() { kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo ""; }

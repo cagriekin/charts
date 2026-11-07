@@ -396,11 +396,14 @@ func Decide(o Observation) Decision {
 			if bad, why := unsafeToServe(o); bad {
 				return d(ReleaseLease, "", "primary must not serve: "+why)
 			}
-			if t := switchoverTargetReady(o); t != "" {
-				return d(Switchover, t, "controlled switchover: target "+t+" is a caught-up same-timeline standby; clear the request and step down so it promotes")
-			}
+			// A nofailover target would release the lease the moment it won it (#275), leaving
+			// the cluster without a primary: the request stays pending, and the reason names
+			// the tag so it is not mistaken for lag.
 			if o.SwitchoverTarget != "" && !FailoverEligible(o, o.SwitchoverTarget) {
 				return d(StayPrimary, "", "primary holds lease; switchover to "+o.SwitchoverTarget+" requested but the target is tagged pg-ha/nofailover (#275), so it would never promote; remove the tag or cancel the request")
+			}
+			if t := switchoverTargetReady(o); t != "" {
+				return d(Switchover, t, "controlled switchover: target "+t+" is a caught-up same-timeline standby; clear the request and step down so it promotes")
 			}
 			if o.SwitchoverTarget != "" {
 				// Requested but not yet actionable: keep serving and surface why in the
@@ -412,11 +415,14 @@ func Decide(o Observation) Decision {
 			return d(StayPrimary, "", "primary holds lease and is current")
 
 		default: // has data, not running
-			// A nofailover holder with standby-state data (#275) releases before starting or
-			// rejoining: either would hold the lock for the whole start, only to release it
-			// once running. As a non-holder it starts (or rejoins) as a standby next tick.
-			if o.Local.InRecovery && !FailoverEligible(o, o.LocalNode) {
-				return d(ReleaseLease, "", NoFailoverReason+": this stopped standby is tagged pg-ha/nofailover on the marker, so it never promotes automatically; releasing the lease for an eligible peer")
+			// A nofailover holder (#275) releases before starting or rejoining. Standby-state
+			// data would hold the lock for the whole start only to release it once running;
+			// primary-state data would StartLocal read-write, a promotion -- and pg_control
+			// says "in production" on a fresh clone too (#181). Only the primary the marker
+			// records resumes (FailoverEligible). As a non-holder it starts read-only or
+			// rejoins next tick.
+			if !FailoverEligible(o, o.LocalNode) {
+				return d(ReleaseLease, "", NoFailoverReason+": this stopped node is tagged pg-ha/nofailover on the marker, so it never promotes automatically; releasing the lease for an eligible peer")
 			}
 			if newer != nil {
 				return d(RejoinForward, newer.Name, "lease holder has data on an older timeline; rejoin forward before starting (never start stale data read-write)")
@@ -870,12 +876,6 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 func switchoverTargetReady(o Observation) string {
 	t := o.SwitchoverTarget
 	if t == "" || !o.Local.TimelineOK || !o.Local.LSNOK {
-		return ""
-	}
-	// A nofailover target would release the lease the moment it won it (#275), leaving
-	// the cluster without a primary: the request stays pending, and the StayPrimary reason
-	// names the tag so it is not mistaken for lag.
-	if !FailoverEligible(o, t) {
 		return ""
 	}
 	for i := range o.Peers {

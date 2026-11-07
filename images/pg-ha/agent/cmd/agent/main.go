@@ -1405,11 +1405,10 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// Member tags (#275).
 	o.NoFailover = memberSet(m.NoFailover)
 	o.NoLoadBalance = memberSet(m.NoLoadBalance)
-	// Candidacy follows the tag, with two exceptions that are both "resuming is not a
-	// failover": a tagged node whose data is primary-state, and the primary the marker
-	// records, keep contending (leadershipCandidate). Without them, tagging the primary and
-	// restarting the cluster would leave its data -- the most advanced there is -- to be
-	// rewound under a standby's promotion. Left alone when the marker could not be read at
+	// Candidacy follows the tag, with one exception, "resuming is not a failover": the
+	// primary the marker records keeps contending (leadershipCandidate). Without it, tagging
+	// the primary and restarting the cluster would leave its data -- the most advanced there
+	// is -- to be rewound under a standby's promotion. Left alone when the marker could not be read at
 	// all: no tags is a guess there, not an observation.
 	if !o.MarkerUnreadable {
 		a.logMemberTags(m)
@@ -3966,8 +3965,7 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 // read the node contends as before, and the decider still never promotes it. The primary the
 // marker records keeps contending through boot by the same rule observe applies
 // (reconcile.FailoverEligible): parking it here would hand a full-cluster restart's lock to an
-// eligible standby that promotes past it before its first tick. A tagged primary-state node
-// the marker does not record is re-enabled by the first tick (see observe).
+// eligible standby that promotes past it before its first tick.
 func (a *agent) initialCandidacy(ctx context.Context) {
 	mctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 	defer cancel()
@@ -3984,19 +3982,15 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 	}
 }
 
-// leadershipCandidate is the candidacy rule observe applies (#275): an eligible node always
-// contends (untagged, or the primary the marker records -- see reconcile.FailoverEligible); a
-// nofailover node otherwise contends only while its data is primary-state, so winning
-// resumes a role it already holds rather than failing over onto it.
-//
-// A postmaster that is up but not yet accepting SQL does not count as primary-state: its
-// role is then read from pg_control, which right after pg_basebackup still carries the
-// source primary's "in production" (#181), so every freshly cloned tagged standby would
-// contend for the whole replay to consistency. A saturated node is excepted -- it is
-// running, and its pg_control state is real.
+// leadershipCandidate is the candidacy rule observe applies (#275): exactly
+// reconcile.FailoverEligible -- an untagged node, or the primary the marker records, contends;
+// any other nofailover node parks whatever its data says. Primary-state pg_control alone is
+// not enough: right after pg_basebackup a clone still carries the source primary's "in
+// production" (#181), stopped or starting, and a tagged clone that won the lock would then
+// StartLocal read-write -- a promotion of a node that must never be promoted automatically.
+// The node genuinely resuming a primary role is the one the marker records.
 func leadershipCandidate(o reconcile.Observation) bool {
-	starting := o.LocalProcessAlive && !o.Local.Running && !o.Local.Saturated
-	return reconcile.FailoverEligible(o, o.LocalNode) || (o.Local.HasData && !o.Local.InRecovery && !starting)
+	return reconcile.FailoverEligible(o, o.LocalNode)
 }
 
 // memberSet turns a parsed member-tag list into the lookup set the Observation carries
@@ -4016,7 +4010,8 @@ func memberSet(names []string) map[string]bool {
 // not a pod of this cluster: a typo such as "pg-1" for "mydb-pg-1" tags nobody, and the
 // operator who set it believes a node is out of the election when it is not.
 func (a *agent) logMemberTags(m k8s.Marker) {
-	key := strings.Join(m.NoFailover, ",") + "|" + strings.Join(m.NoLoadBalance, ",")
+	// expectedNodes is part of the key so a scale-down that strands a tag re-warns.
+	key := strings.Join(m.NoFailover, ",") + "|" + strings.Join(m.NoLoadBalance, ",") + "|" + strconv.Itoa(a.expectedNodes())
 	if key == a.lastMemberTags {
 		return
 	}

@@ -1179,9 +1179,9 @@ func TestLeadershipCandidate(t *testing.T) {
 		{"tagged standby does not", "pg-1", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, false},
 		{"tagged stopped standby-state does not", "pg-1", reconcile.LocalState{HasData: true, InRecovery: true}, false},
 		{"tagged empty node does not", "pg-1", reconcile.LocalState{}, false},
-		{"tagged primary keeps contending", "pg-1", reconcile.LocalState{HasData: true, Running: true}, true},
-		{"tagged stopped primary-state contends to resume", "pg-1", reconcile.LocalState{HasData: true}, true},
-		{"tagged saturated primary keeps contending", "pg-1", reconcile.LocalState{HasData: true, Saturated: true}, true},
+		{"tagged primary-state node the marker does not record does not", "pg-1", reconcile.LocalState{HasData: true, Running: true}, false},
+		{"tagged stopped primary-state the marker does not record does not (fresh clone, #181)", "pg-1", reconcile.LocalState{HasData: true}, false},
+		{"tagged stopped primary-state the marker records contends to resume", "pg-3", reconcile.LocalState{HasData: true}, true},
 		{"tagged read-only node the marker records as primary contends", "pg-3", reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, true},
 	}
 	for _, c := range cases {
@@ -1221,7 +1221,7 @@ func TestInitialCandidacyReadsTheMarker(t *testing.T) {
 		})
 		f := &fakeDCS{}
 		a := &agent{
-			cfg:  &config.Config{PodName: "pg-1", MarkerName: "pg-primary", RenewDeadline: time.Second},
+			cfg:  &config.Config{PodName: "pg-1", MarkerName: "pg-primary", LeaseDuration: 3 * time.Second, RenewDeadline: time.Second, RetryPeriod: 200 * time.Millisecond},
 			dcs:  f,
 			kube: k8s.NewWithClient(cs, "ns"),
 		}
