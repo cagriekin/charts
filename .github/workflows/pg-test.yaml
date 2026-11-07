@@ -111,7 +111,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/base-images
-          key: pg-base-images-${{ hashFiles('pg/tests/ci-base-images.txt') }}
+          # v2: the v1 entries were saved without --platform under the containerd image store
+          # and cannot be imported (see the pull step); a new prefix keeps them from restoring.
+          key: pg-base-images-v2-${{ hashFiles('pg/tests/ci-base-images.txt') }}
 
       - name: Pull base images (on cache miss)
         if: steps.base-cache.outputs.cache-hit != 'true'
@@ -119,9 +121,14 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/base-images
           grep -vE '^\s*(#|$)' pg/tests/ci-base-images.txt | while read -r image; do
-            docker pull "$image"
+            docker pull --platform linux/amd64 "$image"
             safe=$(echo "$image" | tr '/:' '_')
-            docker save "$image" -o "/tmp/base-images/${safe}.tar"
+            # --platform (#275): under the containerd image store (the runner's Docker 29
+            # default) a plain save of a multi-arch pull writes the whole index, naming every
+            # platform's layers while only amd64's were pulled; kind load imports with
+            # --all-platforms and fails on the first absent digest ("content digest ... not
+            # found"). Saving the one platform the kind nodes run keeps the tar self-contained.
+            docker save --platform linux/amd64 "$image" -o "/tmp/base-images/${safe}.tar"
           done
 
       # The repmgr image is built from source (images/pg-ha) so an image change
@@ -192,7 +199,8 @@ jobs:
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
             # with 50 legs bundling both would download a spare 190MB 50 times.
             mkdir -p "/tmp/kind-images-pg${major}"
-            docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
+            # --platform for the same reason as the base images (#275).
+            docker save --platform linux/amd64 "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
           done
 
       # Fast render gate: template + lint take ~1min and catch most regressions
@@ -346,6 +354,7 @@ jobs:
         run: |
           set -euo pipefail
           for tarball in /tmp/kind-images/*.tar; do
+            echo "loading $tarball"
             kind load image-archive "$tarball" --name pg-test
           done
 

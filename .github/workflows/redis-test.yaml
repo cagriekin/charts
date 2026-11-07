@@ -89,7 +89,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/kind-images
-          key: kind-images-redis-${{ hashFiles('redis/values.yaml') }}
+          key: kind-images-redis-v2-${{ hashFiles('redis/values.yaml') }}  # v2: v1 tars lack --platform (see below)
 
       - name: Load cached images into Kind
         if: steps.image-cache.outputs.cache-hit == 'true'
@@ -103,9 +103,12 @@ jobs:
         run: |
           mkdir -p /tmp/kind-images
           for image in $IMAGES; do
-            docker pull "$image"
+            docker pull --platform linux/amd64 "$image"
             safe_name=$(echo "$image" | tr '/:' '_')
-            docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
+            # --platform: under the containerd image store a plain save of a multi-arch pull
+            # names every platform's layers but holds only amd64's, and kind load
+            # (--all-platforms) fails with "content digest ... not found" (#275).
+            docker save --platform linux/amd64 "$image" -o "/tmp/kind-images/${safe_name}.tar"
             kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name redis-test
           done
 
