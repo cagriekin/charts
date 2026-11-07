@@ -323,7 +323,8 @@ spec:
               # again is re-attached with pcp_attach_node. That includes a node an operator
               # detached by hand with pcp_detach_node: under this chart membership is the
               # agent's (pg-role labels and the Services), not pgpool's, so to keep a
-              # standby out of the read pool make it unready or scale it away, and to run
+              # standby out of the read pool tag it pg-ha/noloadbalance on the marker
+              # (#275), and to run
               # pgpool-level manual control set pgpool.reattach.enabled=false first
               # (#361 review). A background sibling of pgpool,
               # not a sidecar: it needs pgpool's own PCP port, credentials and tools, and

@@ -111,7 +111,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/base-images
-          key: pg-base-images-${{ hashFiles('pg/tests/ci-base-images.txt') }}
+          # v2: the v1 entries were saved without --platform under the containerd image store
+          # and cannot be imported (see the pull step); a new prefix keeps them from restoring.
+          key: pg-base-images-v2-${{ hashFiles('pg/tests/ci-base-images.txt') }}
 
       - name: Pull base images (on cache miss)
         if: steps.base-cache.outputs.cache-hit != 'true'
@@ -119,9 +121,14 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/base-images
           grep -vE '^\s*(#|$)' pg/tests/ci-base-images.txt | while read -r image; do
-            docker pull "$image"
+            docker pull --platform linux/amd64 "$image"
             safe=$(echo "$image" | tr '/:' '_')
-            docker save "$image" -o "/tmp/base-images/${safe}.tar"
+            # --platform (#275): under the containerd image store (the runner's Docker 29
+            # default) a plain save of a multi-arch pull writes the whole index, naming every
+            # platform's layers while only amd64's were pulled; kind load imports with
+            # --all-platforms and fails on the first absent digest ("content digest ... not
+            # found"). Saving the one platform the kind nodes run keeps the tar self-contained.
+            docker save --platform linux/amd64 "$image" -o "/tmp/base-images/${safe}.tar"
           done
 
       # The repmgr image is built from source (images/pg-ha) so an image change
@@ -192,7 +199,8 @@ jobs:
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
             # with 50 legs bundling both would download a spare 190MB 50 times.
             mkdir -p "/tmp/kind-images-pg${major}"
-            docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
+            # --platform for the same reason as the base images (#275).
+            docker save --platform linux/amd64 "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
           done
 
       # Fast render gate: template + lint take ~1min and catch most regressions
@@ -258,7 +266,7 @@ jobs:
         pg_major: ["18", "17"]
         # #294: the mechanism axis is GONE. It existed for the repmgr-to-native transition
         # (#288/#295) and carried 11 exclusions to keep the fan-out honest; native is now the
-        # only mechanism, so 25 suites x 2 majors = 50 legs with no exclusions at all. Anything
+        # only mechanism, so 27 suites x 2 majors = 54 legs with no exclusions at all. Anything
         # that reads as mechanism-conditional below is a leftover and should be deleted, not
         # re-gated.
         suite:
@@ -277,6 +285,7 @@ jobs:
           - sync-replication-slots
           - agent-rolling
           - agent-lag-gate
+          - agent-member-tags
           - backup-restore
           - backup-concurrent
           - pgbackrest-restore
@@ -345,6 +354,7 @@ jobs:
         run: |
           set -euo pipefail
           for tarball in /tmp/kind-images/*.tar; do
+            echo "loading $tarball"
             kind load image-archive "$tarball" --name pg-test
           done
 
@@ -377,12 +387,16 @@ jobs:
           # the pull themselves and the suite fails with its own diagnosis rather than this one.
           pulled=""
           for attempt in 1 2 3; do
-            if docker pull "$ref"; then pulled=1; break; fi
+            if docker pull --platform linux/amd64 "$ref"; then pulled=1; break; fi
             echo "docker pull $ref failed (attempt $attempt); retrying"
             sleep $((attempt * 15))
           done
           if [ -n "$pulled" ]; then
-            kind load docker-image "$ref" --name pg-test
+            # Not `kind load docker-image`: it runs a plain `docker save`, which under the
+            # containerd image store writes a multi-arch index whose other platforms' layers
+            # were never pulled, and the node import fails on them (#275; see the base images).
+            docker save --platform linux/amd64 "$ref" -o /tmp/from-image.tar
+            kind load image-archive /tmp/from-image.tar --name pg-test
           else
             echo "::warning::could not pre-load $ref; the kind workers will pull it in-cluster"
           fi

@@ -3,6 +3,7 @@ package control
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -115,6 +116,10 @@ type IntentsView struct {
 	SwitchoverTarget string `json:"switchoverTarget,omitempty"`
 	MarkerPresent    bool   `json:"markerPresent"`
 	MarkerPrimary    string `json:"markerPrimary,omitempty"`
+	// NoFailover and NoLoadBalance are the member tags (#275): the pods named by the
+	// pg-ha/nofailover and pg-ha/noloadbalance marker annotations.
+	NoFailover    []string `json:"noFailover,omitempty"`
+	NoLoadBalance []string `json:"noLoadBalance,omitempty"`
 }
 
 // RestoreRecordView mirrors pgbackrest.RestoreRecord in the API surface.
@@ -160,7 +165,9 @@ func (s *Server) intents(r *http.Request, snap Snapshot) (IntentsView, string) {
 			SwitchoverTarget: snap.SwitchoverTarget,
 			MarkerPresent:    snap.MarkerPresent,
 			MarkerPrimary:    snap.MarkerPrimary,
-		}, "marker could not be read; pause/switchover shown from the last reconcile tick: " + err.Error()
+			NoFailover:       snap.NoFailover,
+			NoLoadBalance:    snap.NoLoadBalance,
+		}, "marker could not be read; pause/switchover/member tags shown from the last reconcile tick: " + err.Error()
 	}
 	return IntentsView{
 		Paused:           m.Paused,
@@ -168,6 +175,8 @@ func (s *Server) intents(r *http.Request, snap Snapshot) (IntentsView, string) {
 		SwitchoverTarget: m.SwitchoverTarget,
 		MarkerPresent:    m.Present,
 		MarkerPrimary:    m.Primary,
+		NoFailover:       m.NoFailover,
+		NoLoadBalance:    m.NoLoadBalance,
 	}, ""
 }
 
@@ -362,6 +371,15 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) (int, 
 		writeErr(w, http.StatusConflict, "cluster is paused: a switchover would not be acted on",
 			"POST /v1/resume first (maintenance mode suspends every automatic action)")
 		return http.StatusConflict, "paused"
+	}
+	// Read fresh from the marker, like pause: the loop's switchover gate refuses a tagged
+	// target (#275), so accepting one would be the silent no-op this preflight exists to
+	// prevent. The primary the marker records is exempt, as in the loop's FailoverEligible.
+	if slices.Contains(m.NoFailover, req.Candidate) && m.Primary != req.Candidate {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("%s is tagged pg-ha/nofailover, so it would never promote", req.Candidate),
+			"remove it from the pg-ha/nofailover annotation on the marker ConfigMap first, or pick another candidate")
+		return http.StatusConflict, "candidate tagged nofailover"
 	}
 	cand, found := findMember(snap, req.Candidate)
 	if !found {

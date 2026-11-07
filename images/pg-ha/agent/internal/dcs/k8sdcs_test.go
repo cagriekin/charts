@@ -300,3 +300,103 @@ func TestK8sDCSRenewFailureFiresOnInvoluntaryLoss(t *testing.T) {
 		t.Fatal("involuntary lease loss never fired OnRenewFailure")
 	}
 }
+
+// #275: a node that is not a candidate never acquires the Lease, and resumes contending
+// once candidacy is restored.
+func TestK8sDCSNotCandidateDoesNotAcquire(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	k := NewK8sDCSWithClient(K8sConfig{
+		Namespace:     "ns",
+		LeaseName:     "pg-leader",
+		LeaseDuration: 2 * time.Second,
+		RenewDeadline: 1 * time.Second,
+		RetryPeriod:   100 * time.Millisecond,
+	}, cs)
+	k.SetCandidate(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	acquired := make(chan struct{})
+	var once sync.Once
+	go k.Run(ctx, "pod-1", Callbacks{
+		OnAcquired: func(context.Context) { once.Do(func() { close(acquired) }) },
+	})
+
+	select {
+	case <-acquired:
+		t.Fatal("acquired leadership while not a candidate")
+	case <-time.After(1 * time.Second):
+	}
+	k.SetCandidate(true)
+	select {
+	case <-acquired:
+	case <-time.After(15 * time.Second):
+		t.Fatal("never acquired after candidacy was restored")
+	}
+}
+
+// #275: withdrawing candidacy from a node that is already CONTENDING (a standby waiting
+// behind a live holder) must take it out of the race, not only gate the next iteration --
+// otherwise it wins the Lease the moment the holder goes.
+func TestK8sDCSWithdrawnCandidacyLeavesARunningContention(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cfg := K8sConfig{Namespace: "ns", LeaseName: "pg-leader", LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 100 * time.Millisecond}
+	holder := NewK8sDCSWithClient(cfg, cs)
+	tagged := NewK8sDCSWithClient(cfg, cs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	held := make(chan struct{})
+	var once sync.Once
+	go holder.Run(ctx, "pod-0", Callbacks{OnAcquired: func(context.Context) { once.Do(func() { close(held) }) }})
+	select {
+	case <-held:
+	case <-time.After(15 * time.Second):
+		t.Fatal("holder never acquired")
+	}
+	var renewFailures atomic.Int32
+	won := make(chan struct{})
+	var wonOnce sync.Once
+	go tagged.Run(ctx, "pod-1", Callbacks{
+		OnAcquired:     func(context.Context) { wonOnce.Do(func() { close(won) }) },
+		OnRenewFailure: func() { renewFailures.Add(1) },
+	})
+	time.Sleep(500 * time.Millisecond) // pod-1 is now inside le.Run, retrying the acquire
+	tagged.SetCandidate(false)
+	holder.Release()
+
+	select {
+	case <-won:
+		t.Fatal("a withdrawn candidate acquired the Lease its holder released")
+	case <-time.After(2 * time.Second):
+	}
+	if renewFailures.Load() != 0 {
+		t.Errorf("a withdrawn candidacy counted %d renew failures", renewFailures.Load())
+	}
+}
+
+// #275: a node parked out of the election still learns who leads, or a nofailover standby
+// never re-points at the primary a failover produced.
+func TestK8sDCSParkedNodeTracksLeader(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cfg := K8sConfig{Namespace: "ns", LeaseName: "pg-leader", LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 100 * time.Millisecond}
+	holder := NewK8sDCSWithClient(cfg, cs)
+	tagged := NewK8sDCSWithClient(cfg, cs)
+	tagged.SetCandidate(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tagged.Run(ctx, "pod-1", Callbacks{})
+	go holder.Run(ctx, "pod-0", Callbacks{})
+
+	deadline := time.Now().Add(15 * time.Second)
+	for tagged.Leader() != "pod-0" {
+		if time.Now().After(deadline) {
+			t.Fatalf("parked node reports leader %q, want pod-0", tagged.Leader())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if tagged.IsLeader() {
+		t.Fatal("parked node claims leadership")
+	}
+}

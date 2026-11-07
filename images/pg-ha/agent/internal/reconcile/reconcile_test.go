@@ -722,3 +722,94 @@ func TestDecideSaturation(t *testing.T) {
 		}
 	}
 }
+
+// #275: member tags. A nofailover member is never promoted automatically and never a
+// handoff or switchover target, but keeps the primary role it already holds.
+func TestDecideNoFailover(t *testing.T) {
+	localStandby := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
+	localPrimary := LocalState{HasData: true, Running: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
+	dataStopped := LocalState{HasData: true, Timeline: tl(5), TimelineOK: true}
+	tagged := func(names ...string) map[string]bool {
+		m := map[string]bool{}
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
+	cases := []struct {
+		name       string
+		obs        Observation
+		wantAction Action
+		wantTarget string
+		wantReason string
+	}{
+		{"tagged holder standby, caught up and most-advanced -> release, never promote",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-1"), Peers: []PeerState{standby("pg-2", 5, 5, 0x80)}},
+			ReleaseLease, "", NoFailoverReason},
+		{"tagged holder standby, alone -> release (no failover onto it, even with nobody else)",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-1")},
+			ReleaseLease, "", NoFailoverReason},
+		{"tag on a different node does not stop this holder promoting",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-2"), Peers: []PeerState{standby("pg-2", 5, 5, 0x80)}},
+			Promote, "", ""},
+		{"a tagged peer further ahead is no handoff target -> promote locally",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-2"), Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}},
+			Promote, "", ""},
+		{"untagged, the same peer further ahead -> hand off to it (control)",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}},
+			ReleaseLease, "pg-2", ""},
+		{"a tagged peer ahead does not mask an eligible one also ahead",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-2"), Peers: []PeerState{standby("pg-2", 5, 5, 0x300), standby("pg-3", 5, 5, 0x200)}},
+			ReleaseLease, "pg-3", ""},
+		{"a saturated tagged peer does not hold the promote",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-2"), Peers: []PeerState{{Name: "pg-2", Saturated: true, SaturatedWait: true}}},
+			Promote, "", ""},
+		{"tagged running primary keeps serving",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: localPrimary, NoFailover: tagged("pg-0"), Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}},
+			StayPrimary, "", ""},
+		{"tagged stopped standby-state holder releases before starting",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: LocalState{HasData: true, InRecovery: true, Timeline: tl(5), TimelineOK: true}, NoFailover: tagged("pg-1")},
+			ReleaseLease, "", NoFailoverReason},
+		{"tagged starting standby holder releases instead of waiting",
+			Observation{HoldLease: true, LocalProcessAlive: true, LocalNode: "pg-1", Local: LocalState{HasData: true, InRecovery: true}, NoFailover: tagged("pg-1")},
+			ReleaseLease, "", NoFailoverReason},
+		{"tagged stopped primary-state holder the marker does not record releases (a fresh clone reads in production)",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: dataStopped, NoFailover: tagged("pg-0"), Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-1"}},
+			ReleaseLease, "", NoFailoverReason},
+		{"tagged stopped primary-state holder the marker records resumes",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: dataStopped, NoFailover: tagged("pg-0"), Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}},
+			StartLocal, "", ""},
+		{"switchover to a tagged, caught-up standby is not acted on, and says why",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: localPrimary, SwitchoverTarget: "pg-1", NoFailover: tagged("pg-1"), Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}},
+			StayPrimary, "", "pg-ha/nofailover"},
+		{"tagged non-holder standby still follows the leader",
+			Observation{LocalNode: "pg-1", LeaderIdentity: "pg-0", Local: localStandby, NoFailover: tagged("pg-1"), Peers: []PeerState{primary("pg-0", 5, 5, 0x100)}},
+			Follow, "pg-0", ""},
+		// The marker's recorded primary is exempt: at a full restart it was started read-only
+		// (StartRecovery) and must still win the ranking and promote, or its unstreamed tail
+		// is discarded.
+		{"tagged peer that the marker records as primary, ahead -> hand off to it",
+			Observation{HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-0"), Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}, Peers: []PeerState{standby("pg-0", 5, 5, 0x200)}},
+			ReleaseLease, "pg-0", ""},
+		{"tagged holder that the marker records as primary, read-only after a restart -> promote",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: localStandby, NoFailover: tagged("pg-0"), Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}},
+			Promote, "", ""},
+		{"a malformed marker grants no exemption",
+			Observation{HoldLease: true, LocalNode: "pg-0", Local: localStandby, NoFailover: tagged("pg-0"), Marker: MarkerState{Present: true, Malformed: true, Primary: "pg-0"}},
+			ReleaseLease, "", NoFailoverReason},
+		{"pause outranks the tag",
+			Observation{Paused: true, HoldLease: true, LocalNode: "pg-1", Local: localStandby, NoFailover: tagged("pg-1")},
+			NoOp, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Decide(c.obs)
+			if got.Action != c.wantAction || got.Target != c.wantTarget {
+				t.Fatalf("Decide = %v(%q) %q; want %v(%q)", got.Action, got.Target, got.Reason, c.wantAction, c.wantTarget)
+			}
+			if c.wantReason != "" && !strings.Contains(got.Reason, c.wantReason) {
+				t.Fatalf("reason %q does not mention %q", got.Reason, c.wantReason)
+			}
+		})
+	}
+}
