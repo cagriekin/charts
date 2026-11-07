@@ -2169,10 +2169,8 @@ JSON, keys sorted by toJson, so an unchanged values file renders an unchanged en
 {{- if not (hasKey ((index $sr $kind) | default dict) $res) -}}
 {{- fail (printf "%s.standbyResources.%s.%s is missing: a standby size sets cpu and memory under both requests and limits, because the agent swaps the whole size on a role change and a key left to the template's default would not come back when the pod is raised. Set it, e.g. %s.standbyResources.%s.%s (#386)." $c $kind $res $c $kind $res) -}}
 {{- end -}}
-{{- range $kind2 := list "requests" "limits" -}}
-{{- if not (hasKey ((index (index $.Values $c).resources $kind2) | default dict) $res) -}}
-{{- fail (printf "%s.standbyResources is set, but %s.resources.%s.%s is missing: the primary size is what the agent raises the pod to, so it needs cpu and memory under both requests and limits too (#386)." $c $c $kind2 $res) -}}
-{{- end -}}
+{{- if not (hasKey ((index (index $.Values $c).resources $kind) | default dict) $res) -}}
+{{- fail (printf "%s.standbyResources is set, but %s.resources.%s.%s is missing: the primary size is what the agent raises the pod to, so it needs cpu and memory under both requests and limits too (#386)." $c $c $kind $res) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

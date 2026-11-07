@@ -102,6 +102,7 @@ func newResizeHarness(t *testing.T) *resizeHarness {
 		},
 		log:  slog.New(slog.NewTextHandler(h.logs, nil)),
 		kube: k8s.NewWithClient(h.cs, "ns"),
+		dcs:  &fakeDCS{leader: true},
 		metr: observe.New(),
 	}
 	h.a.resize.now = func() time.Time { return h.clock }
@@ -279,5 +280,67 @@ func TestResizeTickTransientRefusalRetriesSoon(t *testing.T) {
 	p, _ := h.cs.CoreV1().Pods("ns").Get(context.Background(), "pg-0", metav1.GetOptions{})
 	if got := p.Spec.Containers[0].Resources.Limits.Memory(); got.Cmp(resource.MustParse("4Gi")) != 0 {
 		t.Errorf("after resizeRetry the raise should be retried; memory limit = %s, want 4Gi", got)
+	}
+}
+
+// A Promote whose act() returned nil because the lease lapsed before pg_promote must not
+// raise the pod: it is still a standby, and the raise would only be undone a tick later.
+func TestResizeTickNoRaiseWithoutTheLease(t *testing.T) {
+	h := newResizeHarness(t)
+	h.a.dcs = &fakeDCS{leader: false}
+	h.a.resizeTick(context.Background(), reconcile.Decision{Action: reconcile.Promote},
+		reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, HoldLease: true}, nil)
+	if n := h.count("patch"); n != 0 {
+		t.Errorf("raised a pod that no longer holds the lease: %d patches", n)
+	}
+}
+
+// A Deferred raise is polled every resizeRetry, not on every tick for as long as the node is full.
+func TestResizeTickDeferredBacksOff(t *testing.T) {
+	h := newResizeHarness(t)
+	h.tickAsPrimary()
+	h.kubelet(t, false, &corev1.PodCondition{Type: "PodResizePending", Status: corev1.ConditionTrue, Reason: k8s.ResizeDeferred})
+	h.tickAsPrimary()
+	gets := h.count("get")
+	h.tickAsPrimary()
+	if h.count("get") != gets {
+		t.Error("a Deferred resize must not be re-read on the very next tick")
+	}
+	h.clock = h.clock.Add(resizeRetry)
+	h.tickAsPrimary()
+	if h.count("get") != gets+1 {
+		t.Error("a Deferred resize must be re-read after resizeRetry")
+	}
+}
+
+// A tick or two of role flux on a primary stuck Infeasible leaves the gauges alone (each zero
+// would restart the alerts' `for:` window); flux that lasts resizeRecheck clears them.
+func TestResizeTickFluxHoldsGaugesUntilRecheck(t *testing.T) {
+	h := newResizeHarness(t)
+	h.tickAsPrimary()
+	h.kubelet(t, false, &corev1.PodCondition{Type: "PodResizePending", Status: corev1.ConditionTrue, Reason: k8s.ResizeInfeasible, Message: "Node didn't have enough capacity"})
+	h.tickAsPrimary()
+	flux := func() {
+		h.a.resizeTick(context.Background(), reconcile.Decision{Action: reconcile.StartLocal},
+			reconcile.Observation{Local: reconcile.LocalState{HasData: true}, HoldLease: true}, nil)
+	}
+	h.clock = h.clock.Add(5 * time.Second)
+	flux()
+	if !strings.Contains(metricsText(h.a.metr), "pg_ha_agent_pod_resize_infeasible 1") {
+		t.Fatal("one flux tick must not clear the infeasible gauge")
+	}
+	h.clock = h.clock.Add(5 * time.Second)
+	h.tickAsPrimary() // back to primary: the flux run ends
+	h.clock = h.clock.Add(5 * time.Second)
+	flux()
+	h.clock = h.clock.Add(resizeRecheck - time.Second)
+	flux()
+	if !strings.Contains(metricsText(h.a.metr), "pg_ha_agent_pod_resize_infeasible 1") {
+		t.Fatal("a new flux run must restart the clock, not inherit the previous one")
+	}
+	h.clock = h.clock.Add(time.Second)
+	flux()
+	if !strings.Contains(metricsText(h.a.metr), "pg_ha_agent_pod_resize_infeasible 0") {
+		t.Error("flux lasting resizeRecheck must clear the gauges")
 	}
 }

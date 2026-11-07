@@ -59,6 +59,7 @@ type resizeState struct {
 	settled   bool             // target was actuated, or is in a state only time or an operator changes
 	checkedAt time.Time        // last GET of the pod
 	retryAt   time.Time        // after a transient failure for target: no apiserver call before this
+	keepSince time.Time        // first tick of the current run of sizeKeep ticks; zero outside one
 	logged    string           // last logged state, so the log carries one line per change
 	now       func() time.Time // nil = time.Now; tests set it
 }
@@ -105,22 +106,40 @@ func (a *agent) resizeSizes(s podSize) map[string]corev1.ResourceRequirements {
 
 // resizeTick sizes this pod for its role (#386). A no-op unless PG_HA_RESIZE is set.
 func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation, actErr error) {
-	if len(a.cfg.Resize) == 0 || a.kube == nil {
+	if len(a.cfg.Resize) == 0 || a.kube == nil || a.dcs == nil {
 		return
 	}
 	want := desiredSize(dec, obs, actErr)
-	rs := &a.resize
-	if want == sizeKeep {
-		// The role is in flux, so no size is called for: clear the gauges rather than leave a
-		// past role's infeasible/sized-as-primary paging, and re-read on the next sizing tick.
-		rs.settled = false
-		a.metr.SetResize(observe.ResizeStats{})
-		return
+	// A Promote or StayPrimary that returned nil is not proof this node still holds the lease:
+	// act() returns nil when the lease lapsed between observe() and the promote, and after a
+	// post-promote loss it leaves the fence to OnLost. Raising then would reserve the primary
+	// size on a node that is about to be (or already is) a standby -- room the real primary's
+	// raise may need on a shared node -- only to lower it again a few ticks later.
+	if want == sizePrimary && !a.dcs.IsLeader() {
+		want = sizeKeep
 	}
+	rs := &a.resize
 	now := time.Now()
 	if rs.now != nil {
 		now = rs.now()
 	}
+	if want == sizeKeep {
+		// The role is in flux, so no size is called for; re-read on the next sizing tick. The
+		// gauges are cleared only once the flux has lasted resizeRecheck: a pod that has really
+		// left its role must not keep a past role's infeasible/sized-as-primary paging, but a
+		// single failed local probe on a primary stuck Infeasible must not zero the gauge either
+		// -- each zero restarts the alerts' `for:` window, and a primary that flaps now and then
+		// would be stuck at the standby size with PGHAPodResizeInfeasible/Stuck never firing.
+		rs.settled = false
+		if rs.keepSince.IsZero() {
+			rs.keepSince = now
+		}
+		if now.Sub(rs.keepSince) >= resizeRecheck {
+			a.metr.SetResize(observe.ResizeStats{})
+		}
+		return
+	}
+	rs.keepSince = time.Time{}
 	if want == rs.target && rs.settled && now.Sub(rs.checkedAt) < resizeRecheck {
 		return
 	}
@@ -182,6 +201,13 @@ func (a *agent) resizeTick(ctx context.Context, dec reconcile.Decision, obs reco
 	// leave on its own (Infeasible) or the apiserver will keep refusing. Those are re-read
 	// (and a refused patch retried) every resizeRecheck instead.
 	rs.settled = st.Actuated || st.Pending == k8s.ResizeInfeasible || refused != nil
+	// Deferred, or in progress (a memory limit the kubelet will not lower below usage can stay
+	// there indefinitely): nothing this agent does moves it, so poll it every resizeRetry
+	// rather than spend a GET -- and half a fence budget against a slow apiserver -- on every
+	// tick for as long as the node stays full.
+	if !rs.settled && (st.Pending != "" || st.InProgress) {
+		rs.retryAt = now.Add(resizeRetry)
+	}
 	a.metr.SetResize(observe.ResizeStats{
 		SizedAsPrimary: want == sizePrimary && st.Actuated,
 		Pending:        !st.Actuated,
