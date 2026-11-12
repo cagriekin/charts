@@ -962,6 +962,10 @@ func TestActSwitchoverClearsServingRWAfterTheDemote(t *testing.T) {
 	a := newTestAgent(t, pm, &fakeDCS{})
 	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns")
 	a.servingRW.Store(true)
+	// Phase 2 of the handoff (#389): the stamp has settled.
+	now := time.Unix(1_700_000_000, 0)
+	a.handoffNow = func() time.Time { return now }
+	a.handoff = k8s.Handoff{Target: "pg-1", Start: now.Add(-a.handoffSettle()), OK: true, Present: true}
 	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: false}}
 	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Switchover, Target: "pg-1"}, obs); err != nil {
 		t.Fatalf("act: %v", err)

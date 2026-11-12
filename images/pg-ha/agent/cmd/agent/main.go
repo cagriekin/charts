@@ -313,6 +313,11 @@ type agent struct {
 	// lastMemberTags is the member-tag state last logged (#275), so a change is logged once
 	// rather than every tick.
 	lastMemberTags string
+	// handoff is the marker's pg-ha/switchover-handoff as of the last readable marker
+	// (#389); zero (OK=false) when none. Reconcile goroutine only.
+	handoff k8s.Handoff
+	// handoffNow is the clock the handoff timing reads; nil = time.Now. Tests set it.
+	handoffNow func() time.Time
 
 	// fenceGen counts COMPLETED demotes -- OnLost's fence and every planned step-down. It
 	// exists to sequence tick()'s servingRW derivation against them (#298 review).
@@ -1428,8 +1433,10 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// all: no tags is a guess there, not an observation.
 	if !o.MarkerUnreadable {
 		a.logMemberTags(m)
-		a.dcs.SetCandidate(leadershipCandidate(o))
+		a.handoff = m.Handoff
+		a.dcs.SetCandidate(leadershipCandidate(o) && !a.handoffExcludes(a.cfg.PodName))
 	}
+	o.HandoffToLocal = a.handoffFresh() && a.handoff.Target == a.cfg.PodName
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover. Suppressed while
@@ -2016,6 +2023,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// #308: keep synchronized_standby_slots current as standbys scale up/down. After the
 		// routing switch, not before -- same fence-budget priority as the Promote case.
 		a.assertSyncStandbySlots(wctx, staySlots, stayOwned, staySlotsRead)
+		a.retireHandoff(wctx, obs)
 		return routingErr
 
 	case reconcile.Follow:
@@ -2289,12 +2297,37 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 
 	case reconcile.Switchover:
 		// Controlled handoff (Part H2): the decision guard already confirmed the
-		// target is a caught-up, same-timeline standby. Clear the request FIRST so a
-		// later unrelated failover cannot re-trigger a handoff to the same pod; only
-		// on a successful clear do we step down (graceful/fast demote, THEN release
-		// the Lease). The target, being caught up, then wins the freed Lease and
-		// promotes. If the clear fails we do NOT step down -- the request persists,
-		// so the next tick retries.
+		// target is a caught-up, same-timeline standby. In two phases (#389):
+		//
+		//  1. Stamp pg-ha/switchover-handoff=<target>@<now> on the marker and keep serving.
+		//     Every other member withdraws from the election on its next tick
+		//     (handoffExcludes). The step-down waits handoffSettle for that: a Lease freed
+		//     while another standby still contends goes to whichever acquires first, which
+		//     on three members put the primary on the pod the operator did NOT name about
+		//     half the time. Nothing is down meanwhile -- this node still serves.
+		//  2. Once settled, clear the request (so a later unrelated failover cannot
+		//     re-trigger a handoff to the same pod), demote, release. Only the target
+		//     contends, so it takes the Lease. The stamp stays until the new primary
+		//     retires it, or it expires (handoffWindow) if the target never takes over.
+		//
+		// A stamp for another target, or one too old to leave the target its window,
+		// restarts phase 1: the gate would lapse before the target could acquire.
+		switch a.handoffPhase(dec.Target) {
+		case handoffSettling:
+			return nil // phase 1 in progress: the other members are still parking
+		case handoffStamp:
+			hctx, hcancel := context.WithTimeout(ctx, a.fenceBudget())
+			herr := a.kube.SetSwitchoverHandoff(hctx, a.cfg.MarkerName, dec.Target, a.handoffClock())
+			hcancel()
+			if herr != nil {
+				return herr
+			}
+			a.log.Info("switchover: handoff stamped; stepping down once every other member has stopped contending for the lease (#389)", "target", dec.Target, "settle", a.handoffSettle().String())
+			return nil
+		}
+		// Clear the request FIRST; only on a successful clear do we step down
+		// (graceful/fast demote, THEN release the Lease). If the clear fails we do NOT
+		// step down -- the request persists, so the next tick retries.
 		//
 		// FENCE-BOUNDED, like every other apiserver call on this goroutine (#298 review).
 		// This node is a SERVING READ-WRITE primary here -- that is the precondition for a
@@ -3993,9 +4026,113 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 		NoFailover: memberSet(m.NoFailover),
 		Marker:     reconcile.MarkerState{Present: m.Present, Malformed: m.Malformed, Primary: m.Primary},
 	}
-	if !reconcile.FailoverEligible(o, a.cfg.PodName) {
+	a.handoff = m.Handoff
+	if !reconcile.FailoverEligible(o, a.cfg.PodName) || a.handoffExcludes(a.cfg.PodName) {
 		a.dcs.SetCandidate(false)
 	}
+}
+
+// Switchover handoff timing (#389). All three derive from the agent's own timing config,
+// which the chart renders identically on every member, so no member needs another's view.
+//
+// handoffSettle is how long the primary keeps serving after stamping the handoff before it
+// steps down: every live member must have ticked at least once in between, read the stamp
+// and parked its election. Three reconcile intervals is the /healthz staleness bound -- an
+// agent whose tick takes longer is killed by its liveness probe, and a restarted one parks
+// from boot (initialCandidacy) -- so no contender survives it unparked.
+func (a *agent) handoffSettle() time.Duration { return 3 * a.cfg.ReconcileInterval }
+
+// handoffWindow is how long a stamp parks the other members: the settle, the phase-2 slot
+// the primary's next tick has to land in (handoffStepDownSlot), then the bounded demote (RenewDeadline) and
+// a full LeaseDuration for the target to acquire the freed Lease. A target that died in
+// the window holds the election up for this long at most; on chart defaults (5s interval,
+// 15s lease, 10s renew) 50s.
+func (a *agent) handoffWindow() time.Duration {
+	return a.handoffSettle() + a.handoffStepDownSlot() + a.cfg.RenewDeadline + a.cfg.LeaseDuration
+}
+
+// handoffStepDownSlot is how late past the settle the primary may still step down on its
+// stamp. Two intervals, not one: ticks are an interval apart but jitter, and with a one-
+// interval slot a tick landing just before the settle and the next just after the slot
+// would restamp forever.
+func (a *agent) handoffStepDownSlot() time.Duration { return 2 * a.cfg.ReconcileInterval }
+
+func (a *agent) handoffClock() time.Time {
+	if a.handoffNow != nil {
+		return a.handoffNow()
+	}
+	return time.Now()
+}
+
+// handoffExcludes reports whether a fresh handoff to another pod keeps node out of the
+// election (#389). Fresh means started within handoffWindow -- and, for a start in the
+// future, no further ahead than that either: members' clocks differ a little, but a stamp
+// dated far ahead is not one an agent wrote, and honouring it would park the election for
+// as long as it says.
+func (a *agent) handoffExcludes(node string) bool {
+	return a.handoffFresh() && a.handoff.Target != node
+}
+
+// handoffFresh reports whether the marker carries a handoff stamp still inside its window.
+func (a *agent) handoffFresh() bool {
+	h := a.handoff
+	if !h.OK {
+		return false
+	}
+	age := a.handoffClock().Sub(h.Start)
+	return age > -a.handoffWindow() && age < a.handoffWindow()
+}
+
+// handoffStep is where the Switchover branch stands on the marker's stamp (#389).
+type handoffStep int
+
+const (
+	handoffStamp    handoffStep = iota // no usable stamp for this target: write one (phase 1)
+	handoffSettling                    // stamped, the other members are still parking
+	handoffStepDown                    // settled with the target's window intact: phase 2
+)
+
+// handoffPhase classifies the stamp for a switchover to target. A stamp for another pod, a
+// future-dated one, or one past the step-down slot (the request stalled -- the target fell
+// behind for a while -- so stepping down now would leave the target too little of the window)
+// is restamped rather than acted on.
+func (a *agent) handoffPhase(target string) handoffStep {
+	h := a.handoff
+	if !h.OK || h.Target != target {
+		return handoffStamp
+	}
+	age := a.handoffClock().Sub(h.Start)
+	switch {
+	case age < 0:
+		return handoffStamp
+	case age < a.handoffSettle():
+		return handoffSettling
+	case age <= a.handoffSettle()+a.handoffStepDownSlot():
+		return handoffStepDown
+	default:
+		return handoffStamp
+	}
+}
+
+// retireHandoff removes a handoff stamp once a serving primary no longer needs it (#389):
+// the handoff is over (this node is its target, promoted, or the request was cancelled
+// or replaced). A stamp for the request this primary is still working on is left alone.
+// Best-effort: the stamp expires on its own, and until then it only parks the other members
+// in case this primary fails -- a delay of at most handoffWindow, never a wrong promote.
+func (a *agent) retireHandoff(ctx context.Context, obs reconcile.Observation) {
+	h := a.handoff
+	if !h.Present {
+		return
+	}
+	if h.OK && obs.SwitchoverTarget != "" && obs.SwitchoverTarget == h.Target && h.Target != a.cfg.PodName {
+		return
+	}
+	if err := a.kube.ClearSwitchoverHandoff(ctx, a.cfg.MarkerName); err != nil {
+		a.log.Warn("could not remove pg-ha/switchover-handoff; it expires on its own (#389)", "err", err)
+		return
+	}
+	a.handoff = k8s.Handoff{}
+	a.log.Info("switchover handoff over; removed pg-ha/switchover-handoff (#389)", "target", h.Target)
 }
 
 // leadershipCandidate is the candidacy rule observe applies (#275): exactly

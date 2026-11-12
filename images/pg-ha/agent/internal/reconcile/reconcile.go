@@ -192,6 +192,15 @@ type Observation struct {
 	// serving primary steps down for it only once the target is a caught-up,
 	// same-timeline standby (switchoverTargetReady) -- otherwise it keeps serving.
 	SwitchoverTarget string
+	// HandoffToLocal: a controlled switchover's handoff stamp names this node and is still
+	// fresh (#389), so every other member is parked out of the election. A lease-holding
+	// standby that sees a peer with more WAL then waits rather than releasing: the peer
+	// cannot take the lease until the stamp expires, so a release would only leave the
+	// cluster without a primary for the rest of the window. After a graceful demote both
+	// standbys end on the primary's shutdown checkpoint, so the gap is a measurement taken
+	// mid-stream and closes on the next tick; a gap that does not close is honoured once the
+	// stamp expires, by the ordinary hand-off below.
+	HandoffToLocal bool
 	// LocalProcessAlive is process liveness of the agent's supervised postmaster
 	// (alive, distinct from Local.Running which is SQL reachability). A postmaster
 	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
@@ -348,6 +357,9 @@ func Decide(o Observation) Decision {
 				return d(ReleaseLease, "", "refuse to promote: "+why)
 			}
 			if t, reachable := moreAdvancedPeer(o); t != "" {
+				if reachable && o.HandoffToLocal {
+					return d(Wait, "", "switchover handoff to this node: peer "+t+" reports more WAL, but it is parked until the handoff ends; wait for the positions to settle rather than leave the cluster without a primary (#389)")
+				}
 				if reachable {
 					// A live peer is ahead and can take over: hand off (invariant 8).
 					return d(ReleaseLease, t, "a reachable peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")

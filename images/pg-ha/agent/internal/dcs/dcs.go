@@ -57,7 +57,7 @@ func parkWhileNotCandidate(ctx context.Context, notCandidate *atomic.Bool, perio
 	logged := false
 	for notCandidate.Load() {
 		if !logged {
-			slog.Info("not contending for leadership: this node is tagged nofailover (#275)")
+			slog.Info("not contending for leadership: this node is tagged nofailover (#275), or a switchover is handing the lease to another member (#389)")
 			logged = true
 		}
 		if refreshLeader != nil {
