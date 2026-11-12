@@ -520,7 +520,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.0-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.1-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -583,7 +583,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 ha:
   image:
-    tag: 2.5.0-pg17
+    tag: 2.5.1-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
 # `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
@@ -594,7 +594,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.5.0-pg17
+      tag: 2.5.1-pg17
 ```
 
 The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
@@ -864,9 +864,25 @@ To hand the primary role to a specific standby on purpose (e.g. to move the prim
 kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/switchover-target=<release>-pg-1 --overwrite
 ```
 
-The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8), then clears the annotation (one-shot) and steps down so the target promotes. If the target is lagging or unreachable, the primary keeps serving and retries — it never steps down onto a behind standby, so committed data is not discarded. The graceful step-down flushes WAL to the connected target, making the handoff near-zero-RPO in practice.
+The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8). If the target is lagging or unreachable, the primary keeps serving and retries — it never steps down onto a behind standby, so committed data is not discarded.
 
-Caveats: this is a planned handoff layered on the lease election, not a fenced zero-RPO transaction — the directed target promotes deterministically on a two-pod cluster; with three or more pods the most-advanced standby wins the freed lease (usually but not necessarily the named target). For strict RPO=0 use synchronous replication (not enabled in this chart).
+Once the target is ready, the handoff runs in two steps (#389):
+
+1. The primary writes `pg-ha/switchover-handoff=<target>@<time>` on the marker and keeps
+   serving. Every other member stops contending for the lease on its next tick.
+2. Three reconcile intervals later (15s on defaults), the primary clears the request (one-shot),
+   demotes gracefully (flushing WAL to the connected standbys) and releases the lease. Only the
+   target is contending, so the target promotes, on any number of pods.
+
+The write outage is the same as before; the first step only adds the wait before it. The
+handoff stamp is written by the agent, never by you, and expires after the settle, the
+step-down slot, `renewDeadline` and `leaseDuration` (50s on defaults). If the target dies
+inside that window, the other members wait out the rest of it before a normal failover. The new
+primary removes the stamp once it serves; cancelling the request with
+`pg-ha/switchover-target-` removes it too.
+
+Caveat: this is a planned handoff layered on the lease election, not a fenced zero-RPO
+transaction. For strict RPO=0 use synchronous replication (not enabled in this chart).
 
 ### Member tags: nofailover / noloadbalance (#275)
 
@@ -3045,6 +3061,7 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
+| *unreleased* | `cagriekin/pg-ha:2.5.1-pg18` / `:2.5.1-pg17` (2.5.1+ for a switchover that always lands on the named pod on three or more members, #389) | 18.x (default) or 17.x | as below |
 | 2.7.0 *(current)* | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
 | 2.6.0 | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |

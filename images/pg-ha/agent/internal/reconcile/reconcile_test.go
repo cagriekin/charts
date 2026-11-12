@@ -79,6 +79,7 @@ func TestDecide(t *testing.T) {
 		{"holder standby + newer primary peer -> rejoin forward", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{primary("pg-1", 6, 6, 0x10)}}, RejoinForward, "pg-1"},
 		{"holder standby below highwater -> release", Observation{HoldLease: true, Local: localStandby, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
 		{"holder standby but a peer has more WAL -> release/handoff", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+		{"holder standby named by a fresh switchover handoff, a parked peer reports more WAL -> wait, do not release (#389)", Observation{HoldLease: true, Local: localStandby, HandoffToLocal: true, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, Wait, ""},
 
 		{"holder primary current -> stay", Observation{HoldLease: true, Local: localPrimary, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
 		{"holder primary + malformed marker -> release", Observation{HoldLease: true, Local: localPrimary, Marker: MarkerState{Malformed: true}}, ReleaseLease, ""},

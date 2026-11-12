@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,6 +39,51 @@ const PauseAnnotation = "pg-ha/pause"
 // annotation (one-shot, so a later unrelated failover cannot re-trigger it). Set
 // with `kubectl annotate configmap <fullname>-primary pg-ha/switchover-target=<pod>`.
 const SwitchoverTargetAnnotation = "pg-ha/switchover-target"
+
+// SwitchoverHandoffAnnotation is written by the serving primary, never by an operator: it
+// says a controlled switchover to one pod is under way, as "<pod>@<RFC 3339 start>" (#389).
+// While it is fresh every other member withdraws from the election, so the Lease the primary
+// frees can only go to the pod the operator named. Without it the request was cleared before
+// the step-down and every standby then contended on equal terms: on three or more members a
+// switchover landed on the named pod only about 1/N of the time.
+//
+// It is not one-shot like the request but time-bounded, so a target that never takes the
+// Lease (it died in the handoff window) holds the election up for at most the window; the
+// primary that next serves read-write removes it once the handoff is over.
+const SwitchoverHandoffAnnotation = "pg-ha/switchover-handoff"
+
+// Handoff is a parsed SwitchoverHandoffAnnotation (#389). Present is whether the annotation
+// is set at all; OK whether it also parsed. An unparseable one gates nobody, because a stamp
+// the agent cannot date could otherwise hold the election up for good -- but it is Present,
+// so the serving primary still removes it.
+type Handoff struct {
+	Target  string
+	Start   time.Time
+	OK      bool
+	Present bool
+}
+
+// FormatHandoff is the annotation value for a handoff to target begun at start.
+func FormatHandoff(target string, start time.Time) string {
+	return target + "@" + start.UTC().Format(time.RFC3339Nano)
+}
+
+// ParseHandoff parses a SwitchoverHandoffAnnotation value.
+func ParseHandoff(v string) Handoff {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return Handoff{}
+	}
+	target, ts, ok := strings.Cut(v, "@")
+	if !ok || target == "" {
+		return Handoff{Present: true}
+	}
+	start, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return Handoff{Present: true}
+	}
+	return Handoff{Target: target, Start: start, OK: true, Present: true}
+}
 
 // PausedByAnnotation and SwitchoverRequestedByAnnotation record WHO asked for the
 // current pause / switchover when it was requested through the control API (#276).
@@ -123,6 +169,8 @@ type Marker struct {
 	PausedBy string
 	// SwitchoverTarget is the pod named by SwitchoverTargetAnnotation ("" if none).
 	SwitchoverTarget string
+	// Handoff is the SwitchoverHandoffAnnotation (#389); OK=false when none.
+	Handoff Handoff
 	// AcceptLagTarget is the pod named by AcceptLagAnnotation ("" if none), #273.
 	AcceptLagTarget string
 	// NoFailover and NoLoadBalance are the pods named by the member-tag annotations
@@ -162,6 +210,7 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 		Paused:           strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true"),
 		PausedBy:         strings.TrimSpace(cm.Annotations[PausedByAnnotation]),
 		SwitchoverTarget: strings.TrimSpace(cm.Annotations[SwitchoverTargetAnnotation]),
+		Handoff:          ParseHandoff(cm.Annotations[SwitchoverHandoffAnnotation]),
 		AcceptLagTarget:  strings.TrimSpace(cm.Annotations[AcceptLagAnnotation]),
 		NoFailover:       ParseMemberList(cm.Annotations[NoFailoverAnnotation]),
 		NoLoadBalance:    ParseMemberList(cm.Annotations[NoLoadBalanceAnnotation]),
@@ -369,6 +418,27 @@ func (c *Client) ClearAcceptLagTarget(ctx context.Context, name string) error {
 		return err
 	}
 	return c.patchMarker(ctx, name, types.MergePatchType, patch, "clear "+AcceptLagAnnotation)
+}
+
+// SetSwitchoverHandoff records that this primary has begun a controlled handoff to target
+// at start (#389). A merge patch, like ClearAcceptLagTarget: one call, no read-modify-write,
+// so it cannot 409 against the control API or the lag gate's position writes.
+func (c *Client) SetSwitchoverHandoff(ctx context.Context, name, target string, start time.Time) error {
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]any{SwitchoverHandoffAnnotation: FormatHandoff(target, start)}}})
+	if err != nil {
+		return err
+	}
+	return c.patchMarker(ctx, name, types.MergePatchType, patch, "set "+SwitchoverHandoffAnnotation)
+}
+
+// ClearSwitchoverHandoff removes the handoff annotation (#389). An absent annotation or a
+// missing marker is a no-op.
+func (c *Client) ClearSwitchoverHandoff(ctx context.Context, name string) error {
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]any{SwitchoverHandoffAnnotation: nil}}})
+	if err != nil {
+		return err
+	}
+	return c.patchMarker(ctx, name, types.MergePatchType, patch, "clear "+SwitchoverHandoffAnnotation)
 }
 
 // ClearSwitchoverTarget removes the switchover-target annotation from the marker
