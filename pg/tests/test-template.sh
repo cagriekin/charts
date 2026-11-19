@@ -3003,10 +3003,17 @@ assert_contains "#38: targeted restore promotes (not pause)" "${pgbr_script}" "t
 # pgbackrest shim models that. The pg_ctl shim refuses to start like checkDataDir() does
 # (miscinit.c: FATAL when the mode has group-write or any other-bits) and models
 # `pg_ctl status` as "not running" once it has refused.
+# The script prepends the newest /usr/lib/postgresql/*/bin to PATH, which would put a host
+# PostgreSQL (GitHub's ubuntu runners ship one there) ahead of the shims, so that glob is
+# redirected to a shim bin dir laid out the same way.
 val_shim_dir=$(mktemp -d)
+val_pg_bin="${val_shim_dir}/postgresql/16/bin"
+mkdir -p "${val_pg_bin}"
 awk '/^  validate.sh: \|$/{f=1;next} f && /^  [^ ]/{exit} f{sub(/^    /,""); print}' <<< "${pgbr_script}" \
-  | sed "s#^WORK=/work\$#WORK=${val_shim_dir}/work#" > "${val_shim_dir}/validate.sh"
+  | sed -e "s#^WORK=/work\$#WORK=${val_shim_dir}/work#" \
+        -e "s#/usr/lib/postgresql/\*/bin/#${val_shim_dir}/postgresql/*/bin/#" > "${val_shim_dir}/validate.sh"
 assert_contains_literal "pgdata mode shim: the work dir is redirected to the scratch dir" "$(cat "${val_shim_dir}/validate.sh")" "WORK=${val_shim_dir}/work"
+assert_not_contains "pgdata mode shim: the host PostgreSQL bin glob is redirected to the shims" "$(cat "${val_shim_dir}/validate.sh")" '/usr/lib/postgresql/\*/bin/'
 cat > "${val_shim_dir}/pgbackrest" <<'SHIM'
 #!/bin/bash
 case "$*" in
@@ -3017,7 +3024,7 @@ case "$*" in
   *) echo "shim: unexpected pgbackrest $*" >&2; exit 99 ;;
 esac
 SHIM
-cat > "${val_shim_dir}/pg_ctl" <<'SHIM'
+cat > "${val_pg_bin}/pg_ctl" <<'SHIM'
 #!/bin/bash
 case "$*" in
   *" start")
@@ -3032,8 +3039,8 @@ case "$*" in
   *) echo "shim: unexpected pg_ctl $*" >&2; exit 99 ;;
 esac
 SHIM
-printf '#!/bin/bash\nexit 1\n' > "${val_shim_dir}/pg_controldata"
-cat > "${val_shim_dir}/psql" <<'SHIM'
+printf '#!/bin/bash\nexit 1\n' > "${val_pg_bin}/pg_controldata"
+cat > "${val_pg_bin}/psql" <<'SHIM'
 #!/bin/bash
 case "$*" in
   *"pg_is_in_recovery"*) echo "f" ;;
@@ -3041,7 +3048,7 @@ case "$*" in
   *) echo "shim: unexpected psql $*" >&2; exit 99 ;;
 esac
 SHIM
-chmod +x "${val_shim_dir}/pgbackrest" "${val_shim_dir}/pg_ctl" "${val_shim_dir}/pg_controldata" "${val_shim_dir}/psql"
+chmod +x "${val_shim_dir}/pgbackrest" "${val_pg_bin}/pg_ctl" "${val_pg_bin}/pg_controldata" "${val_pg_bin}/psql"
 val_run() { # val_run <manifest-mode> [start-fail] -> sets val_rc, val_out
   rm -rf "${val_shim_dir}/work" "${val_shim_dir}/state"; mkdir -p "${val_shim_dir}/state"
   val_out=$(PATH="${val_shim_dir}:${PATH}" SHIM_MANIFEST_MODE="$1" SHIM_START_FAIL="${2:-}" SHIM_STATE="${val_shim_dir}/state" \
