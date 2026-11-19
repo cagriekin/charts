@@ -310,6 +310,9 @@ type agent struct {
 	// paused and towards keeping the highwater armed, and it is re-read every tick.
 	lastMarker   k8s.Marker
 	lastMarkerOK bool
+	// markerReadThisTick is whether this tick's observe() read the marker itself rather than
+	// reusing lastMarker; the promote handoff guard trusts a.handoff only then (#389).
+	markerReadThisTick bool
 	// lastMemberTags is the member-tag state last logged (#275), so a change is logged once
 	// rather than every tick.
 	lastMemberTags string
@@ -1328,6 +1331,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// ABSENT marker is not this path: ReadMarker returns Marker{Present:false} with a
 		// nil error for NotFound, so deleting the ConfigMap (a documented recovery step)
 		// still reaches Decide as the real observation it is.
+		a.markerReadThisTick = false
 		if a.lastMarkerOK {
 			a.log.Warn("read marker failed; reusing the last successful read for this tick", "err", err)
 			m = a.lastMarker
@@ -1337,6 +1341,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 	} else {
 		a.lastMarker, a.lastMarkerOK = m, true
+		a.markerReadThisTick = true
 	}
 	if m.SchemaVersion > k8s.SchemaVersion {
 		// A newer agent (mid rolling-upgrade) wrote the marker. v1 fields are stable,
@@ -1877,6 +1882,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// reconcileInterval beside whichever peer took the lease. One atomic read closes it.
 		if !a.dcs.IsLeader() {
 			a.log.Warn("lease lost between observe and promote; not promoting (#298)", "node", a.cfg.PodName)
+			return nil
+		}
+		if !a.promoteHandoffAllows(ctx) {
 			return nil
 		}
 		a.servingRW.Store(true)
@@ -4081,6 +4089,35 @@ func (a *agent) handoffFresh() bool {
 	}
 	age := a.handoffClock().Sub(h.Start)
 	return age > -a.handoffWindow() && age < a.handoffWindow()
+}
+
+// promoteHandoffAllows is the switchover target enforced at the promote itself (#389). The
+// candidacy gate in observe() only narrows who contends: a non-target that was already
+// contending when the stamp landed -- a slow observe(), or a tick that reused lastMarker
+// after a failed read -- can still win the Lease the primary frees. So the marker is read
+// again here, right before pg_promote, and a fresh stamp naming another pod makes this node
+// park and release the Lease instead of promoting; the target, still contending, takes it.
+// A failed re-read falls back to this tick's observation only when observe() read the marker
+// itself; behind a reused one this node holds off for a tick instead, which costs one
+// reconcile interval, never a promote past the named target.
+func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
+	mctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
+	cancel()
+	switch {
+	case err == nil:
+		a.handoff = m.Handoff
+	case !a.markerReadThisTick:
+		a.log.Warn("switchover handoff: could not re-read the marker before promoting and this tick's copy is reused; not promoting this tick (#389)", "err", err)
+		return false
+	}
+	if !a.handoffExcludes(a.cfg.PodName) {
+		return true
+	}
+	a.log.Info("switchover handoff names another member; releasing the lease to it instead of promoting (#389)", "node", a.cfg.PodName, "target", a.handoff.Target)
+	a.dcs.SetCandidate(false)
+	a.dcs.Release()
+	return false
 }
 
 // handoffStep is where the Switchover branch stands on the marker's stamp (#389).

@@ -7,7 +7,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
@@ -211,4 +213,70 @@ func TestInitialCandidacyParksForAHandoff(t *testing.T) {
 			t.Errorf("%s: parked=%v, want %v", c.self, parked, c.wantPark)
 		}
 	}
+}
+
+// #389 review: a non-target that was already contending when the stamp landed can still win
+// the Lease the primary frees. The promote re-reads the marker and hands the Lease on instead.
+func TestPromoteHandoffGuard(t *testing.T) {
+	stamp := map[string]string{k8s.SwitchoverHandoffAnnotation: k8s.FormatHandoff("pg-1", t0.Add(-16*time.Second))}
+	t.Run("a non-target releases instead of promoting, despite a stale cached view", func(t *testing.T) {
+		a, _, d, _ := handoffTestAgent(t, "pg-2", stamp)
+		a.handoffNow = func() time.Time { return t0 }
+		a.markerReadThisTick = true
+		if a.promoteHandoffAllows(context.Background()) {
+			t.Fatal("pg-2 must not promote past a fresh handoff to pg-1")
+		}
+		if !d.released || !d.candidacySet || d.candidate {
+			t.Fatalf("released=%v candidacySet=%v candidate=%v, want a parked release", d.released, d.candidacySet, d.candidate)
+		}
+		if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Promote}, reconcile.Observation{}); err != nil {
+			t.Fatalf("act: %v", err)
+		}
+		if a.servingRW.Load() {
+			t.Fatal("the promote must not arm the read-write latch on a non-target")
+		}
+	})
+	t.Run("the target promotes", func(t *testing.T) {
+		a, _, d, _ := handoffTestAgent(t, "pg-1", stamp)
+		a.handoffNow = func() time.Time { return t0 }
+		a.markerReadThisTick = true
+		if !a.promoteHandoffAllows(context.Background()) || d.released {
+			t.Fatal("the named target must promote")
+		}
+	})
+	t.Run("an expired stamp blocks nobody", func(t *testing.T) {
+		a, _, _, _ := handoffTestAgent(t, "pg-2", stamp)
+		a.handoffNow = func() time.Time { return t0.Add(time.Minute) }
+		a.markerReadThisTick = true
+		if !a.promoteHandoffAllows(context.Background()) {
+			t.Fatal("an expired handoff must not block a failover")
+		}
+	})
+	failReads := func(cs *k8sfake.Clientset) {
+		cs.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, context.DeadlineExceeded
+		})
+	}
+	t.Run("a failed re-read behind a reused marker holds off", func(t *testing.T) {
+		a, _, d, cs := handoffTestAgent(t, "pg-2", nil)
+		a.handoffNow = func() time.Time { return t0 }
+		failReads(cs)
+		a.markerReadThisTick = false
+		if a.promoteHandoffAllows(context.Background()) || d.released {
+			t.Fatal("with no fresh marker this tick the promote waits, keeping the Lease")
+		}
+	})
+	t.Run("a failed re-read after a fresh observe trusts this tick's copy", func(t *testing.T) {
+		a, _, _, cs := handoffTestAgent(t, "pg-2", nil)
+		a.handoffNow = func() time.Time { return t0 }
+		failReads(cs)
+		a.markerReadThisTick = true
+		if !a.promoteHandoffAllows(context.Background()) {
+			t.Fatal("no stamp in this tick's fresh read: promote")
+		}
+		a.handoff = k8s.ParseHandoff(stamp[k8s.SwitchoverHandoffAnnotation])
+		if a.promoteHandoffAllows(context.Background()) {
+			t.Fatal("a fresh stamp in this tick's read still blocks a non-target")
+		}
+	})
 }

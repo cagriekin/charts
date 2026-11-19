@@ -182,10 +182,13 @@ for round in 1 2 3; do
   assert_eq "#389 round ${round}: the primary moves onto the named ${TARGET}" "${TARGET}" "${NEW}"
   settle_roles 300 || true
   assert_eq "#389 round ${round}: ${TARGET} is the primary once roles settle" "${TARGET}" "${PRIMARY}"
-  handoff=""; e=0
+  handoff="unread"; e=0
   while [[ ${e} -lt 60 ]]; do
-    handoff=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-handoff}' 2>/dev/null || true)
-    [[ -z "${handoff}" ]] && break
+    if handoff=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-handoff}' 2>/dev/null); then
+      [[ -z "${handoff}" ]] && break
+    else
+      handoff="unread"
+    fi
     sleep 3; e=$((e + 3))
   done
   assert_eq "#389 round ${round}: the new primary removes the handoff stamp" "" "${handoff}"

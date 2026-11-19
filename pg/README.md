@@ -864,7 +864,7 @@ To hand the primary role to a specific standby on purpose (e.g. to move the prim
 kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/switchover-target=<release>-pg-1 --overwrite
 ```
 
-The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8). If the target is lagging or unreachable, the primary keeps serving and retries — it never steps down onto a behind standby, so committed data is not discarded.
+The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8). If the target is lagging or unreachable, the primary keeps serving and retries; it does not start the handoff onto a behind standby. Writes committed after that check reach the target through asynchronous replication, and the graceful demote flushes them before the lease is released. If the primary fails before the step-down, it is an ordinary failover, and writes the target never received can be lost.
 
 Once the target is ready, the handoff runs in two steps (#389):
 
@@ -872,7 +872,9 @@ Once the target is ready, the handoff runs in two steps (#389):
    serving. Every other member stops contending for the lease on its next tick.
 2. Three reconcile intervals later (15s on defaults), the primary clears the request (one-shot),
    demotes gracefully (flushing WAL to the connected standbys) and releases the lease. Only the
-   target is contending, so the target promotes, on any number of pods.
+   target is contending, so the target promotes, on any number of pods. A member that was
+   still contending when the stamp landed and wins the lease anyway re-reads the marker before
+   promoting and releases the lease to the target instead.
 
 The write outage is the same as before; the first step only adds the wait before it. The
 handoff stamp is written by the agent, never by you, and expires after the settle, the
