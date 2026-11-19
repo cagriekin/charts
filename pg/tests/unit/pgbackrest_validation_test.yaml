@@ -1,0 +1,29 @@
+suite: pgbackrest restore-validation script (#38)
+templates:
+  - templates/pgbackrest-configmap.yaml
+tests:
+  # pgbackrest restore leaves the throwaway PGDATA at the mode the backup manifest recorded
+  # for the live one; postgres refuses group-write or other-bits. The behaviour is exercised
+  # against shims in tests/test-template.sh ("pgdata mode shim").
+  - it: sets the restored data directory to 0700 between the restore and pg_ctl start
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.validation.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["validate.sh"]
+          pattern: '(?s)--stanza="\$PGBACKREST_STANZA" restore\n\s*fi\n.*chmod 00700 "\$PGDATA"\n.*pg_ctl -D "\$PGDATA" -w -t 60'
+
+  - it: reports a postmaster that exited as an exit, not as a recoveryTimeout
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.validation.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["validate.sh"]
+          pattern: '(?s)if ! pg_ctl -D "\$PGDATA" status >/dev/null 2>&1; then\n\s*exited="yes"\n\s*break'
+      - matchRegex:
+          path: data["validate.sh"]
+          pattern: 'the throwaway postmaster exited before it promoted'

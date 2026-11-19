@@ -1,5 +1,17 @@
 # pgvector chart changelog
 
+## Unreleased
+
+### Fixed
+
+- **The pgBackRest restore drill starts its throwaway PostgreSQL with a 0700 data directory.**
+  `pgbackrest restore` sets the restored directory to the mode the backup manifest recorded for
+  the live PGDATA. A backup taken while that directory carried group-write (the kubelet's
+  `fsGroup` bits) restored a directory PostgreSQL refuses ("data directory ... has invalid
+  permissions"), and the validation Job failed. The script now logs the restored mode and sets
+  the directory to 0700 before `pg_ctl start`. A postmaster that exits during startup is now
+  reported as an exit; the message no longer claims it waited out `recoveryTimeout`.
+
 ## 2.7.0 - 2026-11-07
 
 ### Added

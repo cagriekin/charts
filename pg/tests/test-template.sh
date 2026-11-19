@@ -2996,6 +2996,82 @@ pgbr_val_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackre
 assert_contains "#38: PITR target value wired into the env" "${pgbr_val_pitr}" "2026-06-26 03:00:00+00"
 # A targeted restore must promote, not pause: default recovery_target_action is `pause`.
 assert_contains "#38: targeted restore promotes (not pause)" "${pgbr_script}" "target-action=promote"
+
+# Run the rendered validate.sh against shims. pgBackRest's restore chmods the existing target
+# directory to the mode recorded in the backup manifest (restoreCleanMode, clean.c.inc), so
+# the throwaway PGDATA is whatever mode the live one had when the backup was taken. The
+# pgbackrest shim models that. The pg_ctl shim refuses to start like checkDataDir() does
+# (miscinit.c: FATAL when the mode has group-write or any other-bits) and models
+# `pg_ctl status` as "not running" once it has refused.
+val_shim_dir=$(mktemp -d)
+awk '/^  validate.sh: \|$/{f=1;next} f && /^  [^ ]/{exit} f{sub(/^    /,""); print}' <<< "${pgbr_script}" \
+  | sed "s#^WORK=/work\$#WORK=${val_shim_dir}/work#" > "${val_shim_dir}/validate.sh"
+assert_contains_literal "pgdata mode shim: the work dir is redirected to the scratch dir" "$(cat "${val_shim_dir}/validate.sh")" "WORK=${val_shim_dir}/work"
+cat > "${val_shim_dir}/pgbackrest" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *" restore")
+    printf "port = 5432\ninclude_dir = '/etc/postgresql/conf.d'\n" > "${PGDATA}/postgresql.conf"
+    printf 'host all all all scram-sha-256\n' > "${PGDATA}/pg_hba.conf"
+    chmod "${SHIM_MANIFEST_MODE}" "${PGDATA}" ;;
+  *) echo "shim: unexpected pgbackrest $*" >&2; exit 99 ;;
+esac
+SHIM
+cat > "${val_shim_dir}/pg_ctl" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *" start")
+    perms=$(ls -ld "${PGDATA}" | cut -c1-10)
+    if [ -n "${SHIM_START_FAIL}" ] || [ "${perms:5:1}" != "-" ] || [ "${perms:7:3}" != "---" ]; then
+      echo "FATAL:  data directory \"${PGDATA}\" has invalid permissions (${perms})" >> "${PGDATA}/startup.log"
+      exit 1
+    fi
+    touch "${SHIM_STATE}/running" ;;
+  *" status") [ -e "${SHIM_STATE}/running" ] || exit 3 ;;
+  *" stop") rm -f "${SHIM_STATE}/running" ;;
+  *) echo "shim: unexpected pg_ctl $*" >&2; exit 99 ;;
+esac
+SHIM
+printf '#!/bin/bash\nexit 1\n' > "${val_shim_dir}/pg_controldata"
+cat > "${val_shim_dir}/psql" <<'SHIM'
+#!/bin/bash
+case "$*" in
+  *"pg_is_in_recovery"*) echo "f" ;;
+  *"FROM pg_class"*) echo "3|10" ;;
+  *) echo "shim: unexpected psql $*" >&2; exit 99 ;;
+esac
+SHIM
+chmod +x "${val_shim_dir}/pgbackrest" "${val_shim_dir}/pg_ctl" "${val_shim_dir}/pg_controldata" "${val_shim_dir}/psql"
+val_run() { # val_run <manifest-mode> [start-fail] -> sets val_rc, val_out
+  rm -rf "${val_shim_dir}/work" "${val_shim_dir}/state"; mkdir -p "${val_shim_dir}/state"
+  val_out=$(PATH="${val_shim_dir}:${PATH}" SHIM_MANIFEST_MODE="$1" SHIM_START_FAIL="${2:-}" SHIM_STATE="${val_shim_dir}/state" \
+    PGBACKREST_STANZA=db POSTGRES_USER=postgres POSTGRES_DB=postgres \
+    PGDATA="${val_shim_dir}/work/pgdata" PGBACKREST_PG1_PATH="${val_shim_dir}/work/pgdata" \
+    PGBACKREST_LOG_PATH="${val_shim_dir}/work/log" PGBACKREST_LOCK_PATH="${val_shim_dir}/work/lock" \
+    RECOVERY_TIMEOUT=1800 TARGET_TYPE="" TARGET="" \
+    bash "${val_shim_dir}/validate.sh" 2>&1) && val_rc=0 || val_rc=$?
+}
+# A manifest recording a group-writable PGDATA (what the kubelet's fsGroup pass leaves on a
+# directory: g+rwx plus setgid) must still start: the script owns the data directory mode.
+val_run 2770
+assert_eq "pgdata mode shim: a group-writable restored PGDATA is reset and the drill passes" "0" "${val_rc}"
+assert_contains "pgdata mode shim: ... and reaches the validation query" "${val_out}" "Restore OK"
+assert_eq "pgdata mode shim: ... with PGDATA at 0700 when postgres starts" "drwx------" "$(ls -ld "${val_shim_dir}/work/pgdata" | cut -c1-10)"
+val_run 0755
+assert_eq "pgdata mode shim: a world-readable restored PGDATA is reset too" "0" "${val_rc}"
+val_run 0700
+assert_eq "pgdata mode shim: a 0700 restored PGDATA still passes" "0" "${val_rc}"
+# A postmaster that exits during startup fails the Job at once, saying so, not claiming a
+# recoveryTimeout it never waited (the shim exits 3 from status; the loop must not sleep).
+SECONDS=0
+val_run 0700 yes
+assert_eq "pgdata mode shim: a postmaster that exits during startup fails the drill" "1" "${val_rc}"
+assert_contains "pgdata mode shim: ... reporting that it exited" "${val_out}" "exited before it promoted"
+assert_not_contains "pgdata mode shim: ... not a recoveryTimeout it never waited" "${val_out}" "did not promote within"
+assert_contains "pgdata mode shim: ... and printing the server log" "${val_out}" "has invalid permissions"
+assert_eq "pgdata mode shim: ... without sleeping out the poll" "1" "$(( SECONDS < 5 ? 1 : 0 ))"
+rm -rf "${val_shim_dir}"
+
 # targetType set without target is rejected by the template fail guard (a schema if/then
 # is not portable to helm 3.x). bogus targetType is rejected by the values.schema.json enum.
 pgbr_val_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time 2>&1 || true)
