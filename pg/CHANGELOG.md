@@ -1,5 +1,22 @@
 # pg chart changelog
 
+## Unreleased
+
+### Fixed
+
+- **A controlled switchover lands on the pod you named, on any number of members (#389).**
+  Before, the primary cleared `pg-ha/switchover-target` and released the lease, and every
+  standby then contended for it, so with three or more members the switchover often promoted
+  a standby other than the one requested. Now the primary first writes
+  `pg-ha/switchover-handoff=<target>@<time>` on the marker and keeps serving. Every other member
+  stops contending, and three reconcile intervals later (15s on defaults) the primary steps down
+  as before. The write outage is unchanged. The stamp expires on its own (50s on defaults), so
+  a target that dies mid-handoff delays the next failover by at most that, and the new primary
+  removes it once it serves. While the stamp names it, a target that won the lease waits for a
+  peer reporting more WAL to settle rather than releasing to a peer that cannot take the lease.
+- **The pg-ha image moves to 2.5.1** (`ha.image.tag` and `etcd.rbac.bootstrapImage.tag`:
+  `2.5.1-pg18`), which carries the fix.
+
 ## 2.7.0 - 2026-11-07
 
 ### Added
