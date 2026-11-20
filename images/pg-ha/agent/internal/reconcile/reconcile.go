@@ -201,6 +201,17 @@ type Observation struct {
 	// mid-stream and closes on the next tick; a gap that does not close is honoured once the
 	// stamp expires, by the ordinary hand-off below.
 	HandoffToLocal bool
+	// HandoffToOther: a fresh handoff stamp names another node (#389), so this node is out of
+	// the election. A holder that is not serving -- one that won the lease before it read the
+	// stamp (a long clone or rewind, a reused marker) -- releases it at once rather than
+	// keeping it, whatever else it was about to do: the target cannot take a lease this node
+	// holds, and nobody else may.
+	HandoffToOther bool
+	// SwitchoverStamped: the serving primary has stamped a fresh handoff for SwitchoverTarget
+	// (#389). The catch-up check started the handoff; past it, a target that is a reachable
+	// same-timeline standby keeps it going even when one sample shows it a few bytes behind
+	// under write load. The graceful demote then flushes the rest before the lease is freed.
+	SwitchoverStamped bool
 	// LocalProcessAlive is process liveness of the agent's supervised postmaster
 	// (alive, distinct from Local.Running which is SQL reachability). A postmaster
 	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
@@ -290,6 +301,13 @@ func Decide(o Observation) Decision {
 	}
 	if o.Paused {
 		return d(NoOp, "", "paused: automatic failover suspended (maintenance mode)")
+	}
+	// A holder parked by another member's handoff (#389) hands the lease on -- but only from a
+	// state where releasing cannot leave a writer behind: a confirmed standby, or nothing
+	// running at all. A postmaster that is up but not yet answering may still be coming up
+	// read-write, which the release paths never touch (see ReleaseLease in the agent).
+	if o.HoldLease && o.HandoffToOther && !o.LocalStuck && (!o.LocalProcessAlive && !o.Local.Running || o.Local.Running && o.Local.InRecovery) {
+		return d(ReleaseLease, "", "a switchover handoff names another member; this node is out of the election, so release the lease to the target (#389)")
 	}
 
 	// The agent's own postmaster is running but not yet accepting SQL connections:
@@ -887,7 +905,7 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 // peers exclude self, so it is never found.)
 func switchoverTargetReady(o Observation) string {
 	t := o.SwitchoverTarget
-	if t == "" || !o.Local.TimelineOK || !o.Local.LSNOK {
+	if t == "" || !o.Local.TimelineOK || (!o.Local.LSNOK && !o.SwitchoverStamped) {
 		return ""
 	}
 	for i := range o.Peers {
@@ -900,6 +918,9 @@ func switchoverTargetReady(o Observation) string {
 		}
 		if !p.TimelineOK || p.Timeline != o.Local.Timeline {
 			return "" // different timeline -> not a clean same-line handoff
+		}
+		if o.SwitchoverStamped {
+			return t // stamped once caught up (#389); the demote flushes what streams after
 		}
 		if !p.LSNOK || o.Local.LSN.Greater(p.LSN) {
 			return "" // target has not caught up to the primary's WAL position yet

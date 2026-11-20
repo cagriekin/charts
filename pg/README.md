@@ -869,16 +869,20 @@ The serving primary waits until that target is a **caught-up, same-timeline stan
 Once the target is ready, the handoff runs in two steps (#389):
 
 1. The primary writes `pg-ha/switchover-handoff=<target>@<time>` on the marker and keeps
-   serving. Every other member stops contending for the lease on its next tick.
-2. Three reconcile intervals later (15s on defaults), the primary clears the request (one-shot),
-   demotes gracefully (flushing WAL to the connected standbys) and releases the lease. Only the
-   target is contending, so the target promotes, on any number of pods. A member that was
-   still contending when the stamp landed and wins the lease anyway re-reads the marker before
-   promoting and releases the lease to the target instead.
+   serving, with its usual routing and slot upkeep. Every other member stops contending for
+   the lease on its next tick. The primary itself keeps contending until it has demoted.
+2. Three reconcile intervals after the stamp write returns (15s on defaults), the primary
+   clears the request (one-shot), demotes gracefully (flushing WAL to the connected standbys)
+   and releases the lease. A target that briefly reads a few bytes behind under write load
+   does not hold this up once the stamp is down. Only the target is contending, so the target
+   promotes, on any number of pods. A member that was still contending when the stamp landed
+   (in a long clone or rewind, say) and wins the lease anyway releases it to the target on its
+   next tick instead of promoting or keeping it.
 
 The write outage is the same as before; the first step only adds the wait before it. The
 handoff stamp is written by the agent, never by you, and expires after the settle, the
-step-down slot, `renewDeadline` and `leaseDuration` (50s on defaults). If the target dies
+step-down slot, `renewDeadline` and `leaseDuration` (50s on defaults); a stamp dated more
+than one reconcile interval in the future is ignored. If the target dies
 inside that window, the other members wait out the rest of it before a normal failover. The new
 primary removes the stamp once it serves; cancelling the request with
 `pg-ha/switchover-target-` removes it too.

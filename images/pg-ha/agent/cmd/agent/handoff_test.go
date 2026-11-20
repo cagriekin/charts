@@ -33,6 +33,7 @@ func handoffTestAgent(t *testing.T, self string, anns map[string]string) (*agent
 		Data:       map[string]string{"primary": "pg-0", "timeline": "1"},
 	})
 	a.kube = k8s.NewWithClient(cs, "ns")
+	a.prober = execProber(&slotExec{})
 	return a, pm, d, cs
 }
 
@@ -72,6 +73,7 @@ func TestHandoffExcludes(t *testing.T) {
 		{"the old primary parks too", k8s.Handoff{Target: "pg-1", Start: t0.Add(-30 * time.Second), OK: true, Present: true}, "pg-0", true},
 		{"expired", k8s.Handoff{Target: "pg-1", Start: t0.Add(-50 * time.Second), OK: true, Present: true}, "pg-2", false},
 		{"slightly ahead (clock skew)", k8s.Handoff{Target: "pg-1", Start: t0.Add(2 * time.Second), OK: true, Present: true}, "pg-2", true},
+		{"ahead by more than the skew allowance", k8s.Handoff{Target: "pg-1", Start: t0.Add(10 * time.Second), OK: true, Present: true}, "pg-2", false},
 		{"far future (not an agent's)", k8s.Handoff{Target: "pg-1", Start: t0.Add(time.Hour), OK: true, Present: true}, "pg-2", false},
 		{"unparseable", k8s.Handoff{Present: true}, "pg-2", false},
 	} {
@@ -114,10 +116,10 @@ func TestSwitchoverStepsDownOnceSettled(t *testing.T) {
 	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true}, SwitchoverTarget: "pg-1"}
 	dec := reconcile.Decision{Action: reconcile.Switchover, Target: "pg-1"}
 
+	// The settling tick runs the primary's upkeep; its routing write fails on this fake
+	// cluster (no Services), which is beside the point here.
 	a.handoffNow = func() time.Time { return t0.Add(10 * time.Second) }
-	if err := a.act(context.Background(), dec, obs); err != nil {
-		t.Fatal(err)
-	}
+	_ = a.act(context.Background(), dec, obs)
 	if pm.stopped || d.released {
 		t.Fatal("must not step down while the other members may still contend")
 	}
@@ -215,14 +217,14 @@ func TestInitialCandidacyParksForAHandoff(t *testing.T) {
 	}
 }
 
-// #389 review: a non-target that was already contending when the stamp landed can still win
-// the Lease the primary frees. The promote re-reads the marker and hands the Lease on instead.
+// #389 review: a tick that reused lastMarker re-reads it before promoting. A fresh stamp
+// naming another pod hands the lease on; a failed re-read holds off only when the last good
+// read showed a switchover in progress, so an apiserver outage never stalls a failover.
 func TestPromoteHandoffGuard(t *testing.T) {
 	stamp := map[string]string{k8s.SwitchoverHandoffAnnotation: k8s.FormatHandoff("pg-1", t0.Add(-16*time.Second))}
-	t.Run("a non-target releases instead of promoting, despite a stale cached view", func(t *testing.T) {
+	t.Run("a non-target behind a reused marker releases instead of promoting", func(t *testing.T) {
 		a, _, d, _ := handoffTestAgent(t, "pg-2", stamp)
 		a.handoffNow = func() time.Time { return t0 }
-		a.markerReadThisTick = true
 		if a.promoteHandoffAllows(context.Background()) {
 			t.Fatal("pg-2 must not promote past a fresh handoff to pg-1")
 		}
@@ -239,7 +241,6 @@ func TestPromoteHandoffGuard(t *testing.T) {
 	t.Run("the target promotes", func(t *testing.T) {
 		a, _, d, _ := handoffTestAgent(t, "pg-1", stamp)
 		a.handoffNow = func() time.Time { return t0 }
-		a.markerReadThisTick = true
 		if !a.promoteHandoffAllows(context.Background()) || d.released {
 			t.Fatal("the named target must promote")
 		}
@@ -247,9 +248,17 @@ func TestPromoteHandoffGuard(t *testing.T) {
 	t.Run("an expired stamp blocks nobody", func(t *testing.T) {
 		a, _, _, _ := handoffTestAgent(t, "pg-2", stamp)
 		a.handoffNow = func() time.Time { return t0.Add(time.Minute) }
-		a.markerReadThisTick = true
 		if !a.promoteHandoffAllows(context.Background()) {
 			t.Fatal("an expired handoff must not block a failover")
+		}
+	})
+	t.Run("a tick that read the marker itself is not re-read", func(t *testing.T) {
+		a, _, _, cs := handoffTestAgent(t, "pg-2", stamp)
+		a.handoffNow = func() time.Time { return t0 }
+		a.markerReadThisTick = true
+		cs.ClearActions()
+		if !a.promoteHandoffAllows(context.Background()) || len(cs.Actions()) != 0 {
+			t.Fatalf("Decide already saw this tick's marker; want no re-read, got %d calls", len(cs.Actions()))
 		}
 	})
 	failReads := func(cs *k8sfake.Clientset) {
@@ -257,26 +266,22 @@ func TestPromoteHandoffGuard(t *testing.T) {
 			return true, nil, context.DeadlineExceeded
 		})
 	}
-	t.Run("a failed re-read behind a reused marker holds off", func(t *testing.T) {
+	t.Run("a failed re-read with no switchover on record promotes", func(t *testing.T) {
 		a, _, d, cs := handoffTestAgent(t, "pg-2", nil)
 		a.handoffNow = func() time.Time { return t0 }
+		a.lastMarker, a.lastMarkerOK = k8s.Marker{Present: true, Primary: "pg-0"}, true
 		failReads(cs)
-		a.markerReadThisTick = false
-		if a.promoteHandoffAllows(context.Background()) || d.released {
-			t.Fatal("with no fresh marker this tick the promote waits, keeping the Lease")
+		if !a.promoteHandoffAllows(context.Background()) || d.released {
+			t.Fatal("an apiserver outage must not stall an ordinary failover")
 		}
 	})
-	t.Run("a failed re-read after a fresh observe trusts this tick's copy", func(t *testing.T) {
-		a, _, _, cs := handoffTestAgent(t, "pg-2", nil)
+	t.Run("a failed re-read with a switchover on record holds off", func(t *testing.T) {
+		a, _, d, cs := handoffTestAgent(t, "pg-2", nil)
 		a.handoffNow = func() time.Time { return t0 }
+		a.lastMarker, a.lastMarkerOK = k8s.Marker{Present: true, Primary: "pg-0", SwitchoverTarget: "pg-1"}, true
 		failReads(cs)
-		a.markerReadThisTick = true
-		if !a.promoteHandoffAllows(context.Background()) {
-			t.Fatal("no stamp in this tick's fresh read: promote")
-		}
-		a.handoff = k8s.ParseHandoff(stamp[k8s.SwitchoverHandoffAnnotation])
-		if a.promoteHandoffAllows(context.Background()) {
-			t.Fatal("a fresh stamp in this tick's read still blocks a non-target")
+		if a.promoteHandoffAllows(context.Background()) || d.released {
+			t.Fatal("with a switchover on record the promote waits a tick, keeping the lease")
 		}
 	})
 }
@@ -292,5 +297,62 @@ func TestActPromoteRechecksTheLeaseAfterTheHandoffRead(t *testing.T) {
 	}
 	if a.servingRW.Load() {
 		t.Fatal("a node that lost the lease during the handoff re-read must not arm the read-write latch")
+	}
+}
+
+// #389 review: the settle counts from when this node's stamp write returned, so a slow write
+// does not shorten it; the step-down slot's end stays on the stamp's own time.
+func TestHandoffSettleCountsFromTheWrite(t *testing.T) {
+	a, _, _, _ := handoffTestAgent(t, "pg-0", nil)
+	h := k8s.Handoff{Target: "pg-1", Start: t0, OK: true, Present: true}
+	a.handoff, a.handoffWrote, a.handoffWroteAt = h, h, t0.Add(4*time.Second)
+	for _, c := range []struct {
+		at   time.Duration
+		want handoffStep
+	}{
+		{16 * time.Second, handoffSettling},
+		{19 * time.Second, handoffStepDown},
+		{25 * time.Second, handoffStepDown},
+		{26 * time.Second, handoffStamp},
+	} {
+		a.handoffNow = func() time.Time { return t0.Add(c.at) }
+		if got := a.handoffPhase("pg-1"); got != c.want {
+			t.Errorf("at +%v: phase %v, want %v", c.at, got, c.want)
+		}
+	}
+	a.handoffWrote = k8s.Handoff{}
+	a.handoffNow = func() time.Time { return t0.Add(16 * time.Second) }
+	if got := a.handoffPhase("pg-1"); got != handoffStepDown {
+		t.Errorf("a stamp this process did not write settles from its own time: phase %v", got)
+	}
+}
+
+// #389 review: stamping records the write, so the same tick's upkeep and the next tick see it.
+func TestSwitchoverStampRecordsTheWrite(t *testing.T) {
+	a, _, _, _ := handoffTestAgent(t, "pg-0", map[string]string{k8s.SwitchoverTargetAnnotation: "pg-1"})
+	a.handoffNow = func() time.Time { return t0 }
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true}, SwitchoverTarget: "pg-1"}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Switchover, Target: "pg-1"}, obs); err != nil {
+		t.Fatal(err)
+	}
+	if a.handoff.Target != "pg-1" || !a.handoff.Start.Equal(t0) || a.handoffWrote != a.handoff || !a.handoffWroteAt.Equal(t0) {
+		t.Fatalf("handoff=%+v wrote=%+v at %v", a.handoff, a.handoffWrote, a.handoffWroteAt)
+	}
+}
+
+// #389 review: the serving primary keeps contending through its own handoff; once demoted it
+// parks like every other non-target.
+func TestServingPrimaryContendsThroughItsHandoff(t *testing.T) {
+	a, _, _, _ := handoffTestAgent(t, "pg-0", nil)
+	a.handoffNow = func() time.Time { return t0 }
+	a.handoff = k8s.Handoff{Target: "pg-1", Start: t0.Add(-5 * time.Second), OK: true, Present: true}
+	o := reconcile.Observation{LocalNode: "pg-0"}
+	a.servingRW.Store(true)
+	if !a.contends(o) {
+		t.Fatal("the serving primary must keep contending while its handoff settles")
+	}
+	a.servingRW.Store(false)
+	if a.contends(o) {
+		t.Fatal("a demoted primary parks for the rest of the handoff")
 	}
 }
