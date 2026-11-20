@@ -13,6 +13,12 @@
   the install leaves them anywhere else. Images already published are not affected; the fix
   matters for the next image build.
 
+### Changed
+
+- **The pg-ha image builds the agent with Go 1.26.11**, fixing GO-2026-6859 (net/http
+  MaxBytesReader header race), which `govulncheck` reports in the agent's dependency graph.
+  No behaviour change.
+
 ## 2.7.0 - 2026-11-07
 
 ### Added

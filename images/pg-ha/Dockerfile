@@ -1,10 +1,11 @@
 # --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
-# Digest-pinned (manifest-list digest, multi-arch). go1.26.10 carries the patched
-# stdlib the agent links: crypto/x509 (GO-2026-6809, reachable from the TLS verification
-# the logging and etcd paths do) on top of 1.26.9's net/http, net/textproto, crypto/tls and
+# Digest-pinned (manifest-list digest, multi-arch). go1.26.11 carries the patched
+# stdlib the agent links: net/http (GO-2026-6859, MaxBytesReader header race) on top of
+# 1.26.10's crypto/x509 (GO-2026-6809, reachable from the TLS verification the logging and
+# etcd paths do) and 1.26.9's net/http, net/textproto, crypto/tls and
 # html/template fixes (GO-2026-6599..6617); 1.25 has no fixed release.
-# Refresh with: docker buildx imagetools inspect golang:1.26.10-bookworm
-FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS agent-build
+# Refresh with: docker buildx imagetools inspect golang:1.26.11-bookworm
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS agent-build
 ARG TARGETARCH
 # The digest pin above is only binding while THIS toolchain is the one that builds. With
 # GOPROXY=off gone (#333), Go's default GOTOOLCHAIN=auto would silently download and run a
