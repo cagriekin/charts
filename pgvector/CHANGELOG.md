@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## Unreleased
+
+### Fixed
+
+- **The pg-ha image pins the `postgres` user to uid 101 / gid 103.** The chart runs as
+  `runAsUser: 101` with `fsGroup: 103` and chowns PGDATA to `101:103`, but the image left the
+  account to the Debian `postgresql-common` package. That package now creates it through
+  `systemd-sysusers`, which allocated uid/gid 994, so a fresh build failed in every pod with
+  `initdb: could not look up effective user ID 101: user does not exist`. The Dockerfile now
+  creates the group and user explicitly before installing PostgreSQL, and the build fails if
+  the install leaves them anywhere else. Images already published are not affected; the fix
+  matters for the next image build.
+
+### Changed
+
+- **The pg-ha image builds the agent with Go 1.26.11**, fixing GO-2026-6859 (net/http
+  MaxBytesReader header race), which `govulncheck` reports in the agent's dependency graph.
+  No behaviour change.
+
 ## 2.7.0 - 2026-11-07
 
 ### Added

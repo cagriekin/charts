@@ -1,10 +1,11 @@
 # --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
-# Digest-pinned (manifest-list digest, multi-arch). go1.26.10 carries the patched
-# stdlib the agent links: crypto/x509 (GO-2026-6809, reachable from the TLS verification
-# the logging and etcd paths do) on top of 1.26.9's net/http, net/textproto, crypto/tls and
+# Digest-pinned (manifest-list digest, multi-arch). go1.26.11 carries the patched
+# stdlib the agent links: net/http (GO-2026-6859, MaxBytesReader header race) on top of
+# 1.26.10's crypto/x509 (GO-2026-6809, reachable from the TLS verification the logging and
+# etcd paths do) and 1.26.9's net/http, net/textproto, crypto/tls and
 # html/template fixes (GO-2026-6599..6617); 1.25 has no fixed release.
-# Refresh with: docker buildx imagetools inspect golang:1.26.10-bookworm
-FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:632dff7351799a5a9954a48dc06670ade72ee44e8c351cdc0e5a57af2fea21af AS agent-build
+# Refresh with: docker buildx imagetools inspect golang:1.26.11-bookworm
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS agent-build
 ARG TARGETARCH
 # The digest pin above is only binding while THIS toolchain is the one that builds. With
 # GOPROXY=off gone (#333), Go's default GOTOOLCHAIN=auto would silently download and run a
@@ -63,6 +64,20 @@ RUN curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.or
 
 RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
 
+# The postgres uid/gid are a contract with the chart, not an apt detail: pg/values.yaml pins
+# runAsUser 101 / fsGroup 103 and the StatefulSet chowns PGDATA to a literal 101:103. They used
+# to fall out of the install order, until postgresql-common started creating the account through
+# systemd-sysusers (297.pgdg13+1 does), which allocated 994, and initdb then failed in every pod
+# with "could not look up effective user ID 101". So create the account here, before the
+# PostgreSQL packages: systemd-sysusers does nothing for a user or group that already exists
+# (sysusers.d(5), "Idempotence"), and still adds the ssl-cert membership its config asks for.
+# useradd/groupadd refuse an id already in use, so a package that ever claims 101 or 103 in an
+# earlier layer fails the build here instead of shifting the account.
+RUN groupadd --system --gid 103 postgres && \
+    useradd --system --uid 101 --gid 103 --no-create-home \
+      --home-dir /var/lib/postgresql --shell /bin/bash \
+      --comment "PostgreSQL administrator" postgres
+
 # Install PostgreSQL for PG_MAJOR. postgresql-<major>-pgaudit ships the
 # pgaudit extension used by the chart's opt-in compliance audit logging (#219); it is
 # inert unless the chart adds it to shared_preload_libraries, so it costs nothing when
@@ -86,6 +101,10 @@ RUN apt-get update && \
     postgresql-${PG_MAJOR}-pgaudit \
     pgbackrest \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail the build if the install moved the account the chart depends on (see above).
+RUN test "$(id -u postgres)" = 101 || { echo "FATAL: postgres uid is $(id -u postgres), the chart requires 101" >&2; exit 1; }; \
+    test "$(id -g postgres)" = 103 || { echo "FATAL: postgres gid is $(id -g postgres), the chart requires 103" >&2; exit 1; }
 
 # Publish the major to the runtime: pg-common.sh derives PG_BINDIR from it for the shell
 # entrypoint, and the Go agent reads it to locate postgres/pg_controldata. Both fall back to
