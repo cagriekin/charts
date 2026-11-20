@@ -63,6 +63,20 @@ RUN curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.or
 
 RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
 
+# The postgres uid/gid are a contract with the chart, not an apt detail: pg/values.yaml pins
+# runAsUser 101 / fsGroup 103 and the StatefulSet chowns PGDATA to a literal 101:103. They used
+# to fall out of the install order, until postgresql-common started creating the account through
+# systemd-sysusers (297.pgdg13+1 does), which allocated 994, and initdb then failed in every pod
+# with "could not look up effective user ID 101". So create the account here, before the
+# PostgreSQL packages: systemd-sysusers does nothing for a user or group that already exists
+# (sysusers.d(5), "Idempotence"), and still adds the ssl-cert membership its config asks for.
+# useradd/groupadd refuse an id already in use, so a package that ever claims 101 or 103 in an
+# earlier layer fails the build here instead of shifting the account.
+RUN groupadd --system --gid 103 postgres && \
+    useradd --system --uid 101 --gid 103 --no-create-home \
+      --home-dir /var/lib/postgresql --shell /bin/bash \
+      --comment "PostgreSQL administrator" postgres
+
 # Install PostgreSQL for PG_MAJOR. postgresql-<major>-pgaudit ships the
 # pgaudit extension used by the chart's opt-in compliance audit logging (#219); it is
 # inert unless the chart adds it to shared_preload_libraries, so it costs nothing when
@@ -86,6 +100,10 @@ RUN apt-get update && \
     postgresql-${PG_MAJOR}-pgaudit \
     pgbackrest \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail the build if the install moved the account the chart depends on (see above).
+RUN test "$(id -u postgres)" = 101 || { echo "FATAL: postgres uid is $(id -u postgres), the chart requires 101" >&2; exit 1; }; \
+    test "$(id -g postgres)" = 103 || { echo "FATAL: postgres gid is $(id -g postgres), the chart requires 103" >&2; exit 1; }
 
 # Publish the major to the runtime: pg-common.sh derives PG_BINDIR from it for the shell
 # entrypoint, and the Go agent reads it to locate postgres/pg_controldata. Both fall back to
