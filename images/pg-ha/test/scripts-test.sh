@@ -157,6 +157,36 @@ else
   bad "#269: Dockerfile does not assert per-major package availability"
 fi
 
+# --- the postgres account is pinned to 101:103 before the PostgreSQL packages install ---
+# The chart chowns PGDATA to a literal 101:103 and runs as runAsUser 101. postgresql-common
+# creates the account through systemd-sysusers, which picks a free id from the top of the
+# system range (994 on trixie) unless the account already exists -- so the Dockerfile has to
+# create it first, and fail the build if the install still moved it. image-smoke.sh checks the
+# built result; this catches the pin being dropped or reordered without a build.
+df_code=$(grep -vE '^[[:space:]]*#' "${ROOT}/Dockerfile")
+line_of() { printf '%s\n' "$df_code" | grep -nE "$1" | head -1 | cut -d: -f1; }
+l_group=$(line_of 'groupadd --system --gid 103 postgres')
+l_user=$(line_of 'useradd --system --uid 101 --gid 103 ')
+l_install_pg=$(line_of '^[[:space:]]*postgresql-\$\{PG_MAJOR\} \\$')
+l_assert_uid=$(line_of 'test "\$\(id -u postgres\)" = 101')
+l_assert_gid=$(line_of 'test "\$\(id -g postgres\)" = 103')
+if [ -n "$l_group" ] && [ -n "$l_user" ] && [ -n "$l_install_pg" ] \
+   && [ "$l_group" -lt "$l_install_pg" ] && [ "$l_user" -lt "$l_install_pg" ]; then
+  ok "Dockerfile creates postgres as uid 101 / gid 103 before installing PostgreSQL"
+else
+  bad "Dockerfile does not create postgres as uid 101 / gid 103 before the PostgreSQL install" \
+    "group=${l_group:-none} user=${l_user:-none} install=${l_install_pg:-none} (line numbers, comments stripped)"
+fi
+if [ -n "$l_assert_uid" ] && [ -n "$l_assert_gid" ] && [ -n "$l_install_pg" ] \
+   && [ "$l_assert_uid" -gt "$l_install_pg" ] && [ "$l_assert_gid" -gt "$l_install_pg" ]; then
+  ok "Dockerfile fails the build if the install leaves postgres off 101:103"
+else
+  bad "Dockerfile does not assert postgres is 101:103 after the PostgreSQL install" \
+    "uid-assert=${l_assert_uid:-none} gid-assert=${l_assert_gid:-none} install=${l_install_pg:-none}"
+fi
+unset df_code l_group l_user l_install_pg l_assert_uid l_assert_gid
+unset -f line_of
+
 # --- #288: initdb has exactly ONE call site, and native must not reach it inline ---
 # The regression this guards: the init container does not clone, so an inline initdb on any
 # empty PGDATA means every pod creates its own cluster with its own
