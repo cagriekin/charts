@@ -280,3 +280,17 @@ func TestPromoteHandoffGuard(t *testing.T) {
 		}
 	})
 }
+
+// #389 review: a lease lost during the handoff re-read must stop the promote before the
+// read-write latch is armed.
+func TestActPromoteRechecksTheLeaseAfterTheHandoffRead(t *testing.T) {
+	a, _, d, _ := handoffTestAgent(t, "pg-1", nil)
+	d.leaderSeq = []bool{true, false}
+	a.markerReadThisTick = true
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Promote}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a node that lost the lease during the handoff re-read must not arm the read-write latch")
+	}
+}

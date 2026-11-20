@@ -1673,8 +1673,8 @@ func TestActPromoteDoesNotClaimRoutingAfterLosingTheLease(t *testing.T) {
 		},
 		base:   "pg",
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{leaderSeq: []bool{true, false}}, // held at the pre-promote check, lapsed during pg_ctl promote
-		mech:   &rewindStubMech{},                        // Promote succeeds
+		dcs:    &fakeDCS{leaderSeq: []bool{true, true, false}}, // held at both pre-promote checks, lapsed during pg_ctl promote
+		mech:   &rewindStubMech{},                              // Promote succeeds
 		prober: execProber(&slotExec{}),
 		sup:    process.NewSupervisor(&fakePostmaster{running: true}),
 		kube:   k8s.NewWithClient(cs, "ns"),

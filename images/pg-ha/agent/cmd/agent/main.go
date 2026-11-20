@@ -1887,6 +1887,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if !a.promoteHandoffAllows(ctx) {
 			return nil
 		}
+		// The handoff re-read above is an apiserver call under the fence budget, and opMu is
+		// held, so a lease lost during it has already run OnLost's no-fence branch (#298).
+		if !a.dcs.IsLeader() {
+			a.log.Warn("lease lost while re-reading the handoff marker; not promoting (#389)", "node", a.cfg.PodName)
+			return nil
+		}
 		a.servingRW.Store(true)
 		if err := a.beatDuring(func() error { return a.mech.Promote(ctx) }); err != nil {
 			return err

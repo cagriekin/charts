@@ -864,7 +864,7 @@ To hand the primary role to a specific standby on purpose (e.g. to move the prim
 kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/switchover-target=<release>-pg-1 --overwrite
 ```
 
-The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8). If the target is lagging or unreachable, the primary keeps serving and retries; it does not start the handoff onto a behind standby. Writes committed after that check reach the target through asynchronous replication, and the graceful demote flushes them before the lease is released. If the primary fails before the step-down, it is an ordinary failover, and writes the target never received can be lost.
+The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8). If the target is lagging or unreachable, the primary keeps serving and retries; it does not start the handoff onto a behind standby. Writes committed after that check reach the target through asynchronous replication. The graceful demote flushes them to the standbys connected to the primary before the lease is released; with `ha.agent.cascadingReplication` on, the target may be following another standby, and this flush does not guarantee the target has received them. If the primary fails before the step-down, it is an ordinary failover, and writes the target never received can be lost.
 
 Once the target is ready, the handoff runs in two steps (#389):
 
