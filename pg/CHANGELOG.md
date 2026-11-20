@@ -12,6 +12,13 @@
   creates the group and user explicitly before installing PostgreSQL, and the build fails if
   the install leaves them anywhere else. Images already published are not affected; the fix
   matters for the next image build.
+- **The pgBackRest restore drill starts its throwaway PostgreSQL with a 0700 data directory.**
+  `pgbackrest restore` sets the restored directory to the mode the backup manifest recorded for
+  the live PGDATA. A backup taken while that directory carried group-write (the kubelet's
+  `fsGroup` bits) restored a directory PostgreSQL refuses ("data directory ... has invalid
+  permissions"), and the validation Job failed. The script now logs the restored mode and sets
+  the directory to 0700 before `pg_ctl start`. A postmaster that exits during startup is now
+  reported as an exit; the message no longer claims it waited out `recoveryTimeout`.
 
 ### Changed
 

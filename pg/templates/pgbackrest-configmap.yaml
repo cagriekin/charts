@@ -84,6 +84,16 @@ data:
       pgbackrest --stanza="$PGBACKREST_STANZA" restore
     fi
 
+    # pgbackrest restore chmods the data directory to the mode its backup manifest recorded
+    # for the live PGDATA (restoreCleanMode in src/command/restore/clean.c.inc), so a backup
+    # taken while the live directory carried the kubelet's fsGroup bits (g+rwx, setgid)
+    # restores a directory postgres refuses: checkDataDir() FATALs on group-write or any
+    # other-bits. The throwaway is owned by this script alone, so it sets the mode itself.
+    # Five digits: GNU chmod keeps a directory's setgid bit (inherited from the fsGroup
+    # emptyDir) under a four-digit mode and clears it only under five.
+    echo "Restored PGDATA mode: $(ls -ld "$PGDATA" | cut -c1-10); setting 0700"
+    chmod 00700 "$PGDATA"
+
     # The restored postgresql.conf is the live cluster's. The chart appends
     # `include_dir = '/etc/postgresql/conf.d'` to PGDATA (statefulset setup-config),
     # captured in the base backup -- but this Job has no conf.d (a ConfigMap mount on
@@ -181,12 +191,13 @@ data:
     # so a startup failure fails the Job in seconds instead of hanging the full timeout.
     echo "Waiting for WAL replay to finish and the instance to promote..."
     promoted=""
+    exited=""
     poll_interval=5
     poll_iters=$(( (RECOVERY_TIMEOUT + poll_interval - 1) / poll_interval ))
     rec=""
     for _ in $(seq 1 "$poll_iters"); do
       if ! pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
-        echo "ERROR: the throwaway postmaster is not running (it exited during startup/recovery)" >&2
+        exited="yes"
         break
       fi
       rec=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]') || rec=""
@@ -194,7 +205,11 @@ data:
       sleep "$poll_interval"
     done
     if [ -z "$promoted" ]; then
-      echo "ERROR: recovery did not promote within ${RECOVERY_TIMEOUT}s (pg_is_in_recovery=${rec:-unreadable})" >&2
+      if [ -n "$exited" ]; then
+        echo "ERROR: the throwaway postmaster exited before it promoted (pg_is_in_recovery=${rec:-unreadable}); see its log below" >&2
+      else
+        echo "ERROR: recovery did not promote within ${RECOVERY_TIMEOUT}s (pg_is_in_recovery=${rec:-unreadable})" >&2
+      fi
       echo "----- throwaway postgres startup log -----" >&2
       cat "$PGDATA/startup.log" >&2 2>/dev/null || true
       for f in "$PGDATA"/log/*; do [ -f "$f" ] && { echo "----- $f -----" >&2; cat "$f" >&2; }; done 2>/dev/null || true
