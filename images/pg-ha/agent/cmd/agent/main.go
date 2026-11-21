@@ -2292,6 +2292,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			// marker) rather than skipping three or more ticks of it.
 			return a.servePrimaryTick(ctx, obs)
 		case handoffStamp:
+			if obs.SwitchoverStamped {
+				// Decide passed the target on the stamped handoff's lag slack, but the stamp has
+				// aged past the step-down slot since observe(). A new handoff starts from the
+				// catch-up check like the first, which the next tick applies (#389).
+				return a.servePrimaryTick(ctx, obs)
+			}
 			start := a.handoffClock()
 			hctx, hcancel := context.WithTimeout(ctx, a.fenceBudget())
 			herr := a.kube.SetSwitchoverHandoff(hctx, a.cfg.MarkerName, dec.Target, start)
@@ -4141,8 +4147,9 @@ func (a *agent) servePrimaryTick(ctx context.Context, obs reconcile.Observation)
 // could have been freed under: the primary stamps, waits the settle, and only then
 // releases, while HoldLease is sampled before the marker read. That leaves a tick that
 // reused lastMarker after a failed read: it re-reads here. If that fails too, it holds off
-// only when the last good read showed a switchover in progress -- requested, or a stamp
-// still fresh and naming another member -- and otherwise promotes, so an apiserver outage
+// only when the last good read showed a switchover in progress to another member --
+// requested, or a stamp still fresh and naming it -- and otherwise promotes, so the named
+// target is not stalled by the request it is completing, and an apiserver outage
 // under the etcd backend never stalls an ordinary failover (an expired or unparseable stamp
 // a primary never got to remove gates nobody here either).
 func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
@@ -4153,7 +4160,8 @@ func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
 	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
 	cancel()
 	if err != nil {
-		if a.lastMarker.SwitchoverTarget != "" || a.handoffExcludes(a.cfg.PodName) {
+		requestedElsewhere := a.lastMarker.SwitchoverTarget != "" && a.lastMarker.SwitchoverTarget != a.cfg.PodName
+		if requestedElsewhere || a.handoffExcludes(a.cfg.PodName) {
 			a.log.Warn("could not re-read the marker before promoting, and the last good read showed a switchover in progress; not promoting this tick (#389)", "err", err)
 			return false
 		}

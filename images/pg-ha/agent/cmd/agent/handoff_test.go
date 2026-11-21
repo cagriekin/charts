@@ -165,6 +165,26 @@ func TestSwitchoverRestampsAStaleOrForeignStamp(t *testing.T) {
 	}
 }
 
+// A stamp that aged past the step-down slot between observe() and act() is not restamped on
+// the lag slack Decide applied to it: the next tick re-runs the strict catch-up check.
+func TestSwitchoverDoesNotRestampOnTheStampedSlack(t *testing.T) {
+	stale := k8s.Handoff{Target: "pg-1", Start: t0.Add(-40 * time.Second), OK: true, Present: true}
+	a, pm, d, cs := handoffTestAgent(t, "pg-0", map[string]string{
+		k8s.SwitchoverTargetAnnotation:  "pg-1",
+		k8s.SwitchoverHandoffAnnotation: k8s.FormatHandoff(stale.Target, stale.Start),
+	})
+	a.handoff = stale
+	a.handoffNow = func() time.Time { return t0 }
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true}, SwitchoverTarget: "pg-1", SwitchoverStamped: true}
+	_ = a.act(context.Background(), reconcile.Decision{Action: reconcile.Switchover, Target: "pg-1"}, obs)
+	if pm.stopped || d.released {
+		t.Fatal("must not step down on a stamp past its slot")
+	}
+	if v, _ := markerAnn(t, cs, k8s.SwitchoverHandoffAnnotation); v != k8s.FormatHandoff(stale.Target, stale.Start) {
+		t.Fatalf("restamped on the slack: %q", v)
+	}
+}
+
 // The serving primary retires a stamp whose handoff is over, and keeps one it is still
 // working on.
 func TestRetireHandoff(t *testing.T) {
@@ -282,6 +302,15 @@ func TestPromoteHandoffGuard(t *testing.T) {
 		failReads(cs)
 		if a.promoteHandoffAllows(context.Background()) || d.released {
 			t.Fatal("with a switchover on record the promote waits a tick, keeping the lease")
+		}
+	})
+	t.Run("a failed re-read does not hold off the target the request names", func(t *testing.T) {
+		a, _, d, cs := handoffTestAgent(t, "pg-1", nil)
+		a.handoffNow = func() time.Time { return t0 }
+		a.lastMarker, a.lastMarkerOK = k8s.Marker{Present: true, Primary: "pg-0", SwitchoverTarget: "pg-1"}, true
+		failReads(cs)
+		if !a.promoteHandoffAllows(context.Background()) || d.released {
+			t.Fatal("the named target must promote: the request on record is the one it is completing")
 		}
 	})
 	t.Run("a failed re-read holds off for a fresh stamp but not an expired one", func(t *testing.T) {
