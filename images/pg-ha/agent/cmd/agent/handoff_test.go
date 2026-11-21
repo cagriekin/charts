@@ -16,7 +16,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
 
-// Chart-default timing: settle 15s, window 50s.
+// Chart-default timing: settle 15s, step-down slot 20s, window 60s.
 func handoffTestAgent(t *testing.T, self string, anns map[string]string) (*agent, *fakePostmaster, *fakeDCS, *k8sfake.Clientset) {
 	t.Helper()
 	pm := &fakePostmaster{}
@@ -51,8 +51,8 @@ var t0 = time.Unix(1_700_000_000, 0)
 
 func TestHandoffWindowOnChartDefaults(t *testing.T) {
 	a, _, _, _ := handoffTestAgent(t, "pg-0", nil)
-	if a.handoffSettle() != 15*time.Second || a.handoffWindow() != 50*time.Second {
-		t.Fatalf("settle=%v window=%v, want 15s/50s", a.handoffSettle(), a.handoffWindow())
+	if a.handoffSettle() != 15*time.Second || a.handoffStepDownSlot() != 20*time.Second || a.handoffWindow() != 60*time.Second {
+		t.Fatalf("settle=%v slot=%v window=%v, want 15s/20s/60s", a.handoffSettle(), a.handoffStepDownSlot(), a.handoffWindow())
 	}
 }
 
@@ -71,7 +71,7 @@ func TestHandoffExcludes(t *testing.T) {
 		{"the target contends", k8s.Handoff{Target: "pg-1", Start: t0, OK: true, Present: true}, "pg-1", false},
 		{"another member parks", k8s.Handoff{Target: "pg-1", Start: t0.Add(-10 * time.Second), OK: true, Present: true}, "pg-2", true},
 		{"the old primary parks too", k8s.Handoff{Target: "pg-1", Start: t0.Add(-30 * time.Second), OK: true, Present: true}, "pg-0", true},
-		{"expired", k8s.Handoff{Target: "pg-1", Start: t0.Add(-50 * time.Second), OK: true, Present: true}, "pg-2", false},
+		{"expired", k8s.Handoff{Target: "pg-1", Start: t0.Add(-60 * time.Second), OK: true, Present: true}, "pg-2", false},
 		{"slightly ahead (clock skew)", k8s.Handoff{Target: "pg-1", Start: t0.Add(2 * time.Second), OK: true, Present: true}, "pg-2", true},
 		{"ahead by more than the skew allowance", k8s.Handoff{Target: "pg-1", Start: t0.Add(10 * time.Second), OK: true, Present: true}, "pg-2", false},
 		{"far future (not an agent's)", k8s.Handoff{Target: "pg-1", Start: t0.Add(time.Hour), OK: true, Present: true}, "pg-2", false},
@@ -284,6 +284,22 @@ func TestPromoteHandoffGuard(t *testing.T) {
 			t.Fatal("with a switchover on record the promote waits a tick, keeping the lease")
 		}
 	})
+	t.Run("a failed re-read holds off for a fresh stamp but not an expired one", func(t *testing.T) {
+		h := k8s.ParseHandoff(stamp[k8s.SwitchoverHandoffAnnotation])
+		for _, tc := range []struct {
+			now  time.Time
+			want bool
+		}{{t0, false}, {t0.Add(time.Minute), true}} {
+			a, _, _, cs := handoffTestAgent(t, "pg-2", nil)
+			a.handoffNow = func() time.Time { return tc.now }
+			a.lastMarker, a.lastMarkerOK = k8s.Marker{Present: true, Primary: "pg-0", Handoff: h}, true
+			a.handoff = h
+			failReads(cs)
+			if got := a.promoteHandoffAllows(context.Background()); got != tc.want {
+				t.Fatalf("now=%v: promote allowed=%v, want %v", tc.now, got, tc.want)
+			}
+		}
+	})
 }
 
 // #389 review: a lease lost during the handoff re-read must stop the promote before the
@@ -312,8 +328,8 @@ func TestHandoffSettleCountsFromTheWrite(t *testing.T) {
 	}{
 		{16 * time.Second, handoffSettling},
 		{19 * time.Second, handoffStepDown},
-		{25 * time.Second, handoffStepDown},
-		{26 * time.Second, handoffStamp},
+		{35 * time.Second, handoffStepDown},
+		{36 * time.Second, handoffStamp},
 	} {
 		a.handoffNow = func() time.Time { return t0.Add(c.at) }
 		if got := a.handoffPhase("pg-1"); got != c.want {
@@ -324,6 +340,29 @@ func TestHandoffSettleCountsFromTheWrite(t *testing.T) {
 	a.handoffNow = func() time.Time { return t0.Add(16 * time.Second) }
 	if got := a.handoffPhase("pg-1"); got != handoffStepDown {
 		t.Errorf("a stamp this process did not write settles from its own time: phase %v", got)
+	}
+}
+
+// #389 review: at any sustained tick spacing the agent survives (up to the /healthz
+// staleness bound of three intervals) and any stamp write within its budget, some call lands
+// in the step-down interval before the slot ends -- the switchover never restamps forever.
+func TestHandoffStepDownReachableAtAnyTickSpacing(t *testing.T) {
+	a, _, _, _ := handoffTestAgent(t, "pg-0", nil)
+	h := k8s.Handoff{Target: "pg-1", Start: t0, OK: true, Present: true}
+	for w := time.Duration(0); w <= a.fenceBudget(); w += 250 * time.Millisecond {
+		for s := max(w, 250*time.Millisecond); s <= 3*a.cfg.ReconcileInterval; s += 250 * time.Millisecond {
+			a.handoff, a.handoffWrote, a.handoffWroteAt = h, h, t0.Add(w)
+			reached := false
+			for at := s; !reached; at += s {
+				a.handoffNow = func() time.Time { return t0.Add(at) }
+				switch a.handoffPhase("pg-1") {
+				case handoffStepDown:
+					reached = true
+				case handoffStamp:
+					t.Fatalf("write %v, spacing %v: call at +%v restamps without a step-down", w, s, at)
+				}
+			}
+		}
 	}
 }
 

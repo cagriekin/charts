@@ -10,7 +10,7 @@
   a standby other than the one requested. Now the primary first writes
   `pg-ha/switchover-handoff=<target>@<time>` on the marker and keeps serving. Every other member
   stops contending, and three reconcile intervals later (15s on defaults) the primary steps down
-  as before. The write outage is unchanged. The stamp expires on its own (50s on defaults), so
+  as before. The write outage is unchanged. The stamp expires on its own (60s on defaults), so
   a target that dies mid-handoff delays the next failover by at most that, and the new primary
   removes it once it serves. While the stamp names it, a target that won the lease waits for a
   peer reporting more WAL to settle rather than releasing to a peer that cannot take the lease.

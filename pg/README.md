@@ -881,7 +881,7 @@ Once the target is ready, the handoff runs in two steps (#389):
 
 The write outage is the same as before; the first step only adds the wait before it. The
 handoff stamp is written by the agent, never by you, and expires after the settle, the
-step-down slot, `renewDeadline` and `leaseDuration` (50s on defaults); a stamp dated more
+step-down slot, `renewDeadline` and `leaseDuration` (60s on defaults); a stamp dated more
 than one reconcile interval in the future is ignored. If the target dies
 inside that window, the other members wait out the rest of it before a normal failover. The new
 primary removes the stamp once it serves; cancelling the request with

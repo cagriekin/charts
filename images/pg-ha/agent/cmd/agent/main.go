@@ -1443,12 +1443,18 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// all: no tags is a guess there, not an observation.
 	if !o.MarkerUnreadable {
 		a.logMemberTags(m)
-		a.handoff = m.Handoff
+		// Only from a read made this tick: on a failed read lastMarker can predate this
+		// node's own stamp write, and adopting it would restart the settle.
+		if a.markerReadThisTick {
+			a.handoff = m.Handoff
+		}
 		a.dcs.SetCandidate(a.contends(o))
 	}
 	o.HandoffToLocal = a.handoffFresh() && a.handoff.Target == a.cfg.PodName
 	o.HandoffToOther = a.handoffExcludes(a.cfg.PodName)
-	o.SwitchoverStamped = o.SwitchoverTarget != "" && a.handoffFresh() && a.handoff.Target == o.SwitchoverTarget
+	// Only while the stamp can still be stepped down on: one handoffPhase would restamp is a
+	// new handoff, and a new handoff starts from the catch-up check like the first.
+	o.SwitchoverStamped = o.SwitchoverTarget != "" && a.handoffPhase(o.SwitchoverTarget) != handoffStamp
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover. Suppressed while
@@ -4019,16 +4025,24 @@ func (a *agent) handoffSettle() time.Duration { return 3 * a.cfg.ReconcileInterv
 // the primary's next tick has to land in (handoffStepDownSlot), then the bounded demote (RenewDeadline) and
 // a full LeaseDuration for the target to acquire the freed Lease. A target that died in
 // the window holds the election up for this long at most; on chart defaults (5s interval,
-// 15s lease, 10s renew) 50s.
+// 15s lease, 10s renew) 60s.
 func (a *agent) handoffWindow() time.Duration {
 	return a.handoffSettle() + a.handoffStepDownSlot() + a.cfg.RenewDeadline + a.cfg.LeaseDuration
 }
 
 // handoffStepDownSlot is how late past the settle the primary may still step down on its
-// stamp. Two intervals, not one: ticks are an interval apart but jitter, and with a one-
-// interval slot a tick landing just before the settle and the next just after the slot
-// would restamp forever.
-func (a *agent) handoffStepDownSlot() time.Duration { return 2 * a.cfg.ReconcileInterval }
+// stamp. The settle counts from when the stamp write returned (at most fenceBudget after the
+// stamp's own time), the slot's end from the stamp's own time, so the step-down interval is
+// the slot minus the write's duration wide. It must be at least as wide as the spacing
+// between two primary ticks, or calls can straddle it -- one still settling, the next past
+// the slot -- and restamp on every round, so the switchover never lands (#389 review: a
+// sustained 9s spacing with a 4s write did exactly that on a 2-interval slot). Ticks start
+// at most three intervals apart, the /healthz staleness bound that also sizes the settle, so
+// three intervals plus the longest write keeps one call inside it at any spacing the agent
+// survives.
+func (a *agent) handoffStepDownSlot() time.Duration {
+	return 3*a.cfg.ReconcileInterval + a.fenceBudget()
+}
 
 func (a *agent) handoffClock() time.Time {
 	if a.handoffNow != nil {
@@ -4127,9 +4141,10 @@ func (a *agent) servePrimaryTick(ctx context.Context, obs reconcile.Observation)
 // could have been freed under: the primary stamps, waits the settle, and only then
 // releases, while HoldLease is sampled before the marker read. That leaves a tick that
 // reused lastMarker after a failed read: it re-reads here. If that fails too, it holds off
-// only when the last good read showed a switchover in progress -- requested or stamped --
-// and otherwise promotes, so an apiserver outage under the etcd backend never stalls an
-// ordinary failover.
+// only when the last good read showed a switchover in progress -- requested, or a stamp
+// still fresh and naming another member -- and otherwise promotes, so an apiserver outage
+// under the etcd backend never stalls an ordinary failover (an expired or unparseable stamp
+// a primary never got to remove gates nobody here either).
 func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
 	if a.markerReadThisTick {
 		return true
@@ -4138,7 +4153,7 @@ func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
 	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
 	cancel()
 	if err != nil {
-		if a.lastMarker.SwitchoverTarget != "" || a.lastMarker.Handoff.Present {
+		if a.lastMarker.SwitchoverTarget != "" || a.handoffExcludes(a.cfg.PodName) {
 			a.log.Warn("could not re-read the marker before promoting, and the last good read showed a switchover in progress; not promoting this tick (#389)", "err", err)
 			return false
 		}

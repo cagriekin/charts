@@ -306,7 +306,11 @@ func Decide(o Observation) Decision {
 	// state where releasing cannot leave a writer behind: a confirmed standby, or nothing
 	// running at all. A postmaster that is up but not yet answering may still be coming up
 	// read-write, which the release paths never touch (see ReleaseLease in the agent).
-	if o.HoldLease && o.HandoffToOther && !o.LocalStuck && (!o.LocalProcessAlive && !o.Local.Running || o.Local.Running && o.Local.InRecovery) {
+	// Not the recorded primary's own stopped primary-state data either: that is the handing-
+	// off primary whose postmaster went down mid-settle, and it resumes (StartLocal) rather
+	// than hand the lease to a target missing the WAL it never streamed.
+	recordedPrimaryData := o.Local.HasData && !o.Local.InRecovery && o.Marker.Primary != "" && o.Marker.Primary == o.LocalNode
+	if o.HoldLease && o.HandoffToOther && !o.LocalStuck && !recordedPrimaryData && (!o.LocalProcessAlive && !o.Local.Running || o.Local.Running && o.Local.InRecovery) {
 		return d(ReleaseLease, "", "a switchover handoff names another member; this node is out of the election, so release the lease to the target (#389)")
 	}
 
@@ -895,6 +899,12 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 	return false
 }
 
+// StampedHandoffLagSlack is how far behind a target may read once its handoff is stamped
+// (#389): one WAL segment. Enough for the few bytes a busy primary is ahead between two
+// samples, so the handoff does not stall under write load; not enough to cover a target
+// whose walreceiver broke after the stamp, which the graceful demote's flush would miss.
+const StampedHandoffLagSlack = 16 << 20
+
 // switchoverTargetReady returns o.SwitchoverTarget when an operator has requested a
 // controlled handoff (Part H2) AND that target is safe to promote: a DIFFERENT pod
 // that is a reachable (SQL-confirmed, not gossip), same-timeline standby caught up
@@ -905,7 +915,7 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 // peers exclude self, so it is never found.)
 func switchoverTargetReady(o Observation) string {
 	t := o.SwitchoverTarget
-	if t == "" || !o.Local.TimelineOK || (!o.Local.LSNOK && !o.SwitchoverStamped) {
+	if t == "" || !o.Local.TimelineOK || !o.Local.LSNOK {
 		return ""
 	}
 	for i := range o.Peers {
@@ -919,7 +929,7 @@ func switchoverTargetReady(o Observation) string {
 		if !p.TimelineOK || p.Timeline != o.Local.Timeline {
 			return "" // different timeline -> not a clean same-line handoff
 		}
-		if o.SwitchoverStamped {
+		if o.SwitchoverStamped && p.LSNOK && o.Local.LSNOK && o.Local.LSN.Uint64()-min(o.Local.LSN.Uint64(), p.LSN.Uint64()) <= StampedHandoffLagSlack {
 			return t // stamped once caught up (#389); the demote flushes what streams after
 		}
 		if !p.LSNOK || o.Local.LSN.Greater(p.LSN) {
