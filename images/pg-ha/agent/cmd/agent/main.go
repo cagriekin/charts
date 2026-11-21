@@ -4012,9 +4012,21 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 		Marker:     reconcile.MarkerState{Present: m.Present, Malformed: m.Malformed, Primary: m.Primary},
 	}
 	a.handoff = m.Handoff
-	if !reconcile.FailoverEligible(o, a.cfg.PodName) || a.handoffExcludes(a.cfg.PodName) {
+	if !reconcile.FailoverEligible(o, a.cfg.PodName) || a.handoffExcludes(a.cfg.PodName) && !a.resumesOwnHandoff(m.Primary, m.SwitchoverTarget) {
 		a.dcs.SetCandidate(false)
 	}
+}
+
+// resumesOwnHandoff reports whether this node is the primary the marker records, restarting
+// in the middle of its own handoff's settle (#389 review). The request still standing is the
+// proof it never stepped down: phase 2 clears the request before it demotes, and demotes
+// only on a successful clear. Such a node keeps contending, as the recorded primary does
+// through any boot (reconcile.FailoverEligible) -- parking it would hand the Lease to the
+// target, which promotes past it, and the rewind would discard the writes the target never
+// streamed, where resuming loses nothing. Once the request is cleared it parks like every
+// other non-target: a primary that stepped down must not take the Lease back from its target.
+func (a *agent) resumesOwnHandoff(recordedPrimary, request string) bool {
+	return recordedPrimary == a.cfg.PodName && request != "" && request == a.handoff.Target
 }
 
 // Switchover handoff timing (#389). All three derive from the agent's own timing config,
@@ -4239,9 +4251,10 @@ func (a *agent) retireHandoff(ctx context.Context, obs reconcile.Observation) {
 // and out of the election while a handoff names another member (#389) -- except the serving
 // primary. Parking it would leave nobody able to take the lease back if it lapsed before
 // the step-down, with the target dead and every other member parked. It parks once it has
-// demoted.
+// demoted. The same primary restarted mid-settle is no longer serving but keeps contending
+// too (resumesOwnHandoff).
 func (a *agent) contends(o reconcile.Observation) bool {
-	return leadershipCandidate(o) && (a.servingRW.Load() || !a.handoffExcludes(a.cfg.PodName))
+	return leadershipCandidate(o) && (a.servingRW.Load() || !a.handoffExcludes(a.cfg.PodName) || a.resumesOwnHandoff(o.Marker.Primary, o.SwitchoverTarget))
 }
 
 // leadershipCandidate is the candidacy rule observe applies (#275): exactly

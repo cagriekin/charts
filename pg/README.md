@@ -877,7 +877,8 @@ Once the target is ready, the handoff runs in two steps (#389):
    does not hold this up once the stamp is down. Only the target is contending, so the target
    promotes, on any number of pods. A member that was still contending when the stamp landed
    (in a long clone or rewind, say) and wins the lease anyway releases it to the target on its
-   next tick instead of promoting or keeping it.
+   next tick instead of promoting or keeping it. If the primary itself restarts before it steps
+   down, it keeps contending and resumes as primary rather than being rewound under the target.
 
 The write outage is the same as before; the first step only adds the wait before it. The
 handoff stamp is written by the agent, never by you, and expires after the settle, the

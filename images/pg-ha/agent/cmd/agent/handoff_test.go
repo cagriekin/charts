@@ -210,18 +210,22 @@ func TestRetireHandoff(t *testing.T) {
 	}
 }
 
-// A member booting mid-handoff parks before its election starts, unless it is the target.
+// A member booting mid-handoff parks before its election starts, unless it is the target,
+// or the recorded primary restarting before it stepped down (the request still stands).
 func TestInitialCandidacyParksForAHandoff(t *testing.T) {
 	for _, c := range []struct {
 		self     string
+		request  string
 		wantPark bool
-	}{{"pg-2", true}, {"pg-1", false}} {
+	}{{"pg-2", "pg-1", true}, {"pg-1", "pg-1", false}, {"pg-0", "pg-1", false}, {"pg-0", "", true}} {
 		f := &fakeDCS{}
+		anns := map[string]string{k8s.SwitchoverHandoffAnnotation: k8s.FormatHandoff("pg-1", t0)}
+		if c.request != "" {
+			anns[k8s.SwitchoverTargetAnnotation] = c.request
+		}
 		cs := k8sfake.NewSimpleClientset(&corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: "ns", Annotations: map[string]string{
-				k8s.SwitchoverHandoffAnnotation: k8s.FormatHandoff("pg-1", t0),
-			}},
-			Data: map[string]string{"primary": "pg-0", "timeline": "1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: "ns", Annotations: anns},
+			Data:       map[string]string{"primary": "pg-0", "timeline": "1"},
 		})
 		a := &agent{
 			cfg: &config.Config{PodName: c.self, MarkerName: "pg-primary", ReconcileInterval: 5 * time.Second,
@@ -232,7 +236,7 @@ func TestInitialCandidacyParksForAHandoff(t *testing.T) {
 		}
 		a.initialCandidacy(context.Background())
 		if parked := f.candidacySet && !f.candidate; parked != c.wantPark {
-			t.Errorf("%s: parked=%v, want %v", c.self, parked, c.wantPark)
+			t.Errorf("%s (request %q): parked=%v, want %v", c.self, c.request, parked, c.wantPark)
 		}
 	}
 }
@@ -422,5 +426,17 @@ func TestServingPrimaryContendsThroughItsHandoff(t *testing.T) {
 	a.servingRW.Store(false)
 	if a.contends(o) {
 		t.Fatal("a demoted primary parks for the rest of the handoff")
+	}
+	o.Marker = reconcile.MarkerState{Present: true, Primary: "pg-0"}
+	if a.contends(o) {
+		t.Fatal("the recorded primary parks once the request is cleared: it stepped down")
+	}
+	o.SwitchoverTarget = "pg-1"
+	if !a.contends(o) {
+		t.Fatal("the recorded primary restarted mid-settle (request still standing) keeps contending to resume")
+	}
+	o.Marker.Primary = "pg-2"
+	if a.contends(o) {
+		t.Fatal("only the primary the marker records is exempt")
 	}
 }
