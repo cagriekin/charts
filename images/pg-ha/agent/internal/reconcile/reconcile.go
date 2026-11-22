@@ -192,6 +192,26 @@ type Observation struct {
 	// serving primary steps down for it only once the target is a caught-up,
 	// same-timeline standby (switchoverTargetReady) -- otherwise it keeps serving.
 	SwitchoverTarget string
+	// HandoffToLocal: a controlled switchover's handoff stamp names this node and is still
+	// fresh (#389), so every other member is parked out of the election. A lease-holding
+	// standby that sees a peer with more WAL then waits rather than releasing: the peer
+	// cannot take the lease until the stamp expires, so a release would only leave the
+	// cluster without a primary for the rest of the window. After a graceful demote both
+	// standbys end on the primary's shutdown checkpoint, so the gap is a measurement taken
+	// mid-stream and closes on the next tick; a gap that does not close is honoured once the
+	// stamp expires, by the ordinary hand-off below.
+	HandoffToLocal bool
+	// HandoffToOther: a fresh handoff stamp names another node (#389), so this node is out of
+	// the election. A holder that is not serving -- one that won the lease before it read the
+	// stamp (a long clone or rewind, a reused marker) -- releases it at once rather than
+	// keeping it, whatever else it was about to do: the target cannot take a lease this node
+	// holds, and nobody else may.
+	HandoffToOther bool
+	// SwitchoverStamped: the serving primary has stamped a fresh handoff for SwitchoverTarget
+	// (#389). The catch-up check started the handoff; past it, a target that is a reachable
+	// same-timeline standby keeps it going even when one sample shows it a few bytes behind
+	// under write load. The graceful demote then flushes the rest before the lease is freed.
+	SwitchoverStamped bool
 	// LocalProcessAlive is process liveness of the agent's supervised postmaster
 	// (alive, distinct from Local.Running which is SQL reachability). A postmaster
 	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
@@ -282,6 +302,17 @@ func Decide(o Observation) Decision {
 	if o.Paused {
 		return d(NoOp, "", "paused: automatic failover suspended (maintenance mode)")
 	}
+	// A holder parked by another member's handoff (#389) hands the lease on -- but only from a
+	// state where releasing cannot leave a writer behind: a confirmed standby, or nothing
+	// running at all. A postmaster that is up but not yet answering may still be coming up
+	// read-write, which the release paths never touch (see ReleaseLease in the agent).
+	// Not the recorded primary's own stopped primary-state data either: that is the handing-
+	// off primary whose postmaster went down mid-settle, and it resumes (StartLocal) rather
+	// than hand the lease to a target missing the WAL it never streamed.
+	recordedPrimaryData := o.Local.HasData && !o.Local.InRecovery && o.Marker.Primary != "" && o.Marker.Primary == o.LocalNode
+	if o.HoldLease && o.HandoffToOther && !o.LocalStuck && !recordedPrimaryData && (!o.LocalProcessAlive && !o.Local.Running || o.Local.Running && o.Local.InRecovery) {
+		return d(ReleaseLease, "", "a switchover handoff names another member; this node is out of the election, so release the lease to the target (#389)")
+	}
 
 	// The agent's own postmaster is running but not yet accepting SQL connections:
 	// the node is STARTING (e.g. a freshly-cloned standby replaying WAL to a
@@ -348,6 +379,9 @@ func Decide(o Observation) Decision {
 				return d(ReleaseLease, "", "refuse to promote: "+why)
 			}
 			if t, reachable := moreAdvancedPeer(o); t != "" {
+				if reachable && o.HandoffToLocal {
+					return d(Wait, "", "switchover handoff to this node: peer "+t+" reports more WAL, but it is parked until the handoff ends; wait for the positions to settle rather than leave the cluster without a primary (#389)")
+				}
 				if reachable {
 					// A live peer is ahead and can take over: hand off (invariant 8).
 					return d(ReleaseLease, t, "a reachable peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")
@@ -865,6 +899,12 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 	return false
 }
 
+// StampedHandoffLagSlack is how far behind a target may read once its handoff is stamped
+// (#389): one WAL segment. Enough for the few bytes a busy primary is ahead between two
+// samples, so the handoff does not stall under write load; not enough to cover a target
+// whose walreceiver broke after the stamp, which the graceful demote's flush would miss.
+const StampedHandoffLagSlack = 16 << 20
+
 // switchoverTargetReady returns o.SwitchoverTarget when an operator has requested a
 // controlled handoff (Part H2) AND that target is safe to promote: a DIFFERENT pod
 // that is a reachable (SQL-confirmed, not gossip), same-timeline standby caught up
@@ -888,6 +928,9 @@ func switchoverTargetReady(o Observation) string {
 		}
 		if !p.TimelineOK || p.Timeline != o.Local.Timeline {
 			return "" // different timeline -> not a clean same-line handoff
+		}
+		if o.SwitchoverStamped && p.LSNOK && o.Local.LSNOK && o.Local.LSN.Uint64()-min(o.Local.LSN.Uint64(), p.LSN.Uint64()) <= StampedHandoffLagSlack {
+			return t // stamped once caught up (#389); the demote flushes what streams after
 		}
 		if !p.LSNOK || o.Local.LSN.Greater(p.LSN) {
 			return "" // target has not caught up to the primary's WAL position yet

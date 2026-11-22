@@ -79,7 +79,14 @@ func TestDecide(t *testing.T) {
 		{"holder standby + newer primary peer -> rejoin forward", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{primary("pg-1", 6, 6, 0x10)}}, RejoinForward, "pg-1"},
 		{"holder standby below highwater -> release", Observation{HoldLease: true, Local: localStandby, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
 		{"holder standby but a peer has more WAL -> release/handoff", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+		{"holder standby named by a fresh switchover handoff, a parked peer reports more WAL -> wait, do not release (#389)", Observation{HoldLease: true, Local: localStandby, HandoffToLocal: true, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, Wait, ""},
 
+		{"holder standby parked by a handoff to another member -> release to it (#389)", Observation{HoldLease: true, Local: localStandby, HandoffToOther: true, Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}}, ReleaseLease, ""},
+		{"holder with nothing running, parked by a handoff to another member -> release (#389)", Observation{HoldLease: true, Local: dataStopped, HandoffToOther: true}, ReleaseLease, ""},
+		{"recorded primary whose postmaster stopped mid-handoff resumes rather than releasing (#389)", Observation{HoldLease: true, LocalNode: "pg-0", Local: dataStopped, HandoffToOther: true, Marker: MarkerState{Present: true, Primary: "pg-0", Timeline: tl(5)}}, StartLocal, ""},
+		{"holder whose postmaster is up but not answering, parked by a handoff -> no release (#389)", Observation{HoldLease: true, Local: dataStopped, LocalProcessAlive: true, HandoffToOther: true}, Wait, ""},
+		{"serving primary during its own handoff to another member keeps serving (#389)", Observation{HoldLease: true, Local: localPrimary, HandoffToOther: true, Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}}, StayPrimary, ""},
+		{"paused overrides the handoff release (#389)", Observation{Paused: true, HoldLease: true, Local: localStandby, HandoffToOther: true}, NoOp, ""},
 		{"holder primary current -> stay", Observation{HoldLease: true, Local: localPrimary, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
 		{"holder primary + malformed marker -> release", Observation{HoldLease: true, Local: localPrimary, Marker: MarkerState{Malformed: true}}, ReleaseLease, ""},
 
@@ -88,6 +95,11 @@ func TestDecide(t *testing.T) {
 		{"switchover: caught-up target -> switchover", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}}, Switchover, "pg-1"},
 		// target lagging (LSN < local) -> keep serving until it catches up (no data loss)
 		{"switchover: lagging target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
+		// stamped handoff (#389): a momentary lag under write load does not stall it
+		{"switchover: stamped, target a few bytes behind -> still switchover (#389)", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", SwitchoverStamped: true, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, Switchover, "pg-1"},
+		{"switchover: stamped, but the target is more than a WAL segment behind -> stay (#389)", Observation{HoldLease: true, Local: LocalState{HasData: true, Running: true, Timeline: tl(5), TimelineOK: true, LSN: ls(6, 0), LSNOK: true}, SwitchoverTarget: "pg-1", SwitchoverStamped: true, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
+		{"switchover: stamped, but the target left the timeline -> stay (#389)", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", SwitchoverStamped: true, Peers: []PeerState{standby("pg-1", 4, 5, 0x200)}}, StayPrimary, ""},
+		{"switchover: stamped, but the target is unreachable -> stay (#389)", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-2", SwitchoverStamped: true, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, StayPrimary, ""},
 		// target on a different timeline -> not a clean handoff
 		{"switchover: divergent-timeline target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 4, 5, 0x200)}}, StayPrimary, ""},
 		// target not a standby (a reachable non-recovery node) -> refuse

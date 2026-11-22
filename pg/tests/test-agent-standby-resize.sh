@@ -137,10 +137,8 @@ assert_eq "#386: a full backup succeeds on the raised primary" "0" "${full_rc}"
 assert_contains "#386: ... and ran in ${PRIMARY}" "$(kubectl logs -n "${NAMESPACE}" job/pgbr-full 2>/dev/null || true)" "Primary pod resolved to: ${PRIMARY}"
 
 # --- switchover: the new primary is raised, the old one lowered after it rejoins ---
-# Sizing is judged on whichever standby takes over. On three nodes the lease can go to the
-# standby that was NOT named: the primary clears the request and steps down, and every standby
-# then contends. That is the switchover's own behaviour, not this feature's, so it is left to
-# the switchover suites.
+# On three nodes the switchover must land on the standby that was named (#389): the primary
+# stamps a handoff, the other standby parks, and only the target contends for the lease.
 OLD_PRIMARY="${PRIMARY}"
 TARGET="${STANDBYS[0]}"
 echo "Switching over ${OLD_PRIMARY} -> ${TARGET}..."
@@ -152,7 +150,8 @@ while [[ ${elapsed} -lt ${FAILOVER_BUDGET} ]]; do
   sleep 3; elapsed=$((elapsed + 3))
 done
 assert_eq "#386: the switchover moves the primary off ${OLD_PRIMARY}" "yes" "$([[ -n "${NEW}" ]] && echo yes || echo no)"
-[[ "${NEW}" != "${TARGET}" && -n "${NEW}" ]] && echo "  NOTE: ${NEW} took the lease, not the requested ${TARGET}"
+assert_eq "#389: the switchover lands on the named standby" "${TARGET}" "${NEW}"
+[[ "${NEW}" == "${TARGET}" ]] || dump_switchover_diag "${OLD_PRIMARY} -> ${TARGET}, holder after ${FAILOVER_BUDGET}s: '${NEW}'"
 settle_roles 300 || true
 if [[ -n "${NEW}" ]]; then
   assert_sizes "#386: switchover: the new primary ${NEW} is raised" "${NEW}" "${PG_PRIMARY_MEM}" "${BR_PRIMARY_MEM}"
@@ -162,6 +161,58 @@ assert_eq "#386: switchover: the old primary rejoined as a standby" "t" "$(in_re
 assert_sizes "#386: switchover: the old primary ${OLD_PRIMARY} is lowered" "${OLD_PRIMARY}" "${PG_STANDBY_MEM}" "${BR_STANDBY_MEM}"
 for p in "${TARGET}" "${OLD_PRIMARY}"; do
   assert_eq "#386: switchover: no container of ${p} restarted across both resizes" "${RESTARTS[${p}]}" "$(restarts "${p}")"
+done
+
+# A missed #389 round leaves nothing behind once the namespace is torn down, and the cause
+# (the primary refusing the target vs. the target never taking the freed lease) is only in
+# the agents' own logs. Dump just what tells them apart, bounded so a CI log stays readable.
+dump_switchover_diag() {
+  echo "  --- #389 diagnostics: $1 ---"
+  echo "  lease holder: $(holder)"
+  echo "  minio restarts: $(kubectl get pods -n "${NAMESPACE}" -l app=minio -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo unknown)"
+  kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations}{"\n"}' 2>/dev/null | sed 's/^/  marker: /' || true
+  local p
+  for p in "${PODS[@]}"; do
+    echo "  ${p}: $(pg_exec "${NAMESPACE}" "${p}" "SELECT pg_is_in_recovery()::text || ' tli=' || (SELECT timeline_id FROM pg_control_checkpoint()) || ' replay=' || coalesce(pg_last_wal_replay_lsn()::text,'-') || ' receive=' || coalesce(pg_last_wal_receive_lsn()::text,'-') || ' current=' || CASE WHEN pg_is_in_recovery() THEN '-' ELSE pg_current_wal_lsn()::text END" "testuser" "testdb" 2>/dev/null || echo unreachable)"
+  done
+  for p in "${PODS[@]}"; do
+    echo "  --- ${p} agent log (switchover/handoff/lease/decide, last 3m) ---"
+    kubectl logs -n "${NAMESPACE}" "${p}" -c postgresql --since=3m 2>/dev/null \
+      | grep -iE 'switchover|handoff|lease|decid|promot|demot|release|timeline|candida' | tail -n 60 | sed 's/^/    /' || true
+  done
+}
+
+# --- #389: repeated switchovers on three nodes, each onto the named standby ---
+# Each round names the other standby than the last, so a lease that went to whichever standby
+# contended first would miss the target about half the time; three rounds all landing on the
+# named pod is what the handoff stamp buys.
+settle_roles 300 || true
+for round in 1 2 3; do
+  OLD_PRIMARY="${PRIMARY}"
+  TARGET="${STANDBYS[$(( round % 2 ))]}"
+  # The target must be a caught-up standby before the primary will hand over.
+  echo "#389 round ${round}: switching over ${OLD_PRIMARY} -> ${TARGET}..."
+  kubectl annotate configmap "${MARKER}" -n "${NAMESPACE}" pg-ha/switchover-target="${TARGET}" --overwrite >/dev/null
+  NEW=""; elapsed=0
+  while [[ ${elapsed} -lt ${FAILOVER_BUDGET} ]]; do
+    h=$(holder)
+    if [[ -n "${h}" && "${h}" != "${OLD_PRIMARY}" && "$(in_recovery "${h}")" == "f" ]]; then NEW="${h}"; break; fi
+    sleep 3; elapsed=$((elapsed + 3))
+  done
+  assert_eq "#389 round ${round}: the primary moves onto the named ${TARGET}" "${TARGET}" "${NEW}"
+  [[ "${NEW}" == "${TARGET}" ]] || dump_switchover_diag "round ${round}: ${OLD_PRIMARY} -> ${TARGET}, holder after ${FAILOVER_BUDGET}s: '${NEW}'"
+  settle_roles 300 || true
+  assert_eq "#389 round ${round}: ${TARGET} is the primary once roles settle" "${TARGET}" "${PRIMARY}"
+  handoff="unread"; e=0
+  while [[ ${e} -lt 60 ]]; do
+    if handoff=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-handoff}' 2>/dev/null); then
+      [[ -z "${handoff}" ]] && break
+    else
+      handoff="unread"
+    fi
+    sleep 3; e=$((e + 3))
+  done
+  assert_eq "#389 round ${round}: the new primary removes the handoff stamp" "" "${handoff}"
 done
 
 # --- failover: the promoted standby is raised, the recreated pod comes back small ---

@@ -310,9 +310,22 @@ type agent struct {
 	// paused and towards keeping the highwater armed, and it is re-read every tick.
 	lastMarker   k8s.Marker
 	lastMarkerOK bool
+	// markerReadThisTick is whether this tick's observe() read the marker itself rather than
+	// reusing lastMarker; the promote handoff guard trusts a.handoff only then (#389).
+	markerReadThisTick bool
 	// lastMemberTags is the member-tag state last logged (#275), so a change is logged once
 	// rather than every tick.
 	lastMemberTags string
+	// handoff is the marker's pg-ha/switchover-handoff as of the last readable marker
+	// (#389); zero (OK=false) when none. Reconcile goroutine only.
+	handoff k8s.Handoff
+	// handoffNow is the clock the handoff timing reads; nil = time.Now. Tests set it.
+	handoffNow func() time.Time
+	// handoffWrote is the stamp this node last wrote and handoffWroteAt when that write
+	// returned (#389). The settle counts from the moment the stamp was visible, not from the
+	// time inside it, so a slow apiserver write does not eat into the other members' ticks.
+	handoffWrote   k8s.Handoff
+	handoffWroteAt time.Time
 
 	// fenceGen counts COMPLETED demotes -- OnLost's fence and every planned step-down. It
 	// exists to sequence tick()'s servingRW derivation against them (#298 review).
@@ -1323,6 +1336,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// ABSENT marker is not this path: ReadMarker returns Marker{Present:false} with a
 		// nil error for NotFound, so deleting the ConfigMap (a documented recovery step)
 		// still reaches Decide as the real observation it is.
+		a.markerReadThisTick = false
 		if a.lastMarkerOK {
 			a.log.Warn("read marker failed; reusing the last successful read for this tick", "err", err)
 			m = a.lastMarker
@@ -1332,6 +1346,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 	} else {
 		a.lastMarker, a.lastMarkerOK = m, true
+		a.markerReadThisTick = true
 	}
 	if m.SchemaVersion > k8s.SchemaVersion {
 		// A newer agent (mid rolling-upgrade) wrote the marker. v1 fields are stable,
@@ -1428,8 +1443,18 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// all: no tags is a guess there, not an observation.
 	if !o.MarkerUnreadable {
 		a.logMemberTags(m)
-		a.dcs.SetCandidate(leadershipCandidate(o))
+		// Only from a read made this tick: on a failed read lastMarker can predate this
+		// node's own stamp write, and adopting it would restart the settle.
+		if a.markerReadThisTick {
+			a.handoff = m.Handoff
+		}
+		a.dcs.SetCandidate(a.contends(o))
 	}
+	o.HandoffToLocal = a.handoffFresh() && a.handoff.Target == a.cfg.PodName
+	o.HandoffToOther = a.handoffExcludes(a.cfg.PodName)
+	// Only while the stamp can still be stepped down on: one handoffPhase would restamp is a
+	// new handoff, and a new handoff starts from the catch-up check like the first.
+	o.SwitchoverStamped = o.SwitchoverTarget != "" && a.handoffPhase(o.SwitchoverTarget) != handoffStamp
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover. Suppressed while
@@ -1785,7 +1810,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	// new primary or been resolved outright. Retracting is a no-op on a node that never
 	// published any.
 	switch dec.Action {
-	case reconcile.Promote, reconcile.StayPrimary:
+	// Switchover too: the primary keeps serving through the handoff's settle (#389), and its
+	// step-down is followed by a non-primary tick that retracts these anyway.
+	case reconcile.Promote, reconcile.StayPrimary, reconcile.Switchover:
 	case reconcile.Follow:
 		a.lastTopologyGap = ""
 		// Follow keeps the SLOT gauges: standbySlotsTick re-publishes them from a standby's own
@@ -1870,6 +1897,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// reconcileInterval beside whichever peer took the lease. One atomic read closes it.
 		if !a.dcs.IsLeader() {
 			a.log.Warn("lease lost between observe and promote; not promoting (#298)", "node", a.cfg.PodName)
+			return nil
+		}
+		if !a.promoteHandoffAllows(ctx) {
+			return nil
+		}
+		// The handoff re-read above is an apiserver call under the fence budget, and opMu is
+		// held, so a lease lost during it has already run OnLost's no-fence branch (#298).
+		if !a.dcs.IsLeader() {
+			a.log.Warn("lease lost while re-reading the handoff marker; not promoting (#389)", "node", a.cfg.PodName)
 			return nil
 		}
 		a.servingRW.Store(true)
@@ -1961,62 +1997,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return routingErr
 
 	case reconcile.StayPrimary:
-		// The steady-state primary tick. A standby resolves its upstream from the lease
-		// holder's identity plus the headless FQDN, so there is no catalog to publish to
-		// and no registration step.
-		//
-		// The node is read-write here, so bound the marker + routing under one
-		// fence-budget context (see Promote): a hung apiserver write must not hold opMu
-		// past the soft-fence window and starve a lost-leadership fence.
-		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
-		defer cancel()
-		// A scale-down leaves no registry ghosts, but it does leave slot residue, and that
-		// is what this handles (#289): publish the slot gauges, create slots for
-		// expected standbys, and reclaim orphans a scale-down or a repmgr->native migration
-		// left pinning WAL. Bounded by the same fence-budget context -- a hung psql must not
-		// hold opMu past the soft-fence window -- and best-effort, resuming next tick.
-		//
-		// Under its OWN sub-budget, for the reason the Promote branch gives (#298 review):
-		// left on wctx a single slow query consumes the whole fence budget (5s on chart
-		// defaults) and the tick finishes WITHOUT advanceMarker and WITHOUT
-		// assertPrimaryRouting -- a write Service still pointing at the old pod. This branch
-		// carries MORE than Promote's on the same budget (a slot list, a pod LIST, up to
-		// NodeCount-1 creates each allowed 10s by Prober.Timeout, the drop pass, and #308's
-		// ALTER SYSTEM + reload), and it is the ONLY branch a restored primary ever takes --
-		// the documented scale-to-0 restore comes back through StartLocal -> StayPrimary and
-		// never through Promote, so its very first routing assertion happens here, on a tick
-		// whose slot pass has to create every peer slot from scratch.
-		var staySlots []pg.SlotState
-		var stayOwned []string
-		var staySlotsRead bool
-		func() {
-			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
-			defer scancel()
-			staySlots, stayOwned, staySlotsRead = a.slotsTick(sctx)
-		}()
-		// Keep the highwater marker at this primary's timeline (monotonic; written
-		// only when it advances, so steady-state ticks make no API write).
-		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		// THE path that expires a restore claim in practice (#288 review, round 4). The
-		// documented restore procedure is scale to 0, restore into the target ordinal's PVC,
-		// scale up -- and pgbackrest runs with --target-action=promote, so that pod comes back
-		// holding primary-state data. A lease-holding node with initialized, stopped data takes
-		// StartLocal ("lease holder, initialized but stopped") and StayPrimary forever after; it
-		// never passes through Promote at all. With the stamp only on the Promote branch a
-		// successful restore's claim never expired -- and a permanent claim VETOES every peer in
-		// moreAdvancedPeer, so months later this node promotes, or is handed the lease, over a
-		// reachable peer holding more WAL: invariant 8 violated and committed WAL discarded, with
-		// no restore anywhere in sight.
-		a.adoptRestoreIfServing(obs)
-		// The topology gauges are NOT published here. They were, and an extra query plus a pod
-		// LIST on this branch's already-contended fence budget could make a slow tick skip the
-		// marker write or the Service routing assertion above -- so topologyTick runs from
-		// tick(), outside opMu, once act() has returned (see its own comment).
-		routingErr := a.assertPrimaryRouting(wctx, obs)
-		// #308: keep synchronized_standby_slots current as standbys scale up/down. After the
-		// routing switch, not before -- same fence-budget priority as the Promote case.
-		a.assertSyncStandbySlots(wctx, staySlots, stayOwned, staySlotsRead)
-		return routingErr
+		return a.servePrimaryTick(ctx, obs)
 
 	case reconcile.Follow:
 		// #289 review: reclaim slots this node minted while it was the primary, and publish
@@ -2289,12 +2270,49 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 
 	case reconcile.Switchover:
 		// Controlled handoff (Part H2): the decision guard already confirmed the
-		// target is a caught-up, same-timeline standby. Clear the request FIRST so a
-		// later unrelated failover cannot re-trigger a handoff to the same pod; only
-		// on a successful clear do we step down (graceful/fast demote, THEN release
-		// the Lease). The target, being caught up, then wins the freed Lease and
-		// promotes. If the clear fails we do NOT step down -- the request persists,
-		// so the next tick retries.
+		// target is a caught-up, same-timeline standby. In two phases (#389):
+		//
+		//  1. Stamp pg-ha/switchover-handoff=<target>@<now> on the marker and keep serving.
+		//     Every other member withdraws from the election on its next tick
+		//     (handoffExcludes). The step-down waits handoffSettle for that: a Lease freed
+		//     while another standby still contends goes to whichever acquires first, which
+		//     on three members put the primary on the pod the operator did NOT name about
+		//     half the time. Nothing is down meanwhile -- this node still serves.
+		//  2. Once settled, clear the request (so a later unrelated failover cannot
+		//     re-trigger a handoff to the same pod), demote, release. Only the target
+		//     contends, so it takes the Lease. The stamp stays until the new primary
+		//     retires it, or it expires (handoffWindow) if the target never takes over.
+		//
+		// A stamp for another target, or one too old to leave the target its window,
+		// restarts phase 1: the gate would lapse before the target could acquire.
+		switch a.handoffPhase(dec.Target) {
+		case handoffSettling:
+			// Phase 1 in progress: the other members are still parking. This node is the
+			// serving primary for all of it, so it keeps the primary's upkeep (routing, slots,
+			// marker) rather than skipping three or more ticks of it.
+			return a.servePrimaryTick(ctx, obs)
+		case handoffStamp:
+			if obs.SwitchoverStamped {
+				// Decide passed the target on the stamped handoff's lag slack, but the stamp has
+				// aged past the step-down slot since observe(). A new handoff starts from the
+				// catch-up check like the first, which the next tick applies (#389).
+				return a.servePrimaryTick(ctx, obs)
+			}
+			start := a.handoffClock()
+			hctx, hcancel := context.WithTimeout(ctx, a.fenceBudget())
+			herr := a.kube.SetSwitchoverHandoff(hctx, a.cfg.MarkerName, dec.Target, start)
+			hcancel()
+			if herr != nil {
+				return herr
+			}
+			a.handoff = k8s.Handoff{Target: dec.Target, Start: start, OK: true, Present: true}
+			a.handoffWrote, a.handoffWroteAt = a.handoff, a.handoffClock()
+			a.log.Info("switchover: handoff stamped; stepping down once every other member has stopped contending for the lease (#389)", "target", dec.Target, "settle", a.handoffSettle().String())
+			return nil
+		}
+		// Clear the request FIRST; only on a successful clear do we step down
+		// (graceful/fast demote, THEN release the Lease). If the clear fails we do NOT
+		// step down -- the request persists, so the next tick retries.
 		//
 		// FENCE-BOUNDED, like every other apiserver call on this goroutine (#298 review).
 		// This node is a SERVING READ-WRITE primary here -- that is the precondition for a
@@ -3993,9 +4011,250 @@ func (a *agent) initialCandidacy(ctx context.Context) {
 		NoFailover: memberSet(m.NoFailover),
 		Marker:     reconcile.MarkerState{Present: m.Present, Malformed: m.Malformed, Primary: m.Primary},
 	}
-	if !reconcile.FailoverEligible(o, a.cfg.PodName) {
+	a.handoff = m.Handoff
+	if !reconcile.FailoverEligible(o, a.cfg.PodName) || a.handoffExcludes(a.cfg.PodName) && !a.resumesOwnHandoff(m.Primary, m.SwitchoverTarget) {
 		a.dcs.SetCandidate(false)
 	}
+}
+
+// resumesOwnHandoff reports whether this node is the primary the marker records, restarting
+// in the middle of its own handoff's settle (#389 review). The request still standing is the
+// proof it never stepped down: phase 2 clears the request before it demotes, and demotes
+// only on a successful clear. Such a node keeps contending, as the recorded primary does
+// through any boot (reconcile.FailoverEligible) -- parking it would hand the Lease to the
+// target, which promotes past it, and the rewind would discard the writes the target never
+// streamed, where resuming loses nothing. Once the request is cleared it parks like every
+// other non-target: a primary that stepped down must not take the Lease back from its target.
+func (a *agent) resumesOwnHandoff(recordedPrimary, request string) bool {
+	return recordedPrimary == a.cfg.PodName && request != "" && request == a.handoff.Target
+}
+
+// Switchover handoff timing (#389). All three derive from the agent's own timing config,
+// which the chart renders identically on every member, so no member needs another's view.
+//
+// handoffSettle is how long the primary keeps serving after stamping the handoff before it
+// steps down: every live member must have ticked at least once in between, read the stamp
+// and parked its election. Three reconcile intervals is the /healthz staleness bound -- an
+// agent whose tick takes longer is killed by its liveness probe, and a restarted one parks
+// from boot (initialCandidacy) -- so no contender survives it unparked.
+func (a *agent) handoffSettle() time.Duration { return 3 * a.cfg.ReconcileInterval }
+
+// handoffWindow is how long a stamp parks the other members: the settle, the phase-2 slot
+// the primary's next tick has to land in (handoffStepDownSlot), then the bounded demote (RenewDeadline) and
+// a full LeaseDuration for the target to acquire the freed Lease. A target that died in
+// the window holds the election up for this long at most; on chart defaults (5s interval,
+// 15s lease, 10s renew) 60s.
+func (a *agent) handoffWindow() time.Duration {
+	return a.handoffSettle() + a.handoffStepDownSlot() + a.cfg.RenewDeadline + a.cfg.LeaseDuration
+}
+
+// handoffStepDownSlot is how late past the settle the primary may still step down on its
+// stamp. The settle counts from when the stamp write returned (at most fenceBudget after the
+// stamp's own time), the slot's end from the stamp's own time, so the step-down interval is
+// the slot minus the write's duration wide. It must be at least as wide as the spacing
+// between two primary ticks, or calls can straddle it -- one still settling, the next past
+// the slot -- and restamp on every round, so the switchover never lands (#389 review: a
+// sustained 9s spacing with a 4s write did exactly that on a 2-interval slot). Ticks start
+// at most three intervals apart, the /healthz staleness bound that also sizes the settle, so
+// three intervals plus the longest write keeps one call inside it at any spacing the agent
+// survives.
+func (a *agent) handoffStepDownSlot() time.Duration {
+	return 3*a.cfg.ReconcileInterval + a.fenceBudget()
+}
+
+func (a *agent) handoffClock() time.Time {
+	if a.handoffNow != nil {
+		return a.handoffNow()
+	}
+	return time.Now()
+}
+
+// handoffExcludes reports whether a fresh handoff to another pod keeps node out of the
+// election (#389). Fresh means started within handoffWindow, or at most handoffSkew in the
+// future.
+func (a *agent) handoffExcludes(node string) bool {
+	return a.handoffFresh() && a.handoff.Target != node
+}
+
+// handoffFresh reports whether the marker carries a handoff stamp still inside its window.
+func (a *agent) handoffFresh() bool {
+	h := a.handoff
+	if !h.OK {
+		return false
+	}
+	age := a.handoffClock().Sub(h.Start)
+	return age > -a.handoffSkew() && age < a.handoffWindow()
+}
+
+// handoffSkew is how far in the future a stamp may be dated and still count: members'
+// clocks differ a little, but a stamp honoured a full window ahead would park the election
+// for twice the window the docs promise.
+func (a *agent) handoffSkew() time.Duration { return a.cfg.ReconcileInterval }
+
+// servePrimaryTick is the steady-state primary tick: StayPrimary, and every tick of a
+// switchover's settle (#389), when the primary is still the one serving.
+func (a *agent) servePrimaryTick(ctx context.Context, obs reconcile.Observation) error {
+	// The steady-state primary tick. A standby resolves its upstream from the lease
+	// holder's identity plus the headless FQDN, so there is no catalog to publish to
+	// and no registration step.
+	//
+	// The node is read-write here, so bound the marker + routing under one
+	// fence-budget context (see Promote): a hung apiserver write must not hold opMu
+	// past the soft-fence window and starve a lost-leadership fence.
+	wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer cancel()
+	// A scale-down leaves no registry ghosts, but it does leave slot residue, and that
+	// is what this handles (#289): publish the slot gauges, create slots for
+	// expected standbys, and reclaim orphans a scale-down or a repmgr->native migration
+	// left pinning WAL. Bounded by the same fence-budget context -- a hung psql must not
+	// hold opMu past the soft-fence window -- and best-effort, resuming next tick.
+	//
+	// Under its OWN sub-budget, for the reason the Promote branch gives (#298 review):
+	// left on wctx a single slow query consumes the whole fence budget (5s on chart
+	// defaults) and the tick finishes WITHOUT advanceMarker and WITHOUT
+	// assertPrimaryRouting -- a write Service still pointing at the old pod. This branch
+	// carries MORE than Promote's on the same budget (a slot list, a pod LIST, up to
+	// NodeCount-1 creates each allowed 10s by Prober.Timeout, the drop pass, and #308's
+	// ALTER SYSTEM + reload), and it is the ONLY branch a restored primary ever takes --
+	// the documented scale-to-0 restore comes back through StartLocal -> StayPrimary and
+	// never through Promote, so its very first routing assertion happens here, on a tick
+	// whose slot pass has to create every peer slot from scratch.
+	var staySlots []pg.SlotState
+	var stayOwned []string
+	var staySlotsRead bool
+	func() {
+		sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
+		defer scancel()
+		staySlots, stayOwned, staySlotsRead = a.slotsTick(sctx)
+	}()
+	// Keep the highwater marker at this primary's timeline (monotonic; written
+	// only when it advances, so steady-state ticks make no API write).
+	a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+	// THE path that expires a restore claim in practice (#288 review, round 4). The
+	// documented restore procedure is scale to 0, restore into the target ordinal's PVC,
+	// scale up -- and pgbackrest runs with --target-action=promote, so that pod comes back
+	// holding primary-state data. A lease-holding node with initialized, stopped data takes
+	// StartLocal ("lease holder, initialized but stopped") and StayPrimary forever after; it
+	// never passes through Promote at all. With the stamp only on the Promote branch a
+	// successful restore's claim never expired -- and a permanent claim VETOES every peer in
+	// moreAdvancedPeer, so months later this node promotes, or is handed the lease, over a
+	// reachable peer holding more WAL: invariant 8 violated and committed WAL discarded, with
+	// no restore anywhere in sight.
+	a.adoptRestoreIfServing(obs)
+	// The topology gauges are NOT published here. They were, and an extra query plus a pod
+	// LIST on this branch's already-contended fence budget could make a slow tick skip the
+	// marker write or the Service routing assertion above -- so topologyTick runs from
+	// tick(), outside opMu, once act() has returned (see its own comment).
+	routingErr := a.assertPrimaryRouting(wctx, obs)
+	// #308: keep synchronized_standby_slots current as standbys scale up/down. After the
+	// routing switch, not before -- same fence-budget priority as the Promote case.
+	a.assertSyncStandbySlots(wctx, staySlots, stayOwned, staySlotsRead)
+	a.retireHandoff(wctx, obs)
+	return routingErr
+}
+
+// promoteHandoffAllows is the switchover target enforced at the promote (#389). Decide
+// already releases instead of promoting when this tick's marker shows a handoff to another
+// member (HandoffToOther), and a tick that read the marker itself saw any stamp the lease
+// could have been freed under: the primary stamps, waits the settle, and only then
+// releases, while HoldLease is sampled before the marker read. That leaves a tick that
+// reused lastMarker after a failed read: it re-reads here. If that fails too, it holds off
+// only when the last good read showed a switchover in progress to another member --
+// requested, or a stamp still fresh and naming it -- and otherwise promotes, so the named
+// target is not stalled by the request it is completing, and an apiserver outage
+// under the etcd backend never stalls an ordinary failover (an expired or unparseable stamp
+// a primary never got to remove gates nobody here either).
+func (a *agent) promoteHandoffAllows(ctx context.Context) bool {
+	if a.markerReadThisTick {
+		return true
+	}
+	mctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
+	cancel()
+	if err != nil {
+		requestedElsewhere := a.lastMarker.SwitchoverTarget != "" && a.lastMarker.SwitchoverTarget != a.cfg.PodName
+		if requestedElsewhere || a.handoffExcludes(a.cfg.PodName) {
+			a.log.Warn("could not re-read the marker before promoting, and the last good read showed a switchover in progress; not promoting this tick (#389)", "err", err)
+			return false
+		}
+		return true
+	}
+	a.handoff = m.Handoff
+	if !a.handoffExcludes(a.cfg.PodName) {
+		return true
+	}
+	a.log.Info("switchover handoff names another member; releasing the lease to it instead of promoting (#389)", "node", a.cfg.PodName, "target", a.handoff.Target)
+	a.dcs.SetCandidate(false)
+	a.dcs.Release()
+	return false
+}
+
+// handoffStep is where the Switchover branch stands on the marker's stamp (#389).
+type handoffStep int
+
+const (
+	handoffStamp    handoffStep = iota // no usable stamp for this target: write one (phase 1)
+	handoffSettling                    // stamped, the other members are still parking
+	handoffStepDown                    // settled with the target's window intact: phase 2
+)
+
+// handoffPhase classifies the stamp for a switchover to target. A stamp for another pod, a
+// future-dated one, or one past the step-down slot (the request stalled -- the target fell
+// behind for a while -- so stepping down now would leave the target too little of the window)
+// is restamped rather than acted on.
+func (a *agent) handoffPhase(target string) handoffStep {
+	h := a.handoff
+	if !h.OK || h.Target != target {
+		return handoffStamp
+	}
+	now := a.handoffClock()
+	age := now.Sub(h.Start)
+	settled := age
+	if a.handoffWrote.Target == h.Target && a.handoffWrote.Start.Equal(h.Start) {
+		settled = now.Sub(a.handoffWroteAt)
+	}
+	switch {
+	case age < 0:
+		return handoffStamp
+	case age > a.handoffSettle()+a.handoffStepDownSlot():
+		// The upper bound stays on the stamp's own time: the members' window runs from it.
+		return handoffStamp
+	case settled < a.handoffSettle():
+		return handoffSettling
+	default:
+		return handoffStepDown
+	}
+}
+
+// retireHandoff removes a handoff stamp once a serving primary no longer needs it (#389):
+// the handoff is over (this node is its target, promoted, or the request was cancelled
+// or replaced). A stamp for the request this primary is still working on is left alone.
+// Best-effort: the stamp expires on its own, and until then it only parks the other members
+// in case this primary fails -- a delay of at most handoffWindow, never a wrong promote.
+func (a *agent) retireHandoff(ctx context.Context, obs reconcile.Observation) {
+	h := a.handoff
+	if !h.Present {
+		return
+	}
+	if h.OK && obs.SwitchoverTarget != "" && obs.SwitchoverTarget == h.Target && h.Target != a.cfg.PodName {
+		return
+	}
+	if err := a.kube.ClearSwitchoverHandoff(ctx, a.cfg.MarkerName); err != nil {
+		a.log.Warn("could not remove pg-ha/switchover-handoff; it expires on its own (#389)", "err", err)
+		return
+	}
+	a.handoff = k8s.Handoff{}
+	a.log.Info("switchover handoff over; removed pg-ha/switchover-handoff (#389)", "target", h.Target)
+}
+
+// contends is this node's candidacy for the tick: the member-tag rule (leadershipCandidate),
+// and out of the election while a handoff names another member (#389) -- except the serving
+// primary. Parking it would leave nobody able to take the lease back if it lapsed before
+// the step-down, with the target dead and every other member parked. It parks once it has
+// demoted. The same primary restarted mid-settle is no longer serving but keeps contending
+// too (resumesOwnHandoff).
+func (a *agent) contends(o reconcile.Observation) bool {
+	return leadershipCandidate(o) && (a.servingRW.Load() || !a.handoffExcludes(a.cfg.PodName) || a.resumesOwnHandoff(o.Marker.Primary, o.SwitchoverTarget))
 }
 
 // leadershipCandidate is the candidacy rule observe applies (#275): exactly
