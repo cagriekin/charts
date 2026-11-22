@@ -61,10 +61,10 @@ echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
 # The postgres uid/gid are load-bearing OUTSIDE this image: the chart chowns PGDATA to a
-# literal 101:103 and pins runAsUser/runAsGroup to the same. They are allocated by the apt
-# run, so any change to the package set can move them (#290 dropped a package) -- and the
-# failure would surface only after a tag bump, as "data directory has invalid permissions"
-# on every pod, with nothing in CI having looked.
+# literal 101:103 and pins runAsUser/runAsGroup to the same. The Dockerfile creates the
+# account explicitly before the PostgreSQL install, because left to apt the ids moved (994
+# once postgresql-common switched to systemd-sysusers) -- and the failure surfaced only after
+# a tag bump, as initdb or postmaster refusing to start on every pod.
 echo "POSTGRES_UID=$(id -u postgres 2>/dev/null || echo MISSING)"
 echo "POSTGRES_GID=$(id -g postgres 2>/dev/null || echo MISSING)"
 echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
@@ -192,7 +192,7 @@ for pair in "POSTGRES_UID=101" "POSTGRES_GID=103"; do
   if [ "$got" = "$want" ]; then
     ok "${probe_key} is ${want}, matching what the chart chowns PGDATA to"
   else
-    bad "${probe_key} is ${got}, but the chart chowns PGDATA to 101:103 and pins runAsUser/runAsGroup -- every pod would fail at postmaster start with \"data directory has invalid permissions\"" "an apt package-set change can move a system uid; update the chart and this assertion together, deliberately"
+    bad "${probe_key} is ${got}, but the chart chowns PGDATA to 101:103 and pins runAsUser/runAsGroup -- every pod would fail at postmaster start with \"data directory has invalid permissions\"" "the Dockerfile pins postgres to 101:103 before the PostgreSQL install; changing it means updating the chart and this assertion together, deliberately"
   fi
 done
 
