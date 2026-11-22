@@ -315,6 +315,10 @@ jobs:
         include:
           - { suite: migrate-native, timeout_minutes: 50, no_retry: "1" }
           - { suite: migrate-repmgrd, timeout_minutes: 50, no_retry: "1" }
+          # #389: one attempt runs ~23 minutes (initial switchover, three handoff rounds, a
+          # failover, then the infeasible-resize upgrade), so on the 30-minute default the
+          # retry the job promises could never finish: it was cancelled mid-run instead.
+          - { suite: agent-standby-resize, timeout_minutes: 55 }
     steps:
       - name: Free up runner disk space
         run: |

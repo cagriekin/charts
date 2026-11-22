@@ -51,7 +51,10 @@ spec:
         - name: minio
           # bitnamilegacy, not minio/minio: MinIO withdrew its images from every public
           # registry (#348, #353). Plain http here; the TLS variant lives in deploy_minio.
+          # Started directly rather than through the Bitnami entrypoint, whose setup step
+          # crash-loops on a restart over existing data (#389; see deploy_minio).
           image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+          command: ["/opt/bitnami/minio/bin/minio", "server", "/bitnami/minio/data", "--address", ":9000"]
           env:
             - name: MINIO_ROOT_USER
               value: minioadmin

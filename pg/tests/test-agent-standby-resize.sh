@@ -151,6 +151,7 @@ while [[ ${elapsed} -lt ${FAILOVER_BUDGET} ]]; do
 done
 assert_eq "#386: the switchover moves the primary off ${OLD_PRIMARY}" "yes" "$([[ -n "${NEW}" ]] && echo yes || echo no)"
 assert_eq "#389: the switchover lands on the named standby" "${TARGET}" "${NEW}"
+[[ "${NEW}" == "${TARGET}" ]] || dump_switchover_diag "${OLD_PRIMARY} -> ${TARGET}, holder after ${FAILOVER_BUDGET}s: '${NEW}'"
 settle_roles 300 || true
 if [[ -n "${NEW}" ]]; then
   assert_sizes "#386: switchover: the new primary ${NEW} is raised" "${NEW}" "${PG_PRIMARY_MEM}" "${BR_PRIMARY_MEM}"
@@ -161,6 +162,25 @@ assert_sizes "#386: switchover: the old primary ${OLD_PRIMARY} is lowered" "${OL
 for p in "${TARGET}" "${OLD_PRIMARY}"; do
   assert_eq "#386: switchover: no container of ${p} restarted across both resizes" "${RESTARTS[${p}]}" "$(restarts "${p}")"
 done
+
+# A missed #389 round leaves nothing behind once the namespace is torn down, and the cause
+# (the primary refusing the target vs. the target never taking the freed lease) is only in
+# the agents' own logs. Dump just what tells them apart, bounded so a CI log stays readable.
+dump_switchover_diag() {
+  echo "  --- #389 diagnostics: $1 ---"
+  echo "  lease holder: $(holder)"
+  echo "  minio restarts: $(kubectl get pods -n "${NAMESPACE}" -l app=minio -o jsonpath='{.items[*].status.containerStatuses[0].restartCount}' 2>/dev/null || echo unknown)"
+  kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations}{"\n"}' 2>/dev/null | sed 's/^/  marker: /' || true
+  local p
+  for p in "${PODS[@]}"; do
+    echo "  ${p}: $(pg_exec "${NAMESPACE}" "${p}" "SELECT pg_is_in_recovery()::text || ' tli=' || (SELECT timeline_id FROM pg_control_checkpoint()) || ' replay=' || coalesce(pg_last_wal_replay_lsn()::text,'-') || ' receive=' || coalesce(pg_last_wal_receive_lsn()::text,'-') || ' current=' || CASE WHEN pg_is_in_recovery() THEN '-' ELSE pg_current_wal_lsn()::text END" "testuser" "testdb" 2>/dev/null || echo unreachable)"
+  done
+  for p in "${PODS[@]}"; do
+    echo "  --- ${p} agent log (switchover/handoff/lease/decide, last 3m) ---"
+    kubectl logs -n "${NAMESPACE}" "${p}" -c postgresql --since=3m 2>/dev/null \
+      | grep -iE 'switchover|handoff|lease|decid|promot|demot|release|timeline|candida' | tail -n 60 | sed 's/^/    /' || true
+  done
+}
 
 # --- #389: repeated switchovers on three nodes, each onto the named standby ---
 # Each round names the other standby than the last, so a lease that went to whichever standby
@@ -180,6 +200,7 @@ for round in 1 2 3; do
     sleep 3; elapsed=$((elapsed + 3))
   done
   assert_eq "#389 round ${round}: the primary moves onto the named ${TARGET}" "${TARGET}" "${NEW}"
+  [[ "${NEW}" == "${TARGET}" ]] || dump_switchover_diag "round ${round}: ${OLD_PRIMARY} -> ${TARGET}, holder after ${FAILOVER_BUDGET}s: '${NEW}'"
   settle_roles 300 || true
   assert_eq "#389 round ${round}: ${TARGET} is the primary once roles settle" "${TARGET}" "${PRIMARY}"
   handoff="unread"; e=0

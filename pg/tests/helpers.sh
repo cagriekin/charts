@@ -196,9 +196,17 @@ deploy_minio() {
   rm -rf "${certdir}"
 
   # bitnamilegacy, not minio/minio: MinIO withdrew its images from Docker Hub and quay.io
-  # (#348, #353). The Bitnami image reads the same public.crt/private.key pair from /certs
-  # and serves TLS when MINIO_SCHEME=https; it runs as uid 1001 with its data under
-  # /bitnami/minio/data, so that path gets a writable emptyDir.
+  # (#348, #353). It runs as uid 1001 with its data under /bitnami/minio/data, so that path
+  # gets a writable emptyDir.
+  #
+  # The server is started directly (minio server --certs-dir /certs), not through the Bitnami
+  # entrypoint (#389). That script's setup step, on any container restart over an existing data
+  # directory, retried `mc alias set` for ~70s and exited 1, so one MinIO exit became a crash
+  # loop with the Service endpoint-less for minutes. Every archive-push and archive-get in the
+  # namespace then hung on pgBackRest's 60s io-timeout: a primary stepping down could not
+  # archive its last WAL inside the demote deadline, the agent abandoned the switchover as
+  # designed, and the #389 rounds missed for a reason that had nothing to do with the handoff.
+  # Started directly, a restart serves TLS again within seconds.
   echo "Deploying MinIO (TLS on :9000, Service exposes :443 -> 9000)..."
   kubectl apply -n "${namespace}" -f - <<'MINIO'
 apiVersion: apps/v1
@@ -217,7 +225,7 @@ spec:
           env:
             - { name: MINIO_ROOT_USER, value: minioadmin }
             - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
-            - { name: MINIO_SCHEME, value: https }
+          command: ["/opt/bitnami/minio/bin/minio", "server", "/bitnami/minio/data", "--certs-dir", "/certs", "--address", ":9000"]
           ports: [{ containerPort: 9000 }]
           volumeMounts:
             - { name: certs, mountPath: /certs, readOnly: true }
