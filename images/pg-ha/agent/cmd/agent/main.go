@@ -863,16 +863,19 @@ func (a *agent) tick(ctx context.Context) {
 	// spend its interval on a question that could not be asked.
 	if obs.Local.Running {
 		a.verifyTLSActive(ctx)
-		// Only a standby has a restartpoint to force, and only one that is actually streaming
-		// has a newer timeline to record (#298).
-		if obs.Local.InRecovery {
-			a.ensureDurableTimeline(ctx)
-		}
 	}
 	// After observe() and the TLS check, before act(): the verdict describes the node as this
 	// tick found it. An act() that stops or replaces the postmaster lets it go stale (#395);
 	// one that only waits on it (role provisioning) keeps it fresh via beatKeepingReadiness.
+	// Also before ensureDurableTimeline, whose beats touch the CURRENT verdict: touching the
+	// previous tick's would keep, say, a "standby streaming" Ready alive through a slow
+	// restartpoint on a standby this tick just found not streaming.
 	a.metr.SetReadiness(readinessVerdict(obs.Local, a.localStreaming, a.tlsInactiveLatched))
+	// Only a standby has a restartpoint to force, and only one that is actually streaming
+	// has a newer timeline to record (#298).
+	if obs.Local.Running && obs.Local.InRecovery {
+		a.ensureDurableTimeline(ctx)
+	}
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)

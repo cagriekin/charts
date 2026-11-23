@@ -248,6 +248,21 @@ func TestRunIntentStopReadsThePauseFreshNotTheLoopCache(t *testing.T) {
 	}
 }
 
+// #395: /readyz serves the throttled #335 verdict, and an operator restart or reload can load a
+// different `ssl` (a sighup parameter): both must re-arm the check like the loop's own starts.
+func TestRunIntentRestartAndReloadRearmTheTLSCheck(t *testing.T) {
+	for _, kind := range []control.IntentKind{control.IntentRestart, control.IntentReload} {
+		a := newIntentAgent(t, &fakePostmaster{running: true})
+		a.tlsCheckedAt = time.Now()
+		if err := a.runIntent(context.Background(), intentRequest{kind: kind}); err != nil {
+			t.Fatalf("%v: %v", kind, err)
+		}
+		if !a.tlsCheckedAt.IsZero() {
+			t.Errorf("%v left the TLS check throttled until %v", kind, a.tlsCheckedAt.Add(tlsVerifyInterval))
+		}
+	}
+}
+
 func TestRunIntentReload(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
