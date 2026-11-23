@@ -812,7 +812,7 @@ func (a *agent) boot(ctx context.Context) error {
 		if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 			return err
 		}
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 	}
 	a.log.Info("boot: on-disk primary state; deferring start until reconcile confirms holdership + highwater", "state", cd.State)
 	return nil
@@ -870,7 +870,8 @@ func (a *agent) tick(ctx context.Context) {
 		}
 	}
 	// After observe() and the TLS check, before act(): the verdict describes the node as this
-	// tick found it, and a long act() is bounded by the /readyz staleness check (#395).
+	// tick found it. An act() that stops or replaces the postmaster lets it go stale (#395);
+	// one that only waits on it (role provisioning) keeps it fresh via beatKeepingReadiness.
 	a.metr.SetReadiness(readinessVerdict(obs.Local, a.localStreaming, a.tlsInactiveLatched))
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
@@ -2250,7 +2251,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Safe for the stickiness logic in cascadeFollowTarget: it only honours a latched
 		// upstream that is not the leader, and this one always is.
 		a.latchFollow(dec.Target)
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 
 	case reconcile.ReleaseLease:
 		// Step down: demote/stop the local writer FIRST, then release the Lease so a
@@ -2455,7 +2456,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 					return err
 				}
 			}
-			if err := a.sup.Start(ctx); err != nil {
+			if err := a.startPostgres(ctx); err != nil {
 				return err
 			}
 			if primaryState {
@@ -2479,7 +2480,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 				return err
 			}
-			if err := a.sup.Start(ctx); err != nil {
+			if err := a.startPostgres(ctx); err != nil {
 				return err
 			}
 			a.metr.IncRecoveryStart()
@@ -2516,7 +2517,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			}
 			a.log.Warn("restart local: the postmaster did not exit before the stop deadline and was killed; starting it back up", "err", serr)
 		}
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 
 	case reconcile.BootstrapInitdb:
 		// The entrypoint deliberately does NOT initdb on the agent path (#288). It cannot: the
@@ -2709,7 +2710,7 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 		a.log.Warn("lost the lease during initdb; discarding the fresh data directory so this node can clone from the new holder (#288)")
 		return a.discardFreshDataDir()
 	}
-	if err := a.sup.Start(ctx); err != nil {
+	if err := a.startPostgres(ctx); err != nil {
 		return fmt.Errorf("bootstrap initdb: start: %w", err)
 	}
 	// Arm the lost-leadership fence before the first tick observes this node, mirroring
@@ -3168,7 +3169,7 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		// primary's agent liveness-killed. One budget per role, so a role stuck on a lock does
 		// not leave the other an already-expired deadline.
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := a.beatDuring(func() error {
+		err := a.beatKeepingReadiness(func() error {
 			return pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
 		})
 		cancel()
@@ -3677,7 +3678,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// minute. It also covers the early return below, which is the COMMON path (a caught-up
 	// standby has nothing to repair) and previously beat not at all no matter how long the read
 	// took.
-	a.metr.Beat()
+	a.beatAndTouchReadiness()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {
 		return
@@ -3688,7 +3689,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// And again before the CHECKPOINT, which is the one call here that is slow while perfectly
 	// healthy (a restartpoint flushes dirty shared buffers). Same heartbeat-through-a-long-call
 	// pattern the clone path uses.
-	a.metr.Beat()
+	a.beatAndTouchReadiness()
 	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
 		// BACK OFF here too (#298 review). The commonest way this errors is the budget above
 		// expiring on a restartpoint that is genuinely slow -- a full flush of dirty shared
@@ -3796,6 +3797,15 @@ func (a *agent) verifyTLSActive(ctx context.Context) {
 			"This pod is failing its readiness probe until then, so it serves no client traffic",
 			"confd", a.confdDir)
 	}
+}
+
+// startPostgres starts the supervised postmaster and re-arms the TLS check (#395). /readyz
+// serves the #335 verdict, and a new postmaster can load a different `ssl` than the one the
+// throttled check last saw: without the re-arm, a restart into plaintext stayed Ready for up to
+// tlsVerifyInterval, where the exec probe it replaced refused readiness on its first run.
+func (a *agent) startPostgres(ctx context.Context) error {
+	a.tlsCheckedAt = time.Time{}
+	return a.sup.Start(ctx)
 }
 
 // ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in
@@ -3953,6 +3963,23 @@ func (a *agent) fenceBudget() time.Duration {
 // anywhere else still goes stale and still gets restarted. The residual cost is that a hung
 // pg_basebackup looks alive; the clone marker and discardTornClone recover that directory.
 func (a *agent) beatDuring(fn func() error) error {
+	return a.beatAround(fn, a.metr.Beat)
+}
+
+// beatKeepingReadiness is beatDuring for a long call that leaves the local postmaster as the
+// tick's readiness verdict found it, so /readyz stays fresh alongside /healthz (#395 review):
+// without it an ALTER ROLE queued on a lock aged a healthy primary's verdict past the staleness
+// bound and dropped it from the client Services while it served normally.
+func (a *agent) beatKeepingReadiness(fn func() error) error {
+	return a.beatAround(fn, a.beatAndTouchReadiness)
+}
+
+func (a *agent) beatAndTouchReadiness() {
+	a.metr.Beat()
+	a.metr.TouchReadiness()
+}
+
+func (a *agent) beatAround(fn func() error, beat func()) error {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -3971,7 +3998,7 @@ func (a *agent) beatDuring(fn func() error) error {
 			case <-stop:
 				return
 			case <-t.C:
-				a.metr.Beat()
+				beat()
 			}
 		}
 	}()
@@ -3980,7 +4007,7 @@ func (a *agent) beatDuring(fn func() error) error {
 	<-done
 	// One final beat, so the window between the last tick of the helper and the next real
 	// tick cannot itself go stale on a long-running operation that finished just after a beat.
-	a.metr.Beat()
+	beat()
 	return err
 }
 
@@ -4630,7 +4657,7 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	// dec.Target after its own clone. It also re-arms observeStandbyStall, which requires a
 	// non-empty latch, so a standby that stalls right after a rejoin can escalate again.
 	a.latchFollow(target)
-	return a.sup.Start(ctx)
+	return a.startPostgres(ctx)
 }
 
 // newMechanism builds the replication mechanics (#287, #294).

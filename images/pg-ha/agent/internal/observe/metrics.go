@@ -233,6 +233,18 @@ func (m *Metrics) SetReadiness(r Readiness) {
 	m.readiness.Store(&readinessStamp{Readiness: r, at: m.now()})
 }
 
+// TouchReadiness re-stamps the current verdict without re-deciding it (#395 review). The
+// reconcile loop calls it only while it waits on a call that leaves the local postmaster as
+// the verdict found it (an ALTER ROLE queued on a lock, a standby restartpoint): the loop is
+// progressing, so the verdict must not age out and take a serving pod out of the Services.
+// Calls that stop or replace the postmaster (clone, rewind, promote, initdb) beat /healthz
+// without touching this, so /readyz goes stale across them.
+func (m *Metrics) TouchReadiness() {
+	if s := m.readiness.Load(); s != nil {
+		m.readiness.Store(&readinessStamp{Readiness: s.Readiness, at: m.now()})
+	}
+}
+
 // CurrentReadiness returns the last verdict while it is younger than maxAge, and NotReady
 // otherwise (#395). The verdict is cached state, so without the bound a wedged reconcile loop
 // would keep answering with the last good verdict forever -- a primary that has since stopped

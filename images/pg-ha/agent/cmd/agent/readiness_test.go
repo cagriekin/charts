@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
+	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
 
@@ -63,6 +64,23 @@ func TestReadyzStaleLoop(t *testing.T) {
 	}
 }
 
+// #395: a restarted postmaster may have loaded `ssl = off`; the throttled TLS check must run
+// again on the next Running tick instead of trusting the previous postmaster's answer.
+func TestStartPostgresRearmsTheTLSCheck(t *testing.T) {
+	ex := &tlsExec{ssl: "on"}
+	a := newTLSTestAgent(ex, true)
+	a.sup = process.NewSupervisor(&fakePostmaster{})
+	a.verifyTLSActive(context.Background())
+	ex.ssl = "off"
+	if err := a.startPostgres(context.Background()); err != nil {
+		t.Fatalf("startPostgres: %v", err)
+	}
+	a.verifyTLSActive(context.Background())
+	if ex.calls != 2 || !a.tlsInactiveLatched {
+		t.Errorf("after a restart: calls = %d, latched = %v; want a re-probe that latches ssl=off", ex.calls, a.tlsInactiveLatched)
+	}
+}
+
 // #395: the stall check's walreceiver read is the one readiness uses, so a standby's verdict
 // needs no extra query; it must record both answers.
 func TestObserveStandbyStallRecordsStreamingForReadiness(t *testing.T) {
@@ -78,5 +96,31 @@ func TestObserveStandbyStallRecordsStreamingForReadiness(t *testing.T) {
 	a.observeStandbyStall(context.Background(), &o)
 	if a.localStreaming == nil || *a.localStreaming {
 		t.Fatalf("absent walreceiver not recorded as not streaming: %v", a.localStreaming)
+	}
+}
+
+// #395 review: a long call that leaves the postmaster alone (role provisioning) keeps the
+// verdict fresh; one that stops or replaces it (clone, rewind, promote) lets it go stale.
+func TestLongCallsAgeReadinessOnlyWhenThePostmasterChanges(t *testing.T) {
+	const bound = 40 * time.Millisecond
+	for _, tc := range []struct {
+		name      string
+		run       func(a *agent, fn func() error) error
+		wantReady bool
+	}{
+		{"beatKeepingReadiness", (*agent).beatKeepingReadiness, true},
+		{"beatDuring", (*agent).beatDuring, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newFollowTestAgent(t, &scriptedExec{})
+			a.metr = observe.New()
+			a.cfg.ReconcileInterval = 5 * time.Millisecond
+			a.metr.SetReadiness(readinessVerdict(reconcile.LocalState{Running: true, HasData: true}, nil, false))
+			_ = tc.run(a, func() error { time.Sleep(3 * bound); return nil })
+			code, body := readyz(t, a.metr, bound)
+			if (code == http.StatusOK) != tc.wantReady {
+				t.Errorf("/readyz after a long %s = %d %q, want ready=%v", tc.name, code, body, tc.wantReady)
+			}
+		})
 	}
 }
