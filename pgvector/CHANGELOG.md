@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## Unreleased
+
+### Changed
+
+- **Agent-mode readiness is served by the agent over HTTP (#395).** The `postgresql`
+  container's readiness probe is now `httpGet /readyz` on `agent-metrics` instead of an exec
+  script that ran bash, `pg_isready` and up to three `psql` every 10s -- about 22m CPU per idle
+  pod, more than the agent itself. The agent answers from the state its reconcile loop already
+  observes, with the same semantics: a primary is Ready; a standby only while its walreceiver is
+  streaming (#186); NotReady while postgres does not answer on `127.0.0.1` (#350), while
+  `max_connections` is exhausted, and while `postgresql.tls.enabled` is set and the server
+  reports `ssl = off` (#335). `/readyz` also fails once the agent's last verdict is older than
+  three reconcile intervals. Standalone mode keeps the exec probe.
+- **The pg-ha image moves to 2.6.0** (`ha.image.tag` and `etcd.rbac.bootstrapImage.tag`:
+  `2.6.0-pg18`). An agent-mode release with an older chart-scheme `ha.image.tag` now fails the
+  render, since an older agent's `/readyz` answers 200 whenever its process is up.
+
 ## 2.7.2 - 2026-11-22
 
 ### Fixed

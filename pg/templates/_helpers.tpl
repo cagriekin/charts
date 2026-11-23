@@ -2090,6 +2090,14 @@ spelling statefulset.yaml emits, so no second key->env table has to agree with i
 {{- if and $ver (semverCompare "< 2.4.0" $ver) -}}
 {{- fail (printf "ha.image.tag is %q, but chart %s needs the pg-ha image at 2.4.0 or later: this chart no longer sets REPMGR_NODE_COUNT (the agent reads its StatefulSet's spec.replicas instead, so scaling rolls no pod, #373), and an older agent refuses to boot without it -- every PostgreSQL pod would crash-loop at once. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.4.0-pg<major> or later, or stay on a chart before 2.6.0 for that image." (.Values.ha.image.tag | toString) .Chart.Version) -}}
 {{- end -}}
+{{- /* #395: the agent-mode readiness probe is httpGet /readyz, and before image 2.6.0 that
+       route answered 200 whenever the agent process was up. Paired with an older image the
+       render would succeed and every pod would report Ready unconditionally: a cloning standby
+       would let a RollingUpdate advance onto its clone source (#186), and a server serving
+       plaintext despite postgresql.tls.enabled would stay in the client Services (#335). */ -}}
+{{- if and $ver (semverCompare "< 2.6.0" $ver) -}}
+{{- fail (printf "ha.image.tag is %q, but chart %s needs the pg-ha image at 2.6.0 or later: the agent-mode readiness probe is the agent's /readyz (#395), which an older agent answers with 200 whenever its process is up -- a cloning standby or a server that lost TLS would report Ready. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.6.0-pg<major> or later, or stay on a chart before 2.8.0 for that image." (.Values.ha.image.tag | toString) .Chart.Version) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -2157,10 +2165,8 @@ JSON, keys sorted by toJson, so an unchanged values file renders an unchanged en
 {{- if and .Values.pgpool.enabled (gt (int .Values.postgresql.replicaCount) 0) (not .Values.postgresql.standbyResourcesAcknowledgeReads) -}}
 {{- fail "postgresql.standbyResources / pgbackrest.standbyResources are set with pgpool.enabled=true, and pgpool load-balances reads to the standbys -- which would serve them at the standby size. Remove standbyResources, disable pgpool, or, once every standby is tagged pg-ha/noloadbalance (#275) or reads at the standby size are intended, set postgresql.standbyResourcesAcknowledgeReads=true (#386)." -}}
 {{- end -}}
-{{- $ver := include "pg.haImageSchemeVersion" . -}}
-{{- if and $ver (semverCompare "< 2.5.0" $ver) -}}
-{{- fail (printf "ha.image.tag is %q, but postgresql.standbyResources / pgbackrest.standbyResources need the pg-ha agent at 2.5.0 or later: an older agent ignores PG_HA_RESIZE, so every pod -- the primary too -- would run at the standby size. Set ha.image.tag (and etcd.rbac.bootstrapImage.tag) to 2.5.0-pg<major> or later, or remove standbyResources (#386)." (.Values.ha.image.tag | toString)) -}}
-{{- end -}}
+{{- /* The 2.5.0 image floor PG_HA_RESIZE needs is implied by pg.validateAgentImageFloor's
+       2.6.0 one (#395), which every agent-mode render runs. */ -}}
 {{- range $c := list "postgresql" "pgbackrest" -}}
 {{- $sr := (index $.Values $c).standbyResources -}}
 {{- if not (empty $sr) -}}

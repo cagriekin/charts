@@ -92,7 +92,23 @@ type Metrics struct {
 	sizedAsPrimary   atomic.Int64
 	resizePending    atomic.Int64
 	resizeInfeasible atomic.Int64
-	now              func() time.Time
+	// readiness is the reconcile loop's last readiness verdict, served by /readyz (#395).
+	// nil until the first tick has observed the local postmaster.
+	readiness atomic.Pointer[readinessStamp]
+	now       func() time.Time
+}
+
+// Readiness is whether this pod should receive client traffic, as the reconcile loop last
+// judged it from its own connection to the local postmaster (#395). Reason is what /readyz
+// answers with, so a NotReady pod says why in `kubectl describe pod`.
+type Readiness struct {
+	Ready  bool
+	Reason string
+}
+
+type readinessStamp struct {
+	Readiness
+	at time.Time
 }
 
 // SlotStats is the aggregate slot picture the primary publishes each tick (#289).
@@ -212,6 +228,27 @@ func (m *Metrics) SetResize(r ResizeStats) {
 	m.resizeInfeasible.Store(b2i(r.Infeasible))
 }
 
+// SetReadiness records this tick's readiness verdict (#395).
+func (m *Metrics) SetReadiness(r Readiness) {
+	m.readiness.Store(&readinessStamp{Readiness: r, at: m.now()})
+}
+
+// CurrentReadiness returns the last verdict while it is younger than maxAge, and NotReady
+// otherwise (#395). The verdict is cached state, so without the bound a wedged reconcile loop
+// would keep answering with the last good verdict forever -- a primary that has since stopped
+// serving would stay in the client-facing Services. maxAge is the /healthz staleness bound:
+// the loop publishes a verdict every tick, so the two go stale together.
+func (m *Metrics) CurrentReadiness(maxAge time.Duration) Readiness {
+	s := m.readiness.Load()
+	if s == nil {
+		return Readiness{Reason: "no readiness verdict yet: the reconcile loop has not observed the local postmaster"}
+	}
+	if age := m.now().Sub(s.at); age >= maxAge {
+		return Readiness{Reason: fmt.Sprintf("stale: the last readiness verdict is %s old (bound %s); the reconcile loop has not progressed", age.Round(time.Second), maxAge)}
+	}
+	return s.Readiness
+}
+
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
 
@@ -224,15 +261,16 @@ func (m *Metrics) Alive(maxAge time.Duration) bool {
 }
 
 // Handler returns the read-only HTTP surface: /metrics (Prometheus text),
-// /healthz (reconcile-loop liveness), /readyz (process up).
-func (m *Metrics) Handler(livenessMaxAge time.Duration) http.Handler {
+// /healthz (reconcile-loop liveness), /readyz (the reconcile loop's readiness verdict, #395).
+// maxAge bounds both: a heartbeat or a verdict older than it fails its probe.
+func (m *Metrics) Handler(maxAge time.Duration) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		m.write(w)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if m.Alive(livenessMaxAge) {
+		if m.Alive(maxAge) {
 			w.WriteHeader(http.StatusOK)
 			io.WriteString(w, "ok")
 			return
@@ -241,8 +279,14 @@ func (m *Metrics) Handler(livenessMaxAge time.Duration) http.Handler {
 		io.WriteString(w, "stale: reconcile loop has not progressed")
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, "ok")
+		r := m.CurrentReadiness(maxAge)
+		if r.Ready {
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, "ok: "+r.Reason)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, r.Reason)
 	})
 	return mux
 }

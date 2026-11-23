@@ -235,6 +235,11 @@ type agent struct {
 	// one (#288 review). Zero value = nothing observed yet.
 	standbyLastProgressLSN pg.LSN
 
+	// localStreaming is this tick's read of pg_stat_wal_receiver on a running standby, for the
+	// readiness verdict (#395): nil when the node is not a running standby or the read failed.
+	// Reset at the top of observe() so a verdict never reuses a previous tick's answer.
+	localStreaming *bool
+
 	// initdbMarkerWaitOverride shortens the post-initdb wait for the postmaster to accept SQL.
 	// Zero means initdbMarkerWait; only tests set it.
 	initdbMarkerWaitOverride time.Duration
@@ -864,6 +869,9 @@ func (a *agent) tick(ctx context.Context) {
 			a.ensureDurableTimeline(ctx)
 		}
 	}
+	// After observe() and the TLS check, before act(): the verdict describes the node as this
+	// tick found it, and a long act() is bounded by the /readyz staleness check (#395).
+	a.metr.SetReadiness(readinessVerdict(obs.Local, a.localStreaming, a.tlsInactiveLatched))
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
@@ -1153,6 +1161,7 @@ func (a *agent) expectedNodes() int {
 }
 
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
+	a.localStreaming = nil
 	local := a.prober.Probe(ctx, a.selfConn())
 	ls := reconcile.LocalState{
 		HasData:    process.HasData(a.cfg.PGDATA),
@@ -1405,6 +1414,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	if m.Paused {
 		a.standbyNoReceiverTicks = 0
 		a.standbyLastProgressLSN = pg.LSN{}
+		// Readiness still needs the walreceiver state while paused (#395): a pause suspends
+		// failover, not the #186 gate that keeps a cloning standby out of a RollingUpdate.
+		if o.Local.Running && o.Local.InRecovery {
+			if _, streaming, err := a.prober.StreamingUpstream(ctx, a.selfConn()); err == nil {
+				a.localStreaming = &streaming
+			}
+		}
 	} else {
 		a.observeStandbyStall(ctx, &o)
 	}
@@ -1617,6 +1633,7 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 		// Could not look: not evidence of a stall. Hold the counter rather than advancing it.
 		return
 	}
+	a.localStreaming = &streaming
 	if streaming {
 		a.standbyNoReceiverTicks = 0
 		a.standbyLastProgressLSN = pg.LSN{}
@@ -1664,6 +1681,45 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 	if o.StandbyStalled {
 		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
 			"ticks", a.standbyNoReceiverTicks)
+	}
+}
+
+// readinessVerdict is the pod's readiness as the agent observed it this tick (#395). It
+// replaces the chart's exec probe (bash + pg_isready + up to three psql per run, ~22m CPU per
+// idle pod) with state the reconcile loop already reads over its own connection, and keeps
+// that probe's semantics:
+//
+//   - Running is the agent's probe over LOOPBACK TCP (selfConn), so the bootstrap's
+//     socket-only transient postmaster (#350) and a node still starting, recovering or
+//     cloning are NotReady: only the real postmaster opens 127.0.0.1.
+//   - Saturated (max_connections exhausted, superuser_reserved_connections included -- the
+//     agent's role is a superuser) is NotReady, as it was under the exec probe, whose psql ran
+//     as the superuser too and failed the same way. A pod that refuses every new connection
+//     serves no new client; leaving the client-facing Services stops routing more attempts to
+//     it, while the headless Service (publishNotReadyAddresses) keeps replication and peer
+//     probes, and agent-mode liveness is the /healthz heartbeat, so nothing is restarted.
+//   - tlsInactive is the #335 latch: set only on a DEFINITIVE `ssl = off`, never on a query
+//     that failed, and only while postgresql.tls.enabled is set.
+//   - A primary is Ready; a standby only while its walreceiver is streaming (#186), so a
+//     RollingUpdate does not advance onto the clone source while a standby clones or catches
+//     up. A standby whose walreceiver could not be read this tick is NotReady: no evidence of
+//     streaming, the same answer the exec probe gave when its psql failed.
+func readinessVerdict(l reconcile.LocalState, streaming *bool, tlsInactive bool) observe.Readiness {
+	switch {
+	case !l.Running && l.Saturated:
+		return observe.Readiness{Reason: "local postgres refuses connections: max_connections exhausted"}
+	case !l.Running:
+		return observe.Readiness{Reason: "postgres is not accepting connections on 127.0.0.1 (starting, recovering, cloning, bootstrapping or stopped)"}
+	case tlsInactive:
+		return observe.Readiness{Reason: "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)"}
+	case !l.InRecovery:
+		return observe.Readiness{Ready: true, Reason: "primary"}
+	case streaming == nil:
+		return observe.Readiness{Reason: "standby: walreceiver status could not be read"}
+	case !*streaming:
+		return observe.Readiness{Reason: "standby walreceiver is not streaming (cloning, catching up or reconnecting, #186)"}
+	default:
+		return observe.Readiness{Ready: true, Reason: "standby streaming"}
 	}
 }
 
@@ -3703,9 +3759,9 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 //
 // The loudness has three channels, because each reaches a different reader: the gauge
 // (pg_ha_agent_tls_inactive) is what an alert can page on, the Error log names the cause and the
-// remedy for whoever opens `kubectl logs`, and the readiness probe -- rendered by the chart, not
-// here -- takes the pod out of the client-facing Services so nothing keeps talking plaintext to
-// it. The headless Service sets publishNotReadyAddresses, so replication and the agent's own
+// remedy for whoever opens `kubectl logs`, and the readiness verdict /readyz serves
+// (readinessVerdict, #395) takes the pod out of the client-facing Services so nothing keeps
+// talking plaintext to it. The headless Service sets publishNotReadyAddresses, so replication and the agent's own
 // peer probes are unaffected by that.
 func (a *agent) verifyTLSActive(ctx context.Context) {
 	if !a.cfg.TLSEnabled {

@@ -96,6 +96,14 @@ later and `patch` on `pods/resize`, which the chart grants only with the feature
 node cannot fit never blocks a promotion: the agent logs it and publishes
 `pg_ha_agent_pod_resize_pending` / `pg_ha_agent_pod_resize_infeasible`.
 
+Since 2.6.0 the agent's `/readyz` on the metrics port (9200) answers with readiness instead of
+"process up" (#395): 200 for a primary, or a standby whose walreceiver is streaming; 503 while
+postgres does not answer on 127.0.0.1, while it refuses connections with max_connections
+exhausted, while a standby is not streaming, while `TLS_ENABLED` is set and the server reports
+`ssl = off`, and once the reconcile loop's last verdict is older than three reconcile intervals.
+The body names the reason. The pg/pgvector chart uses it as the agent-mode readiness probe from
+the release that requires this image.
+
 ### init mode
 
 Reads exactly one variable (#290). It used to need the credentials, the headless service and the

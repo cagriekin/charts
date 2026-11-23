@@ -146,13 +146,30 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288, and in standalone mode how long the postStart hook waits for the real server before failing, floor 300s, #370) | `180` |
 
-The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350): loopback is the one
-address the bootstrap's transient postmaster and the stock image's init-time server never open,
-so Ready and the end of the startup grace mean the real postmaster. `listen_addresses` must
+The startup probe, and the readiness probe in standalone mode, ask `pg_isready` over
+`127.0.0.1` (#350): loopback is the one address the bootstrap's transient postmaster and the
+stock image's init-time server never open, so Ready and the end of the startup grace mean the
+real postmaster. `listen_addresses` must
 therefore keep IPv4 loopback; a `postgresql.configuration.listen_addresses` without `*`,
 `0.0.0.0`, `localhost` or `127.0.0.1` fails the render (the HA agent connects to its own
 postmaster there too). An IPv6-only `::`/`::1` does not count: PostgreSQL binds it
 `IPV6_V6ONLY`, so it never answers `127.0.0.1`.
+
+In agent mode the readiness probe is `httpGet /readyz` on the agent's metrics port (#395). The
+agent answers it from what its reconcile loop already reads over its own `127.0.0.1` connection,
+so no `psql` or `pg_isready` process runs per probe (the exec probe cost about 22m CPU per idle
+pod). It answers 503, with the reason in the body, while:
+
+- postgres does not answer on `127.0.0.1` (starting, recovering, cloning, mid-bootstrap or stopped);
+- postgres refuses connections with `max_connections` exhausted, including the superuser slots;
+- the pod is a standby whose walreceiver is not streaming (cloning or catching up, #186), so a
+  `RollingUpdate` never advances onto the clone source;
+- `postgresql.tls.enabled` is set and the server reports `ssl = off` (#335);
+- the agent's last verdict is older than three `ha.agent.reconcileInterval`s, so a wedged agent
+  cannot keep reporting its last good answer.
+
+This needs the pg-ha image at 2.6.0 or later; an older chart-scheme `ha.image.tag` fails the
+render, because an older agent's `/readyz` answers 200 whenever its process is up.
 
 ### Pod Disruption Budgets
 
@@ -520,7 +537,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.1-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.6.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -583,7 +600,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 ha:
   image:
-    tag: 2.5.1-pg17
+    tag: 2.6.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
 # `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
@@ -594,7 +611,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.5.1-pg17
+      tag: 2.6.0-pg17
 ```
 
 The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
@@ -2084,8 +2101,9 @@ components reach the server over TLS via libpq's default negotiation.
 an operator can read — the rendered ConfigMap, the mounted Secret, the values file — describes
 the configuration that was *rendered*, not the one the postmaster *loaded*, and a pod whose
 `postgresql.conf` never picked up the chart's `conf.d` include serves plaintext while all three
-still say TLS is on. So the readiness probe asks the server itself (`SHOW ssl`) and refuses
-readiness on a definitive `off`: the pod leaves the client-facing Services rather than serving
+still say TLS is on. So readiness asks the server itself (`SHOW ssl`; in agent mode the agent
+asks it, at most once a minute, and `/readyz` reports the verdict, #395) and refuses readiness
+on a definitive `off`: the pod leaves the client-facing Services rather than serving
 anyone in the clear, a `RollingUpdate` stalls instead of rolling the whole cluster into that
 state, and replication is unaffected (the headless Service publishes not-ready addresses). In
 agent mode the agent additionally publishes `pg_ha_agent_tls_inactive` (a `0`/`1` gauge, always

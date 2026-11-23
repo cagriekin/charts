@@ -333,7 +333,16 @@ probe_lab_350() {
   lab_startup=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].startupProbe.exec.command[2]}')
   lab_readiness=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]}')
   assert_contains "#350 lab: the live startup command asks loopback" "${lab_startup}" "pg_isready -h 127.0.0.1"
-  assert_contains "#350 lab: the live readiness command asks loopback first" "${lab_readiness}" "pg_isready -h 127.0.0.1"
+  # Agent mode serves readiness from the agent's /readyz (#395): there is no command to run here,
+  # and the loopback rule lives in the agent (its probe connection is 127.0.0.1, unit-tested in
+  # readinessVerdict). Only the exec probe -- standalone -- goes through the lab's readiness half.
+  local lab_readiness_http
+  lab_readiness_http=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].readinessProbe.httpGet.path}')
+  if [ -n "${lab_readiness_http}" ]; then
+    assert_eq "#395 lab: the live readiness probe is the agent /readyz" "/readyz" "${lab_readiness_http}"
+  else
+    assert_contains "#350 lab: the live readiness command asks loopback first" "${lab_readiness}" "pg_isready -h 127.0.0.1"
+  fi
   # The container starts as root and the script runs as the image's own `postgres` user via
   # runuser: initdb refuses root, and it also refuses a uid the image has no passwd entry for
   # (the chart's default 101 has none in the stock image, whose postgres is 999).
@@ -379,8 +388,10 @@ LAB
   r() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
   assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(r bare-pg_isready-vs-transient)"
   assert_eq "#350 lab: the startup probe is NOT satisfied by a socket-only postmaster" "fail" "$(r startup-vs-transient)"
-  assert_eq "#350 lab: the readiness probe is NOT satisfied by a socket-only postmaster" "fail" "$(r readiness-vs-transient)"
   assert_eq "#350 lab: the startup probe passes once loopback listens" "pass" "$(r startup-vs-loopback)"
-  assert_eq "#350 lab: the readiness probe passes on a loopback-listening primary" "pass" "$(r readiness-vs-loopback)"
+  if [ -z "${lab_readiness_http}" ]; then
+    assert_eq "#350 lab: the readiness probe is NOT satisfied by a socket-only postmaster" "fail" "$(r readiness-vs-transient)"
+    assert_eq "#350 lab: the readiness probe passes on a loopback-listening primary" "pass" "$(r readiness-vs-loopback)"
+  fi
   unset -f r
 }

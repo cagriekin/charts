@@ -159,11 +159,15 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288, and in standalone mode the postStart hook's wait for the real server, floor 300s, #370) | `180` |
 
-The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350), the one address the
-bootstrap's transient postmaster and the stock image's init-time server never open, so Ready
-means the real postmaster. `listen_addresses` must therefore keep IPv4 loopback: a
+The startup probe, and the readiness probe in standalone mode, ask `pg_isready` over
+`127.0.0.1` (#350), the one address the bootstrap's transient postmaster and the stock image's
+init-time server never open, so Ready means the real postmaster. `listen_addresses` must therefore keep IPv4 loopback: a
 `postgresql.configuration.listen_addresses` without `*`, `0.0.0.0`, `localhost` or `127.0.0.1`
 fails the render. An IPv6-only `::`/`::1` does not count (PostgreSQL binds it `IPV6_V6ONLY`).
+
+In agent mode the readiness probe is the agent's `httpGet /readyz` (#395), answered from what
+its reconcile loop already observes, with no `psql` or `pg_isready` per probe. It needs the
+pg-ha image at 2.6.0 or later. See the pg chart README for the states it reports NotReady.
 
 ### Pod Disruption Budgets
 
@@ -236,7 +240,7 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
-| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.5.1-pg18` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.6.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -268,7 +272,7 @@ postgresql:
     tag: pg17-trixie           # the pgvector image for the SAME major
 ha:
   image:
-    tag: 2.5.1-pg17
+    tag: 2.6.0-pg17
     majorVersion: "17"
 # ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs the
 # HA image, and the render FAILS unless this reference matches ha.image exactly -- see the pg
@@ -277,7 +281,7 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.5.1-pg17
+      tag: 2.6.0-pg17
 ```
 
 **`postgresql.image.tag` matters here even with `ha.enabled`** — unlike in the `pg` chart. This chart ships `postgresql.extensions.enabled=true`, and the `copy-ext` init container copies `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` **out of the pgvector image** into the server container, which is how `vector` reaches a server that runs from the HA image. Those paths are built from `postgresql.majorVersion`, so the pgvector image must be the matching major (`pgvector/pgvector:pg17-trixie`) or the copy finds nothing and `CREATE EXTENSION vector` fails.
