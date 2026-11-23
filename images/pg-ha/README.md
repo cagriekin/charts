@@ -98,9 +98,11 @@ node cannot fit never blocks a promotion: the agent logs it and publishes
 
 Since 2.6.0 the agent's `/readyz` on the metrics port (9200) answers with readiness instead of
 "process up" (#395): 200 for a primary, or a standby whose walreceiver is streaming; 503 while
-postgres does not answer on 127.0.0.1, while it refuses connections with max_connections
-exhausted, while a standby is not streaming, while `TLS_ENABLED` is set and the server reports
-`ssl = off`, and once the reconcile loop's last verdict is older than three reconcile intervals.
+postgres does not answer on 127.0.0.1, while it refuses the agent's own redial with
+max_connections exhausted (the agent's persistent session is not dropped by clients filling the
+slots, so that alone does not fail it), while a standby is not streaming, while `TLS_ENABLED`
+is set and the server reports `ssl = off`, from the start of a promote, clone, rewind or initdb
+until the next tick re-decides, and once the reconcile loop's last verdict is older than three reconcile intervals.
 The body names the reason. The pg/pgvector chart uses it as the agent-mode readiness probe from
 the release that requires this image.
 

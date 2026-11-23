@@ -865,8 +865,9 @@ func (a *agent) tick(ctx context.Context) {
 		a.verifyTLSActive(ctx)
 	}
 	// After observe() and the TLS check, before act(): the verdict describes the node as this
-	// tick found it. An act() that stops or replaces the postmaster lets it go stale (#395);
-	// one that only waits on it (role provisioning) keeps it fresh via beatKeepingReadiness.
+	// tick found it. An act() that promotes or replaces the postmaster swaps it for an explicit
+	// NotReady (beatDuring, #395); one that only waits on it (role provisioning) keeps it fresh
+	// via beatKeepingReadiness.
 	// Also before ensureDurableTimeline, whose beats touch the CURRENT verdict: touching the
 	// previous tick's would keep, say, a "standby streaming" Ready alive through a slow
 	// restartpoint on a standby this tick just found not streaming.
@@ -1697,11 +1698,14 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 //     socket-only transient postmaster (#350) and a node still starting, recovering or
 //     cloning are NotReady: only the real postmaster opens 127.0.0.1.
 //   - Saturated (max_connections exhausted, superuser_reserved_connections included -- the
-//     agent's role is a superuser) is NotReady, as it was under the exec probe, whose psql ran
-//     as the superuser too and failed the same way. A pod that refuses every new connection
-//     serves no new client; leaving the client-facing Services stops routing more attempts to
-//     it, while the headless Service (publishNotReadyAddresses) keeps replication and peer
-//     probes, and agent-mode liveness is the /healthz heartbeat, so nothing is restarted.
+//     agent's role is a superuser) is NotReady. It is NOT the exec probe's answer, though:
+//     Probe runs on the cached read session (#371), which an exhausted max_connections does
+//     not close, so Saturated is only seen once that session is lost and the redial is refused.
+//     A pod whose clients alone exhaust the slots stays Ready, where the exec probe's fresh
+//     psql per run went NotReady. When it does fire, leaving the client-facing Services stops
+//     routing more attempts to the pod, while the headless Service (publishNotReadyAddresses)
+//     keeps replication and peer probes, and agent-mode liveness is the /healthz heartbeat, so
+//     nothing is restarted.
 //   - tlsInactive is the #335 latch: set only on a DEFINITIVE `ssl = off`, never on a query
 //     that failed, and only while postgresql.tls.enabled is set.
 //   - A primary is Ready; a standby only while its walreceiver is streaming (#186), so a
@@ -2136,7 +2140,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err != nil {
 			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 		} else if changed || a.dbNameReloadPending {
-			if err := a.sup.Reload(ctx); err != nil {
+			if err := a.reloadPostgres(ctx); err != nil {
 				a.dbNameReloadPending = true
 				return fmt.Errorf("reload after patching primary_conninfo dbname: %w", err)
 			}
@@ -2155,7 +2159,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// worse, a failing reload there returns an error without latching, so the branch
 		// re-enters every tick with nothing to apply. It also double-reloaded on the #308 path.
 		if followRan {
-			if err := a.sup.Reload(ctx); err != nil {
+			if err := a.reloadPostgres(ctx); err != nil {
 				return fmt.Errorf("reload after follow: %w", err)
 			}
 		}
@@ -3811,6 +3815,17 @@ func (a *agent) startPostgres(ctx context.Context) error {
 	return a.sup.Start(ctx)
 }
 
+// reloadPostgres reloads the supervised postmaster and re-arms the TLS check (#395). `ssl` is a
+// sighup parameter, so any reload -- the operator's, or the agent's own after a Follow or a
+// primary_conninfo patch, which re-reads conf.d and every pending edit with it -- can turn it
+// off as surely as a restart. Every SIGHUP goes through here, and the one SQL reload
+// (assertSyncStandbySlots' pg_reload_conf) re-arms the same way, so none of them leaves
+// /readyz on the previous postmaster config for up to tlsVerifyInterval.
+func (a *agent) reloadPostgres(ctx context.Context) error {
+	a.tlsCheckedAt = time.Time{}
+	return a.sup.Reload(ctx)
+}
+
 // ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in
 // postgresql.auto.conf, where repmgr's own clone/follow/rejoin machinery writes it
 // without one (confirmed live -- repmgr's physical-replication-only conninfo writer
@@ -3965,8 +3980,15 @@ func (a *agent) fenceBudget() time.Duration {
 // is progressing", so the beat is armed only around a call known to be long, and a wedge
 // anywhere else still goes stale and still gets restarted. The residual cost is that a hung
 // pg_basebackup looks alive; the clone marker and discardTornClone recover that directory.
+//
+// Every caller promotes, clones, rewinds or initdbs the local postmaster, so the tick's
+// readiness verdict no longer describes it (#395). Replace it with an explicit NotReady up
+// front: left alone, a verdict of "primary" before a rewind kept /readyz answering 200 for a
+// stopped postmaster until it aged past the staleness bound, and then the body blamed a wedged
+// loop for what was a clone in progress. The replacement is kept fresh for the same reason.
 func (a *agent) beatDuring(fn func() error) error {
-	return a.beatAround(fn, a.metr.Beat)
+	a.metr.SetReadiness(observe.Readiness{Reason: "the agent is promoting, cloning, rewinding or initialising the local postmaster"})
+	return a.beatAround(fn, a.beatAndTouchReadiness)
 }
 
 // beatKeepingReadiness is beatDuring for a long call that leaves the local postmaster as the
@@ -4461,6 +4483,10 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	if a.lastSyncStandbySlots != nil && desired == *a.lastSyncStandbySlots {
 		return
 	}
+	// The pg_reload_conf() inside re-reads conf.d like any other reload, so it re-arms the
+	// #335 check exactly as reloadPostgres does (#395). Before the call, not on success: a
+	// failed ALTER skips the reload, but a reload that ran and then errored still applied.
+	a.tlsCheckedAt = time.Time{}
 	if err := a.prober.SetSynchronizedStandbySlots(ctx, a.selfConn(), slots); err != nil {
 		a.log.Warn("set synchronized_standby_slots", "err", err, "slots", desired)
 		return

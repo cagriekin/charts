@@ -237,8 +237,8 @@ func (m *Metrics) SetReadiness(r Readiness) {
 // reconcile loop calls it only while it waits on a call that leaves the local postmaster as
 // the verdict found it (an ALTER ROLE queued on a lock, a standby restartpoint): the loop is
 // progressing, so the verdict must not age out and take a serving pod out of the Services.
-// Calls that stop or replace the postmaster (clone, rewind, promote, initdb) beat /healthz
-// without touching this, so /readyz goes stale across them.
+// Calls that promote or replace the postmaster (clone, rewind, promote, initdb) first replace
+// the verdict with an explicit NotReady, so a touch there keeps that one fresh instead.
 func (m *Metrics) TouchReadiness() {
 	if s := m.readiness.Load(); s != nil {
 		m.readiness.Store(&readinessStamp{Readiness: s.Readiness, at: m.now()})

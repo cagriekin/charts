@@ -8,9 +8,10 @@
   container's readiness probe is now `httpGet /readyz` on `agent-metrics` instead of an exec
   script that ran bash, `pg_isready` and up to three `psql` every 10s -- about 22m CPU per idle
   pod, more than the agent itself. The agent answers from the state its reconcile loop already
-  observes, with the same semantics: a primary is Ready; a standby only while its walreceiver is
-  streaming (#186); NotReady while postgres does not answer on `127.0.0.1` (#350), while
-  `max_connections` is exhausted, and while `postgresql.tls.enabled` is set and the server
+  observes: a primary is Ready; a standby only while its walreceiver is streaming (#186);
+  NotReady while postgres does not answer on `127.0.0.1` (#350), while `max_connections`
+  refuses the agent's own redial (clients exhausting it alone no longer make the pod NotReady:
+  the agent holds a persistent session, where the exec probe dialled fresh), and while `postgresql.tls.enabled` is set and the server
   reports `ssl = off` (#335). `/readyz` also fails once the agent's last verdict is older than
   three reconcile intervals. Standalone mode keeps the exec probe.
 - **The pg-ha image moves to 2.6.0** (`ha.image.tag` and `etcd.rbac.bootstrapImage.tag`:

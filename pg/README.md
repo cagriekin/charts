@@ -161,7 +161,9 @@ so no `psql` or `pg_isready` process runs per probe (the exec probe cost about 2
 pod). It answers 503, with the reason in the body, while:
 
 - postgres does not answer on `127.0.0.1` (starting, recovering, cloning, mid-bootstrap or stopped);
-- postgres refuses connections with `max_connections` exhausted, including the superuser slots;
+- postgres refuses the agent's own redial with `max_connections` exhausted, including the
+  superuser slots. The agent keeps one persistent loopback session, so clients exhausting
+  `max_connections` alone leave the pod Ready (the exec probe dialled fresh and went NotReady);
 - the pod is a standby whose walreceiver is not streaming (cloning or catching up, #186), so a
   `RollingUpdate` never advances onto the clone source;
 - `postgresql.tls.enabled` is set and the server reports `ssl = off` (#335);

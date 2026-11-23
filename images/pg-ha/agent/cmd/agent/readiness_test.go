@@ -81,6 +81,38 @@ func TestStartPostgresRearmsTheTLSCheck(t *testing.T) {
 	}
 }
 
+// #395: `ssl` is a sighup parameter, so the agent's own reloads (after a Follow or a
+// primary_conninfo patch) must re-arm the throttled check exactly like an operator reload.
+func TestReloadPostgresRearmsTheTLSCheck(t *testing.T) {
+	ex := &tlsExec{ssl: "on"}
+	a := newTLSTestAgent(ex, true)
+	a.sup = process.NewSupervisor(&fakePostmaster{running: true})
+	a.verifyTLSActive(context.Background())
+	ex.ssl = "off"
+	if err := a.reloadPostgres(context.Background()); err != nil {
+		t.Fatalf("reloadPostgres: %v", err)
+	}
+	a.verifyTLSActive(context.Background())
+	if ex.calls != 2 || !a.tlsInactiveLatched {
+		t.Errorf("after a reload: calls = %d, latched = %v; want a re-probe that latches ssl=off", ex.calls, a.tlsInactiveLatched)
+	}
+}
+
+// #395: the synchronized_standby_slots reconcile reloads over SQL, which re-reads conf.d like a
+// SIGHUP does, so it must re-arm the throttled check too.
+func TestSyncStandbySlotsReloadRearmsTheTLSCheck(t *testing.T) {
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	a.tlsCheckedAt = time.Now()
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), []string{"pg_ha_slot_1"}, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload, got %v", ex.slotSyncSQL)
+	}
+	if !a.tlsCheckedAt.IsZero() {
+		t.Errorf("tlsCheckedAt = %v after a pg_reload_conf; want it re-armed", a.tlsCheckedAt)
+	}
+}
+
 // #395: the stall check's walreceiver read is the one readiness uses, so a standby's verdict
 // needs no extra query; it must record both answers.
 func TestObserveStandbyStallRecordsStreamingForReadiness(t *testing.T) {
@@ -100,26 +132,36 @@ func TestObserveStandbyStallRecordsStreamingForReadiness(t *testing.T) {
 }
 
 // #395 review: a long call that leaves the postmaster alone (role provisioning) keeps the
-// verdict fresh; one that stops or replaces it (clone, rewind, promote) lets it go stale.
+// verdict fresh; one that promotes or replaces it (clone, rewind, promote) is NotReady from its
+// first moment, for that reason rather than "stale", however long it runs.
 func TestLongCallsAgeReadinessOnlyWhenThePostmasterChanges(t *testing.T) {
 	const bound = 40 * time.Millisecond
 	for _, tc := range []struct {
-		name      string
-		run       func(a *agent, fn func() error) error
-		wantReady bool
+		name       string
+		run        func(a *agent, fn func() error) error
+		wantReady  bool
+		wantReason string
 	}{
-		{"beatKeepingReadiness", (*agent).beatKeepingReadiness, true},
-		{"beatDuring", (*agent).beatDuring, false},
+		{"beatKeepingReadiness", (*agent).beatKeepingReadiness, true, "primary"},
+		{"beatDuring", (*agent).beatDuring, false, "promoting, cloning, rewinding or initialising"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a := newFollowTestAgent(t, &scriptedExec{})
 			a.metr = observe.New()
 			a.cfg.ReconcileInterval = 5 * time.Millisecond
 			a.metr.SetReadiness(readinessVerdict(reconcile.LocalState{Running: true, HasData: true}, nil, false))
-			_ = tc.run(a, func() error { time.Sleep(3 * bound); return nil })
+			var during int
+			_ = tc.run(a, func() error {
+				during, _ = readyz(t, a.metr, bound)
+				time.Sleep(3 * bound)
+				return nil
+			})
+			if (during == http.StatusOK) != tc.wantReady {
+				t.Errorf("/readyz at the start of a long %s = %d, want ready=%v", tc.name, during, tc.wantReady)
+			}
 			code, body := readyz(t, a.metr, bound)
-			if (code == http.StatusOK) != tc.wantReady {
-				t.Errorf("/readyz after a long %s = %d %q, want ready=%v", tc.name, code, body, tc.wantReady)
+			if (code == http.StatusOK) != tc.wantReady || !strings.Contains(body, tc.wantReason) {
+				t.Errorf("/readyz after a long %s = %d %q, want ready=%v containing %q", tc.name, code, body, tc.wantReady, tc.wantReason)
 			}
 		})
 	}

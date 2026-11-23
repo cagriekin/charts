@@ -1487,8 +1487,10 @@ spec:
             #   - loopback TCP (#350): the bootstrap's socket-only transient postmaster does not
             #     answer 127.0.0.1, so a pod mid-bootstrap is NotReady.
             #   - TLS (#335): NotReady on a definitive `ssl = off` while postgresql.tls.enabled.
-            #   - saturation: NotReady while max_connections (superuser slots included) is
-            #     exhausted, as the exec probe's psql was.
+            #   - saturation: NotReady only once max_connections (superuser slots included)
+            #     refuses the agent's own redial. The agent holds one persistent loopback
+            #     session (#371), so clients exhausting max_connections alone leave the pod
+            #     Ready; the exec probe dialled fresh every run and went NotReady there.
             #   - staleness: the verdict is refreshed every reconcile tick and /readyz fails once
             #     it is older than 3x ha.agent.reconcileInterval, so a wedged loop cannot keep
             #     reporting its last good answer.

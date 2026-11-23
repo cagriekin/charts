@@ -97,11 +97,7 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	defer cancelStop()
 	switch kind {
 	case control.IntentReload:
-		// `ssl` is a sighup parameter, so a reload can turn it off (or back on) as surely as a
-		// restart: re-arm the throttled #335 check so /readyz reflects it on the next Running
-		// tick rather than up to tlsVerifyInterval later (#395).
-		a.tlsCheckedAt = time.Time{}
-		return a.sup.Reload(parent)
+		return a.reloadPostgres(parent)
 	case control.IntentRestart:
 		// Stop and start explicitly rather than stopping and letting the loop start it
 		// back up: under maintenance mode the loop is a no-op, so relying on it would
