@@ -1,6 +1,6 @@
 # pgvector chart changelog
 
-## Unreleased
+## 2.8.0 - 2026-11-24
 
 ### Changed
 
