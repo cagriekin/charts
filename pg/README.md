@@ -3088,7 +3088,8 @@ replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme
 
 | `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
 |-------------------|----------|-----------|-----------|
-| 2.7.2 *(current)* | `cagriekin/pg-ha:2.5.1-pg18` / `:2.5.1-pg17` (2.5.1+ for a switchover that always lands on the named pod on three or more members, #389) | 18.x (default) or 17.x | as below |
+| 2.8.0 *(current)* | `cagriekin/pg-ha:2.6.0-pg18` / `:2.6.0-pg17` (2.6.0+ required in agent mode: readiness is served by the agent's `/readyz`, #395) | 18.x (default) or 17.x | as below |
+| 2.7.2 | `cagriekin/pg-ha:2.5.1-pg18` / `:2.5.1-pg17` (2.5.1+ for a switchover that always lands on the named pod on three or more members, #389) | 18.x (default) or 17.x | as below |
 | 2.7.1 | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
 | 2.7.0 | `cagriekin/pg-ha:2.5.0-pg18` / `:2.5.0-pg17` (2.5.0+ required for `standbyResources`, #386; member tags take effect from 2.5.0, #275) | 18.x (default) or 17.x | as below; ≥ 1.34 with `postgresql.standbyResources` / `pgbackrest.standbyResources` (in-place pod resize) |
 | 2.6.0 | `cagriekin/pg-ha:2.4.0-pg18` / `:2.4.0-pg17` (2.4.0+ required: the chart no longer sets `REPMGR_NODE_COUNT`, #373) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
