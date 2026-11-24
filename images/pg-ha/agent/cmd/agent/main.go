@@ -235,6 +235,11 @@ type agent struct {
 	// one (#288 review). Zero value = nothing observed yet.
 	standbyLastProgressLSN pg.LSN
 
+	// localStreaming is this tick's read of pg_stat_wal_receiver on a running standby, for the
+	// readiness verdict (#395): nil when the node is not a running standby or the read failed.
+	// Reset at the top of observe() so a verdict never reuses a previous tick's answer.
+	localStreaming *bool
+
 	// initdbMarkerWaitOverride shortens the post-initdb wait for the postmaster to accept SQL.
 	// Zero means initdbMarkerWait; only tests set it.
 	initdbMarkerWaitOverride time.Duration
@@ -807,7 +812,7 @@ func (a *agent) boot(ctx context.Context) error {
 		if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 			return err
 		}
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 	}
 	a.log.Info("boot: on-disk primary state; deferring start until reconcile confirms holdership + highwater", "state", cd.State)
 	return nil
@@ -858,11 +863,19 @@ func (a *agent) tick(ctx context.Context) {
 	// spend its interval on a question that could not be asked.
 	if obs.Local.Running {
 		a.verifyTLSActive(ctx)
-		// Only a standby has a restartpoint to force, and only one that is actually streaming
-		// has a newer timeline to record (#298).
-		if obs.Local.InRecovery {
-			a.ensureDurableTimeline(ctx)
-		}
+	}
+	// After observe() and the TLS check, before act(): the verdict describes the node as this
+	// tick found it. An act() that promotes or replaces the postmaster swaps it for an explicit
+	// NotReady (beatDuring, #395); one that only waits on it (role provisioning) keeps it fresh
+	// via beatKeepingReadiness.
+	// Also before ensureDurableTimeline, whose beats touch the CURRENT verdict: touching the
+	// previous tick's would keep, say, a "standby streaming" Ready alive through a slow
+	// restartpoint on a standby this tick just found not streaming.
+	a.metr.SetReadiness(readinessVerdict(obs.Local, a.localStreaming, a.tlsInactiveLatched))
+	// Only a standby has a restartpoint to force, and only one that is actually streaming
+	// has a newer timeline to record (#298).
+	if obs.Local.Running && obs.Local.InRecovery {
+		a.ensureDurableTimeline(ctx)
 	}
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
@@ -1153,6 +1166,7 @@ func (a *agent) expectedNodes() int {
 }
 
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
+	a.localStreaming = nil
 	local := a.prober.Probe(ctx, a.selfConn())
 	ls := reconcile.LocalState{
 		HasData:    process.HasData(a.cfg.PGDATA),
@@ -1405,6 +1419,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	if m.Paused {
 		a.standbyNoReceiverTicks = 0
 		a.standbyLastProgressLSN = pg.LSN{}
+		// Readiness still needs the walreceiver state while paused (#395): a pause suspends
+		// failover, not the #186 gate that keeps a cloning standby out of a RollingUpdate.
+		if o.Local.Running && o.Local.InRecovery {
+			if _, streaming, err := a.prober.StreamingUpstream(ctx, a.selfConn()); err == nil {
+				a.localStreaming = &streaming
+			}
+		}
 	} else {
 		a.observeStandbyStall(ctx, &o)
 	}
@@ -1617,6 +1638,7 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 		// Could not look: not evidence of a stall. Hold the counter rather than advancing it.
 		return
 	}
+	a.localStreaming = &streaming
 	if streaming {
 		a.standbyNoReceiverTicks = 0
 		a.standbyLastProgressLSN = pg.LSN{}
@@ -1664,6 +1686,48 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 	if o.StandbyStalled {
 		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
 			"ticks", a.standbyNoReceiverTicks)
+	}
+}
+
+// readinessVerdict is the pod's readiness as the agent observed it this tick (#395). It
+// replaces the chart's exec probe (bash + pg_isready + up to three psql per run, ~22m CPU per
+// idle pod) with state the reconcile loop already reads over its own connection, and keeps
+// that probe's semantics:
+//
+//   - Running is the agent's probe over LOOPBACK TCP (selfConn), so the bootstrap's
+//     socket-only transient postmaster (#350) and a node still starting, recovering or
+//     cloning are NotReady: only the real postmaster opens 127.0.0.1.
+//   - Saturated (max_connections exhausted, superuser_reserved_connections included -- the
+//     agent's role is a superuser) is NotReady. It is NOT the exec probe's answer, though:
+//     Probe runs on the cached read session (#371), which an exhausted max_connections does
+//     not close, so Saturated is only seen once that session is lost and the redial is refused.
+//     A pod whose clients alone exhaust the slots stays Ready, where the exec probe's fresh
+//     psql per run went NotReady. When it does fire, leaving the client-facing Services stops
+//     routing more attempts to the pod, while the headless Service (publishNotReadyAddresses)
+//     keeps replication and peer probes, and agent-mode liveness is the /healthz heartbeat, so
+//     nothing is restarted.
+//   - tlsInactive is the #335 latch: set only on a DEFINITIVE `ssl = off`, never on a query
+//     that failed, and only while postgresql.tls.enabled is set.
+//   - A primary is Ready; a standby only while its walreceiver is streaming (#186), so a
+//     RollingUpdate does not advance onto the clone source while a standby clones or catches
+//     up. A standby whose walreceiver could not be read this tick is NotReady: no evidence of
+//     streaming, the same answer the exec probe gave when its psql failed.
+func readinessVerdict(l reconcile.LocalState, streaming *bool, tlsInactive bool) observe.Readiness {
+	switch {
+	case !l.Running && l.Saturated:
+		return observe.Readiness{Reason: "local postgres refuses connections: max_connections exhausted"}
+	case !l.Running:
+		return observe.Readiness{Reason: "postgres is not accepting connections on 127.0.0.1 (starting, recovering, cloning, bootstrapping or stopped)"}
+	case tlsInactive:
+		return observe.Readiness{Reason: "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)"}
+	case !l.InRecovery:
+		return observe.Readiness{Ready: true, Reason: "primary"}
+	case streaming == nil:
+		return observe.Readiness{Reason: "standby: walreceiver status could not be read"}
+	case !*streaming:
+		return observe.Readiness{Reason: "standby walreceiver is not streaming (cloning, catching up or reconnecting, #186)"}
+	default:
+		return observe.Readiness{Ready: true, Reason: "standby streaming"}
 	}
 }
 
@@ -2076,7 +2140,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err != nil {
 			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 		} else if changed || a.dbNameReloadPending {
-			if err := a.sup.Reload(ctx); err != nil {
+			if err := a.reloadPostgres(ctx); err != nil {
 				a.dbNameReloadPending = true
 				return fmt.Errorf("reload after patching primary_conninfo dbname: %w", err)
 			}
@@ -2095,7 +2159,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// worse, a failing reload there returns an error without latching, so the branch
 		// re-enters every tick with nothing to apply. It also double-reloaded on the #308 path.
 		if followRan {
-			if err := a.sup.Reload(ctx); err != nil {
+			if err := a.reloadPostgres(ctx); err != nil {
 				return fmt.Errorf("reload after follow: %w", err)
 			}
 		}
@@ -2194,7 +2258,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Safe for the stickiness logic in cascadeFollowTarget: it only honours a latched
 		// upstream that is not the leader, and this one always is.
 		a.latchFollow(dec.Target)
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 
 	case reconcile.ReleaseLease:
 		// Step down: demote/stop the local writer FIRST, then release the Lease so a
@@ -2399,7 +2463,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 					return err
 				}
 			}
-			if err := a.sup.Start(ctx); err != nil {
+			if err := a.startPostgres(ctx); err != nil {
 				return err
 			}
 			if primaryState {
@@ -2423,7 +2487,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 				return err
 			}
-			if err := a.sup.Start(ctx); err != nil {
+			if err := a.startPostgres(ctx); err != nil {
 				return err
 			}
 			a.metr.IncRecoveryStart()
@@ -2460,7 +2524,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			}
 			a.log.Warn("restart local: the postmaster did not exit before the stop deadline and was killed; starting it back up", "err", serr)
 		}
-		return a.sup.Start(ctx)
+		return a.startPostgres(ctx)
 
 	case reconcile.BootstrapInitdb:
 		// The entrypoint deliberately does NOT initdb on the agent path (#288). It cannot: the
@@ -2653,7 +2717,7 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 		a.log.Warn("lost the lease during initdb; discarding the fresh data directory so this node can clone from the new holder (#288)")
 		return a.discardFreshDataDir()
 	}
-	if err := a.sup.Start(ctx); err != nil {
+	if err := a.startPostgres(ctx); err != nil {
 		return fmt.Errorf("bootstrap initdb: start: %w", err)
 	}
 	// Arm the lost-leadership fence before the first tick observes this node, mirroring
@@ -3112,7 +3176,7 @@ func (a *agent) ensureManagedRolesOnce(ctx context.Context) {
 		// primary's agent liveness-killed. One budget per role, so a role stuck on a lock does
 		// not leave the other an already-expired deadline.
 		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := a.beatDuring(func() error {
+		err := a.beatKeepingReadiness(func() error {
 			return pg.EnsureRole(rctx, a.roleExec, a.cfg.PostgresUser, a.cfg.PostgresDB, r)
 		})
 		cancel()
@@ -3621,7 +3685,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// minute. It also covers the early return below, which is the COMMON path (a caught-up
 	// standby has nothing to repair) and previously beat not at all no matter how long the read
 	// took.
-	a.metr.Beat()
+	a.beatAndTouchReadiness()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {
 		return
@@ -3632,7 +3696,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// And again before the CHECKPOINT, which is the one call here that is slow while perfectly
 	// healthy (a restartpoint flushes dirty shared buffers). Same heartbeat-through-a-long-call
 	// pattern the clone path uses.
-	a.metr.Beat()
+	a.beatAndTouchReadiness()
 	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
 		// BACK OFF here too (#298 review). The commonest way this errors is the budget above
 		// expiring on a restartpoint that is genuinely slow -- a full flush of dirty shared
@@ -3703,9 +3767,9 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 //
 // The loudness has three channels, because each reaches a different reader: the gauge
 // (pg_ha_agent_tls_inactive) is what an alert can page on, the Error log names the cause and the
-// remedy for whoever opens `kubectl logs`, and the readiness probe -- rendered by the chart, not
-// here -- takes the pod out of the client-facing Services so nothing keeps talking plaintext to
-// it. The headless Service sets publishNotReadyAddresses, so replication and the agent's own
+// remedy for whoever opens `kubectl logs`, and the readiness verdict /readyz serves
+// (readinessVerdict, #395) takes the pod out of the client-facing Services so nothing keeps
+// talking plaintext to it. The headless Service sets publishNotReadyAddresses, so replication and the agent's own
 // peer probes are unaffected by that.
 func (a *agent) verifyTLSActive(ctx context.Context) {
 	if !a.cfg.TLSEnabled {
@@ -3740,6 +3804,26 @@ func (a *agent) verifyTLSActive(ctx context.Context) {
 			"This pod is failing its readiness probe until then, so it serves no client traffic",
 			"confd", a.confdDir)
 	}
+}
+
+// startPostgres starts the supervised postmaster and re-arms the TLS check (#395). /readyz
+// serves the #335 verdict, and a new postmaster can load a different `ssl` than the one the
+// throttled check last saw: without the re-arm, a restart into plaintext stayed Ready for up to
+// tlsVerifyInterval, where the exec probe it replaced refused readiness on its first run.
+func (a *agent) startPostgres(ctx context.Context) error {
+	a.tlsCheckedAt = time.Time{}
+	return a.sup.Start(ctx)
+}
+
+// reloadPostgres reloads the supervised postmaster and re-arms the TLS check (#395). `ssl` is a
+// sighup parameter, so any reload -- the operator's, or the agent's own after a Follow or a
+// primary_conninfo patch, which re-reads conf.d and every pending edit with it -- can turn it
+// off as surely as a restart. Every SIGHUP goes through here, and the one SQL reload
+// (assertSyncStandbySlots' pg_reload_conf) re-arms the same way, so none of them leaves
+// /readyz on the previous postmaster config for up to tlsVerifyInterval.
+func (a *agent) reloadPostgres(ctx context.Context) error {
+	a.tlsCheckedAt = time.Time{}
+	return a.sup.Reload(ctx)
 }
 
 // ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in
@@ -3896,7 +3980,31 @@ func (a *agent) fenceBudget() time.Duration {
 // is progressing", so the beat is armed only around a call known to be long, and a wedge
 // anywhere else still goes stale and still gets restarted. The residual cost is that a hung
 // pg_basebackup looks alive; the clone marker and discardTornClone recover that directory.
+//
+// Every caller promotes, clones, rewinds or initdbs the local postmaster, so the tick's
+// readiness verdict no longer describes it (#395). Replace it with an explicit NotReady up
+// front: left alone, a verdict of "primary" before a rewind kept /readyz answering 200 for a
+// stopped postmaster until it aged past the staleness bound, and then the body blamed a wedged
+// loop for what was a clone in progress. The replacement is kept fresh for the same reason.
 func (a *agent) beatDuring(fn func() error) error {
+	a.metr.SetReadiness(observe.Readiness{Reason: "the agent is promoting, cloning, rewinding or initialising the local postmaster"})
+	return a.beatAround(fn, a.beatAndTouchReadiness)
+}
+
+// beatKeepingReadiness is beatDuring for a long call that leaves the local postmaster as the
+// tick's readiness verdict found it, so /readyz stays fresh alongside /healthz (#395 review):
+// without it an ALTER ROLE queued on a lock aged a healthy primary's verdict past the staleness
+// bound and dropped it from the client Services while it served normally.
+func (a *agent) beatKeepingReadiness(fn func() error) error {
+	return a.beatAround(fn, a.beatAndTouchReadiness)
+}
+
+func (a *agent) beatAndTouchReadiness() {
+	a.metr.Beat()
+	a.metr.TouchReadiness()
+}
+
+func (a *agent) beatAround(fn func() error, beat func()) error {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -3915,7 +4023,7 @@ func (a *agent) beatDuring(fn func() error) error {
 			case <-stop:
 				return
 			case <-t.C:
-				a.metr.Beat()
+				beat()
 			}
 		}
 	}()
@@ -3924,7 +4032,7 @@ func (a *agent) beatDuring(fn func() error) error {
 	<-done
 	// One final beat, so the window between the last tick of the helper and the next real
 	// tick cannot itself go stale on a long-running operation that finished just after a beat.
-	a.metr.Beat()
+	beat()
 	return err
 }
 
@@ -4375,6 +4483,10 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	if a.lastSyncStandbySlots != nil && desired == *a.lastSyncStandbySlots {
 		return
 	}
+	// The pg_reload_conf() inside re-reads conf.d like any other reload, so it re-arms the
+	// #335 check exactly as reloadPostgres does (#395). Before the call, not on success: a
+	// failed ALTER skips the reload, but a reload that ran and then errored still applied.
+	a.tlsCheckedAt = time.Time{}
 	if err := a.prober.SetSynchronizedStandbySlots(ctx, a.selfConn(), slots); err != nil {
 		a.log.Warn("set synchronized_standby_slots", "err", err, "slots", desired)
 		return
@@ -4574,7 +4686,7 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	// dec.Target after its own clone. It also re-arms observeStandbyStall, which requires a
 	// non-empty latch, so a standby that stalls right after a rejoin can escalate again.
 	a.latchFollow(target)
-	return a.sup.Start(ctx)
+	return a.startPostgres(ctx)
 }
 
 // newMechanism builds the replication mechanics (#287, #294).

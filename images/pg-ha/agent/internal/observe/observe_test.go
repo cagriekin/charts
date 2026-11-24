@@ -87,7 +87,9 @@ func TestMetricsHandlerServesNoControlRoutes(t *testing.T) {
 
 // Only these three routes exist on the metrics port.
 func TestMetricsHandlerRoutes(t *testing.T) {
-	h := New().Handler(time.Minute)
+	m := New()
+	m.SetReadiness(Readiness{Ready: true, Reason: "primary"})
+	h := m.Handler(time.Minute)
 	for _, path := range []string{"/metrics", "/healthz", "/readyz"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
@@ -116,5 +118,39 @@ func TestControlCountersAreExported(t *testing.T) {
 		if !strings.Contains(sb.String(), want) {
 			t.Errorf("metrics output should contain %q:\n%s", want, sb.String())
 		}
+	}
+}
+
+// #395: /readyz serves the reconcile loop's verdict, is NotReady before the first one, and
+// fails once the verdict is older than the bound -- a wedged loop must not keep answering
+// with its last good verdict.
+func TestReadyzServesTheLoopVerdictWithinTheBound(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	m := New()
+	m.now = func() time.Time { return now }
+	get := func() (int, string) {
+		rr := httptest.NewRecorder()
+		m.Handler(15*time.Second).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		return rr.Code, rr.Body.String()
+	}
+	if code, body := get(); code != http.StatusServiceUnavailable || !strings.Contains(body, "no readiness verdict yet") {
+		t.Errorf("before the first verdict: /readyz = %d %q, want 503 naming the missing verdict", code, body)
+	}
+	m.SetReadiness(Readiness{Ready: true, Reason: "primary"})
+	if code, body := get(); code != http.StatusOK || !strings.Contains(body, "primary") {
+		t.Errorf("fresh ready verdict: /readyz = %d %q, want 200", code, body)
+	}
+	m.SetReadiness(Readiness{Reason: "standby walreceiver is not streaming"})
+	if code, body := get(); code != http.StatusServiceUnavailable || !strings.Contains(body, "not streaming") {
+		t.Errorf("fresh NotReady verdict: /readyz = %d %q, want 503 with the reason", code, body)
+	}
+	m.SetReadiness(Readiness{Ready: true, Reason: "primary"})
+	now = now.Add(14 * time.Second)
+	if code, _ := get(); code != http.StatusOK {
+		t.Errorf("verdict inside the bound: /readyz = %d, want 200", code)
+	}
+	now = now.Add(time.Second)
+	if code, body := get(); code != http.StatusServiceUnavailable || !strings.Contains(body, "stale") {
+		t.Errorf("verdict at the bound: /readyz = %d %q, want 503 stale", code, body)
 	}
 }

@@ -97,7 +97,7 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	defer cancelStop()
 	switch kind {
 	case control.IntentReload:
-		return a.sup.Reload(parent)
+		return a.reloadPostgres(parent)
 	case control.IntentRestart:
 		// Stop and start explicitly rather than stopping and letting the loop start it
 		// back up: under maintenance mode the loop is a no-op, so relying on it would
@@ -135,7 +135,7 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		if err := a.assertRestartRecoverySignal(parent); err != nil {
 			return err
 		}
-		if err := a.sup.Start(parent); err != nil {
+		if err := a.startPostgres(parent); err != nil {
 			return fmt.Errorf("start postgres: %w", err)
 		}
 		a.log.Info("control: restarted postgres")

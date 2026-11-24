@@ -127,6 +127,9 @@ postgresql:
     timeoutSeconds: 5
     failureThreshold: 10
 
+  # In agent mode (ha.enabled) this is httpGet /readyz on the agent's metrics port: the agent
+  # answers from its own reconcile loop, so no psql runs per probe (#395). Standalone keeps an
+  # exec probe (pg_isready over 127.0.0.1, plus `SHOW ssl` under tls.enabled).
   readinessProbe:
     enabled: true
     initialDelaySeconds: 5
@@ -582,7 +585,7 @@ postgresql:
 ha:
   image:
     repository: cagriekin/pg-ha
-    tag: 2.5.1-pg18
+    tag: 2.6.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -1750,4 +1753,4 @@ etcd:
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha
-      tag: 2.5.1-pg18
+      tag: 2.6.0-pg18

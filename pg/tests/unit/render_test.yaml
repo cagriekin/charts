@@ -342,10 +342,11 @@ tests:
       - exists:
           path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe
 
-  # #350: the startup and readiness probes must not be satisfied by the bootstrap's socket-only
-  # transient postmaster, so pg_isready asks loopback TCP; the readiness psql checks stay on the
-  # socket. Liveness is /healthz in agent mode and untouched in standalone mode.
-  - it: startup and readiness probes ask pg_isready over loopback (#350)
+  # #350: the startup probe must not be satisfied by the bootstrap's socket-only transient
+  # postmaster, so pg_isready asks loopback TCP. Agent-mode readiness is the agent's /readyz
+  # (#395), whose loopback check is the agent's own 127.0.0.1 connection. Liveness is /healthz
+  # in agent mode and untouched in standalone mode.
+  - it: startup probe asks pg_isready over loopback, readiness is the agent /readyz (#350, #395)
     values:
       - ../values-agent.yaml
     template: templates/statefulset.yaml
@@ -353,12 +354,13 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[?(@.name=="postgresql")].startupProbe.exec.command[2]
           pattern: '^pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB"$'
-      - matchRegex:
-          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]
-          pattern: '^pg_isready -h 127\.0\.0\.1 -U "\$POSTGRES_USER" -d "\$POSTGRES_DB" >/dev/null 2>&1 \|\| exit 1'
-      - notMatchRegex:
-          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]
-          pattern: 'psql -h'
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe.httpGet
+          value:
+            path: /readyz
+            port: agent-metrics
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe.exec
       - equal:
           path: spec.template.spec.containers[?(@.name=="postgresql")].livenessProbe.httpGet.path
           value: /healthz

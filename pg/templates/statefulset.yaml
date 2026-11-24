@@ -1476,56 +1476,29 @@ spec:
 {{- if .Values.postgresql.readinessProbe.enabled }}
           readinessProbe:
 {{- if eq (include "pg.agentMode" .) "true" }}
-            # Agent mode: readiness is replication-aware (#186). A standby reports Ready
-            # only once its walreceiver is actually streaming -- NOT merely when postgres
-            # accepts connections. Because a StatefulSet RollingUpdate advances to the
-            # next pod only after the current one is Ready, gating standby readiness on
-            # streaming stops the controller from rolling the primary / clone-source
-            # while a standby is still cloning or catching up (which interrupted the
-            # clone and deadlocked the cluster). A primary stays plain pg_isready. A
-            # cloning standby (no postgres yet, or walreceiver not yet streaming) is
-            # NotReady by design -- it is not killed (agent-mode liveness is the agent
-            # /healthz heartbeat, and readiness is independent of the startup probe).
-            # pg_isready probes LOOPBACK TCP (#350): the bootstrap's socket-only transient
-            # postmaster used to answer the socket and report the pod Ready mid-bootstrap,
-            # with the bootstrap pg_hba still on disk, then NotReady when it was stopped.
-            # The psql checks stay on the socket on purpose: they run as $POSTGRES_USER under
-            # the local trust rule, and once loopback answers, the socket is the real
-            # postmaster's too (the two never coexist).
-            exec:
-              command:
-                - /bin/bash
-                - -c
-                - |
-                  pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
-                  {{- if .Values.postgresql.tls.enabled }}
-                  {{- /* Fail closed when requested server TLS is not actually on (#335).
-                         `SHOW ssl` is the only signal that reports what the postmaster
-                         LOADED; the ConfigMap, the mounted Secret and the values file all
-                         describe what was rendered, and #335 is exactly the case where the
-                         two disagree in silence -- the release goes Ready, the certificate
-                         is mounted, and the server accepts only plaintext.
-                         A NotReady pod leaves the client-facing Services, so nothing keeps
-                         talking plaintext to it, while the headless Service
-                         (publishNotReadyAddresses) keeps replication and the agent's peer
-                         probes working -- and a RollingUpdate stalls here rather than
-                         rolling the whole cluster into the broken state.
-                         Only a DEFINITIVE "off" fails. An empty answer is a psql that did
-                         not run, which is uncertainty rather than evidence of plaintext;
-                         failing on it would turn a transient blip into a write outage. The
-                         agent alarms on that case separately (pg_ha_agent_tls_inactive). */}}
-                  if [ "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW ssl" 2>/dev/null)" = "off" ]; then
-                    echo "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)" >&2
-                    exit 1
-                  fi
-{{- end }}
-                  rec=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null)
-                  if [ "$rec" = "f" ]; then exit 0; fi
-                  if [ "$rec" = "t" ]; then
-                    st=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT status FROM pg_stat_wal_receiver" 2>/dev/null)
-                    [ "$st" = "streaming" ] && exit 0 || exit 1
-                  fi
-                  exit 1
+            # Agent mode: the agent serves readiness from the state its reconcile loop already
+            # observes over its own loopback connection (#395). The exec probe this replaces ran
+            # bash + pg_isready + up to three psql every period -- each a Perl pg_wrapper and a
+            # backend fork, ~22m CPU per idle pod, more than the agent itself. Same semantics:
+            #   - replication-aware (#186): a standby is Ready only while its walreceiver is
+            #     streaming, so a RollingUpdate never advances onto the clone source while a
+            #     standby is still cloning or catching up. A NotReady cloning standby is not
+            #     killed: liveness is the /healthz heartbeat.
+            #   - loopback TCP (#350): the bootstrap's socket-only transient postmaster does not
+            #     answer 127.0.0.1, so a pod mid-bootstrap is NotReady.
+            #   - TLS (#335): NotReady on a definitive `ssl = off` while postgresql.tls.enabled.
+            #   - saturation: NotReady only once max_connections (superuser slots included)
+            #     refuses the agent's own redial. The agent holds one persistent loopback
+            #     session (#371), so clients exhausting max_connections alone leave the pod
+            #     Ready; the exec probe dialled fresh every run and went NotReady there.
+            #   - staleness: the verdict is refreshed every reconcile tick and /readyz fails once
+            #     it is older than 3x ha.agent.reconcileInterval, so a wedged loop cannot keep
+            #     reporting its last good answer.
+            # Needs the pg-ha image at 2.6.0 or later (pg.validateAgentImageFloor): an older
+            # agent's /readyz always answers 200.
+            httpGet:
+              path: /readyz
+              port: agent-metrics
 {{- else }}
             exec:
               command:

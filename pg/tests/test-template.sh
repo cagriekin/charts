@@ -244,6 +244,16 @@ floor_custom=0; helm template test-pg "${CHART_DIR}" --set ha.image.tag=mirror-b
 assert_eq "#373: a custom tag is not second-guessed" "0" "${floor_custom}"
 floor_sa=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.image.tag=2.3.0-pg18 >/dev/null 2>&1 || floor_sa=$?
 assert_eq "#373: standalone ignores the floor (no agent runs)" "0" "${floor_sa}"
+# #395: agent-mode readiness is httpGet /readyz, which an agent before image 2.6.0 answers with
+# 200 whenever its process is up: every pod would report Ready unconditionally.
+floor_readyz=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=2.5.1-pg18 --set etcd.rbac.bootstrapImage.tag=2.5.1-pg18 2>&1 || true)
+assert_contains "#395: a pre-2.6.0 chart-scheme image tag fails the render" "${floor_readyz}" "needs the pg-ha image at 2.6.0 or later"
+assert_contains "#395: ... naming /readyz" "${floor_readyz}" "/readyz"
+assert_contains "#395: ... and the offending tag" "${floor_readyz}" "2.5.1-pg18"
+floor_readyz_sa=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.image.tag=2.5.1-pg18 >/dev/null 2>&1 || floor_readyz_sa=$?
+assert_eq "#395: standalone ignores the floor (exec readiness, no agent)" "0" "${floor_readyz_sa}"
+floor_readyz_ok=0; helm template test-pg "${CHART_DIR}" --set ha.image.tag=2.6.0-pg18 --set etcd.rbac.bootstrapImage.tag=2.6.0-pg18 >/dev/null 2>&1 || floor_readyz_ok=$?
+assert_eq "#395: 2.6.0 renders" "0" "${floor_readyz_ok}"
 lag_custom_rc=0; helm template test-pg "${CHART_DIR}" --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=internal-build-42 --set etcd.rbac.bootstrapImage.tag=internal-build-42 >/dev/null 2>&1 || lag_custom_rc=$?
 assert_eq "#273: a custom image tag is not checked" "0" "${lag_custom_rc}"
 lag_sa_rc=0; helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 --set ha.agent.maximumLagOnFailover=1048576 --set ha.image.tag=2.0.2-pg18 >/dev/null 2>&1 || lag_sa_rc=$?
@@ -479,7 +489,7 @@ pkg_major19=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
-  --set repmgr.image.tag=2.4.0-pg19 \
+  --set repmgr.image.tag=2.6.0-pg19 \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "postgresql-19-cron"
@@ -2125,11 +2135,15 @@ done
 assert_eq "agent: all required agent env vars present (Load fail-fast)" "" "${agent_env_missing}"
 assert_contains "agent: metrics port 9200 exposed" "${agent_pg_cont}" "containerPort: 9200"
 assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "path: /healthz"
-# #186: agent-mode readiness is replication-aware -- a standby is Ready only when its
-# walreceiver is streaming, so RollingUpdate won't roll the primary/clone-source while
-# a standby is mid-clone. Primary readiness stays plain pg_isready.
-assert_contains "agent #186: readiness checks recovery role" "${agent_pg_cont}" "SELECT pg_is_in_recovery()"
-assert_contains "agent #186: standby readiness gated on streaming" "${agent_pg_cont}" "SELECT status FROM pg_stat_wal_receiver"
+# #395: agent-mode readiness is the agent's /readyz, which carries the #186 (standby ready only
+# while streaming), #350 (loopback) and #335 (ssl=off) semantics in the agent itself
+# (readinessVerdict, unit-tested there). No psql or pg_isready runs per probe.
+agent_readiness=$(printf '%s\n' "${agent_pg_cont}" | awk '/readinessProbe:/{f=1; next} f && /^          [a-z]+:$/{exit} f' | grep -v '^ *#')
+assert_contains "agent #395: readiness probes the agent /readyz" "${agent_readiness}" "path: /readyz"
+assert_contains "agent #395: ... on the agent metrics port" "${agent_readiness}" "port: agent-metrics"
+assert_not_contains "agent #395: no exec readiness probe" "${agent_readiness}" "exec:"
+assert_not_contains "agent #395: no psql per readiness probe" "${agent_readiness}" "psql"
+assert_not_contains "agent #395: no pg_isready per readiness probe" "${agent_readiness}" "pg_isready"
 # standalone keeps the bare pg_isready readiness probe -- there is no replication.
 assert_not_contains "standalone #186: readiness stays bare pg_isready (no wal_receiver check)" "${standalone_sts_hba}" "SELECT status FROM pg_stat_wal_receiver"
 # startupProbe (#172) kept in agent mode
@@ -2146,14 +2160,13 @@ for mode_name in agent standalone; do
   if [ "${mode_name}" = agent ]; then cont="${agent_pg_cont}"; else cont="${standalone_sts_hba}"; fi
   assert_eq "#350 ${mode_name}: every startupProbe pg_isready asks 127.0.0.1" \
     "$(probe_pg_isready "${cont}" startup | grep -c .)" "$(probe_pg_isready "${cont}" startup | grep -c -- '-h 127.0.0.1')"
-  assert_eq "#350 ${mode_name}: every readinessProbe pg_isready asks 127.0.0.1" \
-    "$(probe_pg_isready "${cont}" readiness | grep -c .)" "$(probe_pg_isready "${cont}" readiness | grep -c -- '-h 127.0.0.1')"
   assert_not_eq "#350 ${mode_name}: ... and there is at least one startup pg_isready" "0" "$(probe_pg_isready "${cont}" startup | grep -c .)"
-  assert_not_eq "#350 ${mode_name}: ... and at least one readiness pg_isready" "0" "$(probe_pg_isready "${cont}" readiness | grep -c .)"
 done
-readiness_block=$(printf '%s\n' "${agent_pg_cont}" | awk '/readinessProbe:/{f=1; next} f && /^          [a-z]+:$/{exit} f')
-assert_not_contains "#350: the readiness psql checks stay on the unix socket (local trust)" "${readiness_block}" 'psql -h'
-assert_contains "#350: ... and still ask the recovery role there" "${readiness_block}" 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"'
+# Agent-mode readiness is /readyz (#395), whose loopback check is the agent's own 127.0.0.1
+# connection; standalone keeps the exec probe and its loopback pg_isready.
+assert_eq "#350 standalone: every readinessProbe pg_isready asks 127.0.0.1" \
+  "$(probe_pg_isready "${standalone_sts_hba}" readiness | grep -c .)" "$(probe_pg_isready "${standalone_sts_hba}" readiness | grep -c -- '-h 127.0.0.1')"
+assert_not_eq "#350 standalone: ... and at least one readiness pg_isready" "0" "$(probe_pg_isready "${standalone_sts_hba}" readiness | grep -c .)"
 assert_contains "#350: standalone liveness pg_isready is unchanged (it only runs after startup succeeded)" "$(probe_pg_isready "${standalone_sts_hba}" liveness)" '^ *- pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"$'
 assert_contains "#350: the postStart wait loop still waits on the socket (it must see the transient too)" "${agent_pg_cont}" 'if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then'
 # The guard: a listen_addresses without loopback would render a pod that is never Ready.
@@ -3709,14 +3722,14 @@ sync_slots_pg16_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=2.4.0-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
+  --set repmgr.image.tag=2.6.0-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
 assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
 # walLevel=logical isolates this to the MAJOR-version guard specifically (both guards
 # would otherwise fire on the default walLevel, and a bare non-zero rc cannot tell which).
 sync_slots_pg16_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=2.4.0-pg16 2>&1 || true)
+  --set repmgr.image.tag=2.6.0-pg16 2>&1 || true)
 assert_contains "#308: PG16 guard message names the version requirement" "${sync_slots_pg16_msg}" "requires PostgreSQL 17+"
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.
@@ -3819,7 +3832,7 @@ assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
 major_rebump=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 \
+  --set repmgr.image.tag=2.6.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && major_rebump_rc=0 || major_rebump_rc=$?
 assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "0" "${major_rebump_rc}"
 
@@ -3829,7 +3842,7 @@ assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "
 # a PG17 server while every extension path the chart builds points at /18/.
 major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
+  --set repmgr.image.tag=2.6.0-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
 assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
 assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match ha.image.majorVersion"
 
@@ -3841,10 +3854,10 @@ pg17_full=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 \
+  --set repmgr.image.tag=2.6.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && pg17_full_rc=0 || pg17_full_rc=$?
 assert_eq "#269: PG17 selection renders" "0" "${pg17_full_rc}"
-assert_contains "#269: PG17 selection uses the -pg17 HA image" "${pg17_full}" "cagriekin/pg-ha:2.4.0-pg17"
+assert_contains "#269: PG17 selection uses the -pg17 HA image" "${pg17_full}" "cagriekin/pg-ha:2.6.0-pg17"
 
 # Extensions are where a wrong major becomes a crash-looping init container: the copy
 # paths are built from postgresql.majorVersion, so they must follow the selection with no
@@ -3854,7 +3867,7 @@ pg17_ext=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 \
+  --set repmgr.image.tag=2.6.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG17 extension lib path" "${pg17_ext}" "/usr/lib/postgresql/17/lib"
 assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/postgresql/17/extension"
@@ -3867,7 +3880,7 @@ pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 \
+  --set repmgr.image.tag=2.6.0-pg17 \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 # pgaudit alone: #294 made native the only mechanism, and native has no repmgr extension to
 # preserve, so the chart merges nothing into the operator's list.
@@ -3878,7 +3891,7 @@ assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_p
 # The two majorVersion values are hand-typed claims; the -pgNN suffix is the artifact. A
 # values file that moves one and not the other must fail at render, not run the wrong major.
 tag_mismatch=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.image.tag=2.4.0-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
+  --set repmgr.image.tag=2.6.0-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
 assert_eq "#269: render fails when the -pg17 tag disagrees with majorVersion" "1" "${tag_mismatch_rc}"
 assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch}" "is built for PostgreSQL 17"
 
@@ -3887,7 +3900,7 @@ assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch
 # entrypoint's require_pg_bindir and the agent then refuse to start the wrong image.
 pgmajor_env=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=2.4.0-pg17 \
+  --set repmgr.image.tag=2.6.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG_MAJOR env follows repmgr.image.majorVersion" "${pgmajor_env}" "value: \"17\""
 pgmajor_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_env}")
@@ -4295,7 +4308,7 @@ extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
-  --set repmgr.image.tag=2.4.0-pg19 \
+  --set repmgr.image.tag=2.6.0-pg19 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/lib" "${extpaths_19}" "mountPath: /usr/lib/postgresql/19/lib"
 assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
@@ -4742,11 +4755,10 @@ assert_not_contains "#335 off: no TLS_ENABLED env" "${tls_off}" "TLS_ENABLED"
 assert_not_contains "#335 off: readiness does not query ssl" "${tls_off}" "SHOW ssl"
 assert_contains "#335: TLS_ENABLED env present when tls.enabled" "${tls_sts}" 'name: TLS_ENABLED
               value: "true"'
-assert_contains "#335: readiness asserts the running server reports ssl" "${tls_sts}" 'SHOW ssl'
-assert_contains "#335: readiness refuses rather than serving plaintext" "${tls_sts}" "refusing readiness rather than serving clients in plaintext"
-# Only a DEFINITIVE off fails: an empty answer is a psql that did not run, and failing on it
-# would turn a transient blip into a write outage.
-assert_contains "#335: readiness fails only on a definitive off" "${tls_sts}" '"SHOW ssl" 2>/dev/null)" = "off" ]'
+# Agent mode: the agent verifies `SHOW ssl` itself and /readyz fails on a definitive off (#395),
+# so the rendered probe carries no psql.
+assert_not_contains "#335 agent: readiness runs no SHOW ssl (the agent checks it)" "${tls_sts}" 'SHOW ssl'
+assert_contains "#335 agent: readiness is the agent /readyz" "${tls_sts}" "path: /readyz"
 # Standalone has no agent, so the readiness gate is the ONLY channel there -- it must render
 # in that branch too, which previously carried a bare one-line pg_isready.
 tls_sa_ready=$(helm template test-pg "${CHART_DIR}" \
@@ -6564,7 +6576,7 @@ legacy_img_ha=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=trixie-5
 assert_contains "#298: rejected under the ha.image spelling as well" "${legacy_img_ha}" "is a 1.x image tag"
 # The current scheme renders, and so does any tag that is merely unfamiliar -- the guard is
 # narrow on purpose (a private mirror's tags are not second-guessed).
-for good_tag in "2.4.0-pg18" "2.5.0-pg18" "internal-build-42"; do
+for good_tag in "2.6.0-pg18" "internal-build-42"; do
   gt_rc=0
   helm template test-pg "${CHART_DIR}" --set ha.image.tag="${good_tag}" \
     --set etcd.rbac.bootstrapImage.tag="${good_tag}" >/dev/null 2>&1 || gt_rc=$?
@@ -6677,15 +6689,15 @@ assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails th
   "${etcd_drift}" "must match ha.image"
 etcd_lock_rc=0
 helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.4.0-pg18 \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.6.0-pg18 \
   --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
-  --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
+  --set etcd.rbac.bootstrapImage.tag=2.6.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
 assert_eq "#291: moving both halves together renders" "0" "${etcd_lock_rc}"
 # ...and exactly one image reaches the manifests in that case.
 etcd_lock_imgs=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.4.0-pg18 \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.6.0-pg18 \
   --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
-  --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 2>/dev/null \
+  --set etcd.rbac.bootstrapImage.tag=2.6.0-pg18 2>/dev/null \
   | grep -oE 'cagriekin/[^"[:space:]]*' | sort -u | wc -l)
 assert_eq "#291: the lockstep render uses exactly one cagriekin image" "1" "${etcd_lock_imgs}"
 # The default (bundled etcd, untouched pins) must be in lockstep already.
@@ -6695,7 +6707,7 @@ assert_eq "#291: the shipped etcd pins are already in lockstep" "0" "${etcd_def_
 # With an EXTERNAL etcd the Job never renders, so a stale pin there is inert, not an error.
 etcd_ext_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
-  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.4.0-pg18 >/dev/null 2>&1 \
+  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.6.0-pg18 >/dev/null 2>&1 \
   || etcd_ext_rc=$?
 assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
 # The DIGEST is part of the reference (#298 review). Both image dicts carry one and both are
@@ -6962,8 +6974,6 @@ assert_eq "#386: pgpool + standbyResources renders once acknowledged" "0" "${sr_
 sr_nosr_rc=0
 helm template test-pg "${CHART_DIR}" "${sr_args[@]}" --set pgpool.enabled=true >/dev/null 2>&1 || sr_nosr_rc=$?
 assert_eq "#386: pgpool without standbyResources needs no acknowledgement" "0" "${sr_nosr_rc}"
-sr_fail "#386 guard: a 2.4.0 image" "need the pg-ha agent at 2.5.0 or later" \
-  "${sr_args[@]}" --set repmgr.image.tag=2.4.0-pg18 --set etcd.rbac.bootstrapImage.tag=2.4.0-pg18 "${sr_pg[@]}"
 sr_fail "#386 guard: a standby size without a memory limit" "postgresql.standbyResources.limits.memory is missing" \
   "${sr_args[@]}" --set postgresql.standbyResources.requests.cpu=50m --set postgresql.standbyResources.requests.memory=256Mi \
   --set postgresql.standbyResources.limits.cpu=500m
