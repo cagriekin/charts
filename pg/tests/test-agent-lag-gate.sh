@@ -141,7 +141,9 @@ switchover_to() {  # switchover_to <pod>: request the handoff, wait for the role
   local e=0 streaming=""
   while [[ ${e} -lt ${FAILOVER_BUDGET} ]]; do
     if settle_roles 5 && [[ "${PRIMARY}" == "$1" ]]; then break; fi
-    e=$((e + 5))
+    # settle_roles returns at once while the old primary still holds the lease, so without
+    # this sleep the budget counted iterations, not seconds, and ran out in ~10s.
+    sleep 5; e=$((e + 5))
   done
   [[ "${PRIMARY}" == "$1" ]] || return 1
   e=0
